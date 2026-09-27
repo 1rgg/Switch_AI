@@ -1295,6 +1295,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut refreshed_401 = HashSet::new();
 
         for _ in 0..MAX_ROTATE {
+            // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽
+            if tx.is_closed() {
+                return;
+            }
             let mut picked = match state
                 .pool
                 .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
@@ -1440,6 +1444,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 // 同账号重试：不 note_error 不冷却
                                 same_attempt += 1;
                                 std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
+                                // 断连检测：重试等待期间客户端离开则终止
+                                if tx.is_closed() {
+                                    return;
+                                }
                                 continue;
                             }
                             RetryAction::SwitchKey => {
