@@ -651,7 +651,8 @@ pub fn update_run_installer(
         .map_err(|e| format!("启动安装程序失败: {e}（可手动运行：{file_path}）"))?;
 
     // 提示前端后退出，让安装器接管（安装钩子会兜底结束本进程解锁文件占用）
-    let _ = app.emit("update-installing", asset_name);
+    // 结果型事件：emit 失败落 stderr（issue #44 遗留项；即将 exit，无 data_dir 需求）
+    crate::events::emit_logged(&app, "update-installing", serde_json::Value::String(asset_name.clone()), None);
     std::thread::sleep(Duration::from_millis(800));
     std::process::exit(0);
 }

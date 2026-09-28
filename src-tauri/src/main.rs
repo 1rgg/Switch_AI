@@ -4,6 +4,7 @@
 mod commands;
 mod checkin_results;
 mod device_proxy;
+mod events;
 mod fs_utils;
 mod icube_auth;
 mod jwt;
