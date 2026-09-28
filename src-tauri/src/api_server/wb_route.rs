@@ -11,8 +11,11 @@
 //! 5. SSE keep-alive 15s（T2.7/F-34）+ 首字超时 10s 故障转移；
 //! 6. 用量记账 + 请求级日志（含 TTFB，F-32）。
 //!
-//! 客户端断连（F-34 §5.5 #8）：wb_sse 层对 send 失败（接收端已 drop）保持
-//! 消费上游直到 EOF——usage 完整记账，等效 `_drain_upstream`。
+//! 客户端断连（F-34 §5.5 #8，issue #41 系列 0028c93/73f3480/5abb891 修订）：
+//! 转发链路三层检测——轮换/重试入口 tx.is_closed() 快速终止、停滞期
+//! next_event_polling 轮询（LINE_POLL）、活跃流逐事件顶部检测；断连即终止
+//! 转发并释放账号并发槽（usage 记账取断连前已收到的上游 usage 事件，
+//! 不再为残缺流量保持消费上游到 EOF）。
 
 use std::collections::HashSet;
 use std::io::Read;
