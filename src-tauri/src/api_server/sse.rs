@@ -232,13 +232,18 @@ fn stream_convert_src(
                     }
                     if !delta.is_empty() {
                         let data = write_chunk(Value::Object(delta), "", &pending_usage);
-                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                        // 客户端断连检测：发送失败即退出读循环，释放上游与账号并发槽
+                        if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
+                            break;
+                        }
                         sent_any = true;
                     } else if !sent_any {
                         // 空 delta 的首个 output：上游已开始产出，
                         // 发出仅含 role 的空 chunk 占位，让 sent_any 语义与真实下发一致
                         let data = write_chunk(json!({ "role": "assistant" }), "", &pending_usage);
-                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                        if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
+                            break;
+                        }
                         sent_any = true;
                     }
                 }
@@ -247,7 +252,9 @@ fn stream_convert_src(
                 }
                 "done" | "turn_completion" => {
                     let data = write_chunk(json!({}), &ev.finish_reason, &pending_usage);
-                    let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                    if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
+                        break;
+                    }
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                     saw_done = true;
                     sent_any = true;
@@ -263,10 +270,12 @@ fn stream_convert_src(
                                 "code": ev.error_code.unwrap_or(0),
                             }
                         });
-                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(format!(
+                        if sender.blocking_send(Ok(bytes::Bytes::from(format!(
                             "data: {}\n\n",
                             error_chunk
-                        ))));
+                        )))).is_err() {
+                            break;
+                        }
                         let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                         saw_done = true;
                     }
@@ -334,7 +343,9 @@ fn stream_convert_text_src(
                 "output" | "thought" => {
                     if !ev.response.is_empty() {
                         let data = write_chunk(&ev.response, "", &pending_usage);
-                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                        if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
+                            break;
+                        }
                         sent_any = true;
                     }
                 }
@@ -343,7 +354,9 @@ fn stream_convert_text_src(
                 }
                 "done" | "turn_completion" => {
                     let data = write_chunk("", &ev.finish_reason, &pending_usage);
-                    let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                    if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
+                        break;
+                    }
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                     saw_done = true;
                     sent_any = true;
@@ -359,10 +372,12 @@ fn stream_convert_text_src(
                                 "code": ev.error_code.unwrap_or(0),
                             }
                         });
-                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(format!(
+                        if sender.blocking_send(Ok(bytes::Bytes::from(format!(
                             "data: {}\n\n",
                             error_chunk
-                        ))));
+                        )))).is_err() {
+                            break;
+                        }
                         let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                         saw_done = true;
                     }
@@ -558,10 +573,14 @@ fn stream_convert_anthropic_src(
     let mut finish_reason = String::new();
     let mut saw_done = false;
     let mut error_info: Option<(i64, String)> = None;
+    // 客户端断连标志：宏内发送失败置位，主循环检测退出（宏也被循环外收尾调用，不能直接 break）
+    let mut disconnected = false;
 
     macro_rules! send {
         ($s:expr) => {
-            let _ = sender.blocking_send(Ok(bytes::Bytes::from($s)));
+            if sender.blocking_send(Ok(bytes::Bytes::from($s))).is_err() {
+                disconnected = true;
+            }
         };
     }
 
@@ -677,6 +696,10 @@ fn stream_convert_anthropic_src(
     }
 
     while let Some(line) = src.next() {
+        // 客户端断连：立即停止读上游，释放连接与账号并发槽
+        if disconnected {
+            break;
+        }
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
@@ -794,7 +817,7 @@ fn stream_convert_anthropic_src(
         }
     }
 
-    if !saw_done {
+    if !saw_done && !disconnected {
         if message_started || !tools.is_empty() {
             // 上游未发 done 即断流：把已收到的内容按正常收尾发出，避免客户端挂起
             finish_stream!();
