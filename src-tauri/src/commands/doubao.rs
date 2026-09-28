@@ -785,6 +785,7 @@ pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<()
         proxy_port: None,
         include_indexeddb: false,
         expected_current_uid: String::new(),
+        machine_id_override: None,
         data_dir: state.data_dir.clone(),
     };
     let app2 = app.clone();
@@ -1460,6 +1461,7 @@ pub fn doubao_open_as_account(
         proxy_port: proxy_port.filter(|p| *p > 0),
         include_indexeddb: include_idb,
         expected_current_uid: expected_uid,
+        machine_id_override: None,
         data_dir: state.data_dir.clone(),
     };
     let app2 = app.clone();

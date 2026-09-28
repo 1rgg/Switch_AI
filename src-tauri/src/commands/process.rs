@@ -98,6 +98,8 @@ pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
         // CodeBuddy 桌面版（安装形态含 CN 后缀，与 trae-switch-bridge.ps1 ProcNames 对齐；
         // 此前缺失导致 Rust 侧 graceful_kill_app 杀不掉 CodeBuddy，与桥行为不一致存竞态）
         "CodeBuddy" => vec!["CodeBuddy.exe", "CodeBuddy CN.exe"],
+        // Qoder CN IDE（F-80 M4 环境重置前置关闭，防清理后被回写）
+        "Qoder CN" => vec!["Qoder CN.exe", "Qoder CN Launcher.exe"],
         _ => vec![],
     }
 }

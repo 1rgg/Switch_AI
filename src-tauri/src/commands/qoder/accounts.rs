@@ -1,0 +1,222 @@
+//! Qoder 账号域（F-80 M1）：账号列表/改名/移除/PAT 导入。
+//!
+//! 导入通道（§5.4）：M1 实装 **PAT 手工录入**（M0 R-3 侦察结论：CLI token 不明文落盘，
+//! IDE 存储本机未生成，PAT 是最可靠且官方认可的通道）。
+//! IDE 存储发现（L1）在 R-2/R-8 闭合后接入；MITM（L2）随 device_proxy M2 接入。
+
+use serde::Serialize;
+use serde_json::Value;
+use tauri::State;
+
+use crate::fs_utils;
+use crate::state::AppState;
+
+use super::common::{account_id_of, load_pool, with_pool_mut, QoderAccount};
+use crate::tasks::qoder_common::{self, QoderCreds};
+
+#[derive(Serialize, Clone)]
+pub struct QoderAccountView {
+    pub id: String,
+    pub uid: String,
+    pub nickname: String,
+    pub phone_masked: String,
+    pub plan: String,
+    pub credential_source: String,
+    pub token_expires_at: Option<i64>,
+    pub needs_relogin: bool,
+    pub relogin_reason: String,
+    pub group_id: String,
+    pub note: String,
+    pub credits_balance: Option<f64>,
+    pub credits_fetched_at: Option<String>,
+    /// token store 中有可用凭证
+    pub has_credential: bool,
+    /// token 种类徽标：pat | client | unknown（脱敏，不含 token 本体）
+    pub token_kind: String,
+    /// 设备指纹徽标（§5.10：machine_id 前 8 位；None = 尚未回填）
+    pub fingerprint: Option<String>,
+    /// 完整设备指纹（§5.10；指纹查看弹框数据源）
+    pub device_profile: Option<crate::tasks::qoder_device::QoderDeviceProfile>,
+}
+
+fn view_of(a: &QoderAccount, tokens: &Value) -> QoderAccountView {
+    let rec = tokens
+        .get("tokens")
+        .and_then(|t| t.get(&a.id));
+    let has_token = rec
+        .and_then(|r| r.get("access_token").or_else(|| r.get("accessToken")))
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    let kind = rec
+        .and_then(|r| r.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    QoderAccountView {
+        id: a.id.clone(),
+        uid: a.uid.clone(),
+        nickname: a.nickname.clone(),
+        phone_masked: a.phone_masked.clone(),
+        plan: a.plan.clone(),
+        credential_source: a.credential_source.clone(),
+        token_expires_at: a.token_expires_at,
+        needs_relogin: a.needs_relogin,
+        relogin_reason: a.relogin_reason.clone(),
+        group_id: a.group_id.clone(),
+        note: a.note.clone(),
+        credits_balance: a.credits_balance,
+        credits_fetched_at: a.credits_fetched_at.clone(),
+        has_credential: has_token,
+        token_kind: kind,
+        fingerprint: a
+            .device_profile
+            .as_ref()
+            .filter(|p| !p.machine_id.is_empty())
+            // I12：按字符截取，防非 ASCII machine_id 触发字节切片 panic
+            .map(|p| p.machine_id.chars().take(8).collect::<String>()),
+        device_profile: a.device_profile.clone(),
+    }
+}
+
+/// 账号列表（含凭证状态；脱敏：只回 kind 徽标不回 token）。
+/// 列表前惰性回填设备指纹（§5.10：存量账号幂等补齐，已有不覆盖）。
+#[tauri::command]
+pub fn qoder_accounts_list(state: State<AppState>) -> Result<Vec<QoderAccountView>, String> {
+    crate::tasks::qoder_device::ensure_pool_profiles(&state)?;
+    let accounts = load_pool(&state);
+    let tokens = qoder_common::load_token_store(&state);
+    Ok(accounts.iter().map(|a| view_of(a, &tokens)).collect())
+}
+
+/// 改名/备注（nickname 即展示名，可编辑覆盖 userinfo 值）
+#[tauri::command]
+pub fn qoder_account_save(
+    state: State<AppState>,
+    user_id: String,
+    name: Option<String>,
+    note: Option<String>,
+) -> Result<(), String> {
+    // I09：持锁读-改-写，防并发整池覆盖丢更新
+    with_pool_mut(&state, |accounts| {
+        let Some(a) = accounts.iter_mut().find(|a| a.id == user_id) else {
+            return Err(format!("账号不在池中: {user_id}"));
+        };
+        if let Some(n) = name {
+            a.nickname = n.trim().to_string();
+        }
+        if let Some(n) = note {
+            a.note = n;
+        }
+        Ok(())
+    })
+}
+
+/// 移除账号（同步清理 token store 记录，防悬空凭证残留）
+#[tauri::command]
+pub fn qoder_account_remove(state: State<AppState>, user_id: String) -> Result<(), String> {
+    fs_utils::ensure_uid_safe(&user_id)?;
+    // I09：持锁读-改-写
+    with_pool_mut(&state, |accounts| {
+        let before = accounts.len();
+        accounts.retain(|a| a.id != user_id);
+        if accounts.len() == before {
+            return Err(format!("账号不在池中: {user_id}"));
+        }
+        Ok(())
+    })?;
+    // I14：清理失败留痕（原先静默吞掉，悬空凭证难排查）
+    if let Err(e) = qoder_common::remove_token(&state, &user_id) {
+        fs_utils::app_log(&state.data_dir, &format!("Qoder 账号 {user_id} 凭证清理失败: {e}"));
+    }
+    fs_utils::app_log(&state.data_dir, &format!("Qoder 账号已移除: {user_id}"));
+    Ok(())
+}
+
+/// PAT 手工导入（M1 最可靠凭证通道；幂等：同 token 稳定同 id，重复导入=更新）。
+/// 导入时尝试 /api/v1/userinfo 回填 uid/昵称（失败容错不阻塞——userinfo 对 PAT 的
+/// 兼容性 R-6 待验证）。返回导入后的账号视图。
+#[tauri::command]
+pub async fn qoder_account_import_pat(
+    state: State<'_, AppState>,
+    name: Option<String>,
+    pat: String,
+) -> Result<QoderAccountView, String> {
+    let pat = pat.trim().to_string();
+    if pat.is_empty() {
+        return Err("PAT 不能为空".into());
+    }
+    if !pat.starts_with("pt-") && !pat.starts_with("jt-") {
+        return Err("凭证格式不识别：应为 qoder.com.cn/account/integrations 创建的 PAT（pt- 前缀）".into());
+    }
+    let id = account_id_of(&pat);
+    let (uid, nickname, plan) = {
+        let agent = crate::tasks::http_agent(15);
+        let creds = QoderCreds {
+            access_token: pat.clone(),
+            kind: "pat".into(),
+            ..Default::default()
+        };
+        let (uid, nickname) = qoder_common::fetch_userinfo(&agent, &creds);
+        // 套餐回填（R-7 抓包固化：GET /api/v2/user/plan → plan_tier_name，如 "Pro Trial"；失败容错）
+        let (tier, _user_type, _end) = qoder_common::fetch_plan(&agent, &creds);
+        (uid.unwrap_or_default(), nickname.unwrap_or_default(), tier.unwrap_or_default())
+    };
+    // 幂等入池：同 id 保留旧 uid/nickname（userinfo 失败时不覆盖既有信息）；持锁读-改-写（I09）
+    let display = name
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string());
+    with_pool_mut(&state, |accounts| {
+        if let Some(a) = accounts.iter_mut().find(|a| a.id == id) {
+            if let Some(d) = display {
+                a.nickname = d;
+            } else if a.nickname.is_empty() && !nickname.is_empty() {
+                // I13：显式传名仍覆盖；否则仅在池中昵称为空时补 userinfo 值，
+                // 防重复导入把用户改过的名覆盖回去（对照 ide_store.rs 守卫）
+                a.nickname = nickname.clone();
+            }
+            if a.uid.is_empty() && !uid.is_empty() {
+                a.uid = uid.clone();
+            }
+            if !plan.is_empty() {
+                a.plan = plan.clone();
+            }
+            a.credential_source = "pat".into();
+            a.needs_relogin = false;
+            a.relogin_reason = String::new();
+            // 指纹回填（幂等：已有稳定绑定不覆盖，§5.10）
+            if a.device_profile.is_none() {
+                a.device_profile = Some(crate::tasks::qoder_device::QoderDeviceProfile::generate());
+            }
+        } else {
+            accounts.push(QoderAccount {
+                id: id.clone(),
+                uid: uid.clone(),
+                nickname: display.or_else(|| if nickname.is_empty() { None } else { Some(nickname.clone()) })
+                    .unwrap_or_else(|| format!("Qoder {}", &id[3..9])),
+                plan,
+                credential_source: "pat".into(),
+                // 入池即生成稳定指纹（§5.10：一次生成永不轮换）
+                device_profile: Some(crate::tasks::qoder_device::QoderDeviceProfile::generate()),
+                ..Default::default()
+            });
+        }
+        Ok(())
+    })?;
+    // 凭证入 token store（M1 单源；vault 收敛为 M3 事项，对齐 wb 现状）
+    let creds = QoderCreds {
+        access_token: pat,
+        kind: "pat".into(),
+        uid: uid.clone(),
+        nickname: nickname.clone(),
+        ..Default::default()
+    };
+    qoder_common::save_token_store(&state, &id, &creds)?;
+    fs_utils::app_log(&state.data_dir, &format!("Qoder PAT 账号已导入: {id}"));
+    let accounts = load_pool(&state);
+    let tokens = qoder_common::load_token_store(&state);
+    accounts
+        .iter()
+        .find(|a| a.id == id)
+        .map(|a| view_of(a, &tokens))
+        .ok_or_else(|| "导入后读取账号失败".into())
+}

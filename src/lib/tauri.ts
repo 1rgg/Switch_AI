@@ -73,6 +73,20 @@ import type {
   WbPoolImportResult,
   WbModelInfo,
   UsageHistoryResult,
+  QoderAccountView,
+  QoderCheckinRecord,
+  QoderCliStatus,
+  QoderCreditsResult,
+  QoderCreditsSnapshot,
+  QoderEnvCheck,
+  QoderIdeScanResult,
+  QoderOauthDone,
+  QoderOauthProgress,
+  QoderPoolExport,
+  QoderPoolImportResult,
+  QoderResetItem,
+  QoderResetResult,
+  QoderSettings,
 } from '../types';
 
 // 所有 invoke 封装集中于此，字段名严格遵循 Rust 端 snake_case 约定。
@@ -209,7 +223,7 @@ export const api = {
   },
   switchAccount: (
     userId: string,
-    targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy',
+    targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder',
     skipJwtProbe?: boolean,
   ) =>
     invoke('switch_account', {
@@ -218,19 +232,20 @@ export const api = {
       // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
       skipJwtProbe: skipJwtProbe ?? false,
     }),
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
   profiles: {
     // Buddy 双应用：profile_list / profile_restore / profile_delete 支持 WorkBuddy / CodeBuddy 档案映射
-    list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
+    // Qoder：M3 Icube 档案（data/profiles_qoder；切号快照保存/恢复）
+    list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') =>
       invoke<ProfileInfo[]>('profile_list', { targetApp: targetApp ?? null }),
-    backup: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao') =>
+    backup: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'Qoder') =>
       invoke('profile_backup', { userId, targetApp: targetApp ?? null }),
-    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
+    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') =>
       invoke('profile_restore', { userId, targetApp: targetApp ?? null }),
-    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') =>
+    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') =>
       invoke('profile_delete', { userId, targetApp: targetApp ?? null }),
     formatSize: (bytes: number) => invoke<string>('profile_format_size', { bytes }),
   },
@@ -390,6 +405,55 @@ export const api = {
       invoke<WbTokenStats>('workbuddy_token_stats', { fresh: fresh ?? null }),
     activityInfo: (userId?: string, fresh?: boolean) =>
       invoke<WbActivityInfo>('workbuddy_activity_info', { userId: userId ?? null, refresh: fresh ?? null }),
+  },
+  // ---- Qoder（F-80；Rust commands/qoder；字段名严格 snake_case）----
+  qoder: {
+    envCheck: () => invoke<QoderEnvCheck>('qoder_env_check'),
+    /** 打开客户端（后端 spawn；未检测到 exe 时 reject 文案含「未检测到」） */
+    openIde: () => invoke('qoder_open_ide'),
+    openWork: () => invoke('qoder_open_work'),
+    accountsList: () => invoke<QoderAccountView[]>('qoder_accounts_list'),
+    accountSave: (userId: string, name?: string, note?: string) =>
+      invoke('qoder_account_save', { userId, name: name ?? null, note: note ?? null }),
+    accountRemove: (userId: string) => invoke('qoder_account_remove', { userId }),
+    /** PAT 手工导入（M1 最可靠凭证通道；qoder.com.cn/account/integrations 自建，pt- 前缀） */
+    accountImportPat: (name?: string, pat?: string) =>
+      invoke<QoderAccountView>('qoder_account_import_pat', { name: name ?? null, pat: pat ?? null }),
+    /** OAuth 设备流登录（浏览器授权页 + deviceToken/poll 轮询；事件 qoder-oauth-progress/done） */
+    oauthLogin: () => invoke<void>('qoder_oauth_login'),
+    /** IDE 存储账号发现/导入（M3；secret://aicoding.auth.userInfo DPAPI+AES-GCM 解密） */
+    ideScan: () => invoke<QoderIdeScanResult>('qoder_ide_scan'),
+    /** CLI 登录状态只读桥（M4；~/.qoder-cn/.qoder-app-status.json 白名单透传，无凭证） */
+    cliStatus: () => invoke<QoderCliStatus>('qoder_cli_status'),
+    settingsGet: () => invoke<QoderSettings>('qoder_settings_get'),
+    settingsSet: (patch: QoderSettings) => invoke('qoder_settings_set', { patch }),
+    checkinStart: (opts?: { user_ids?: string[]; skip_checked_in?: boolean; lazy_hours?: number }) =>
+      invoke('qoder_checkin_start', {
+        opts: {
+          user_ids: opts?.user_ids ?? null,
+          skip_checked_in: opts?.skip_checked_in ?? true,
+          lazy_hours: opts?.lazy_hours ?? null,
+        },
+      }),
+    checkinResults: (days?: number) =>
+      invoke<QoderCheckinRecord[]>('qoder_checkin_results', { days: days ?? null }),
+    checkinTaskRegister: (times: string[]) => invoke('qoder_checkin_task_register', { times }),
+    checkinTaskStatus: () => invoke<string[]>('qoder_checkin_task_status'),
+    checkinTaskUnregister: () => invoke('qoder_checkin_task_unregister'),
+    creditsFetch: (userId?: string, fresh?: boolean) =>
+      invoke<QoderCreditsResult>('qoder_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
+    creditsHistoryList: () =>
+      invoke<{ snapshots: QoderCreditsSnapshot[] }>('qoder_credits_history_list'),
+    /** 账号池导出（M4；includeCredentials=true 附带凭证副本——导出文件等同密码） */
+    accountsExport: (includeCredentials?: boolean) =>
+      invoke<QoderPoolExport>('qoder_accounts_export', { includeCredentials: includeCredentials ?? null }),
+    /** 账号池导入（M4；kind 强校验 + uid 幂等原位更新 + device_profile 仅本地为空才补入） */
+    accountsImport: (payload: Record<string, unknown>) =>
+      invoke<QoderPoolImportResult>('qoder_accounts_import', { payload }),
+    /** 环境重置清单（M4；8 项语义块 + 动态存在性标注） */
+    envResetItems: () => invoke<QoderResetItem[]>('qoder_env_reset_items'),
+    /** 环境重置执行（M4；自动关闭 Qoder CN，单项失败不中断） */
+    envReset: (items: string[]) => invoke<QoderResetResult[]>('qoder_env_reset', { items }),
   },
   oauth: {
     getLoginUrl: () => invoke<OAuthLoginUrl>('oauth_get_login_url'),

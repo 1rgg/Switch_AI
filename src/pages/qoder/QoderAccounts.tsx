@@ -1,0 +1,1000 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { listen } from '@tauri-apps/api/event';
+import {
+  Archive,
+  ArchiveRestore,
+  DatabaseBackup,
+  Download,
+  ExternalLink,
+  Fingerprint,
+  KeyRound,
+  Loader2,
+  LogIn,
+  Pencil,
+  RefreshCw,
+  ScanSearch,
+  ShieldAlert,
+  Terminal,
+  Trash2,
+  Upload,
+  UserPlus,
+} from 'lucide-react';
+import PageHeader from '../../components/PageHeader';
+import { Badge, Modal } from '../../components/ui';
+import { api, type ProfileDoneEvent } from '../../lib/tauri';
+import { useAppStore } from '../../store';
+import type {
+  ProfileInfo,
+  QoderAccountView,
+  QoderCliStatus,
+  QoderOauthDone,
+  QoderOauthProgress,
+  QoderResetItem,
+  QoderResetResult,
+} from '../../types';
+
+/**
+ * qoder-accounts 账号管理（F-80 §5.8，对照 BuddyAccounts 裁剪复刻）：
+ * 账号池列表 + 凭证来源徽标 + PAT 导入 / OAuth 设备流 / IDE 存储扫描（M3）三通道，
+ * 账号级登录态快照备份/恢复与一键切换（M3 Icube 管线，恢复自动注入绑定指纹 §5.10）。
+ */
+
+const PAT_URL = 'https://qoder.com.cn/account/integrations';
+
+function TokenBadge({ a }: { a: QoderAccountView }) {
+  if (!a.has_credential) return <Badge tone="red">无凭证</Badge>;
+  if (a.needs_relogin) return <Badge tone="red">需重新登录</Badge>;
+  return <Badge tone="green">{a.token_kind === 'pat' ? 'PAT 有效' : '凭证有效'}</Badge>;
+}
+
+/** 设备指纹徽标（§5.10）：machine_id 前 8 位，点击查看完整指纹 */
+function FingerprintBadge({ a, onOpen }: { a: QoderAccountView; onOpen: (a: QoderAccountView) => void }) {
+  if (!a.fingerprint) return <Badge tone="slate">未绑定</Badge>;
+  return (
+    <button
+      className="inline-flex cursor-pointer items-center"
+      title="查看完整设备指纹"
+      onClick={() => onOpen(a)}
+    >
+      <Badge tone="violet">
+        <Fingerprint size={10} className="mr-1" />
+        {a.fingerprint}…
+      </Badge>
+    </button>
+  );
+}
+
+/** 快照大小异步格式化（对齐 SnapshotModal SizeText 模式） */
+function SizeText({ bytes }: { bytes: number }) {
+  const [text, setText] = useState('');
+  useEffect(() => {
+    let cancel = false;
+    api.profiles
+      .formatSize(bytes)
+      .then((t) => {
+        if (!cancel) setText(t);
+      })
+      .catch(() => {
+        if (!cancel) setText(`${bytes} B`);
+      });
+    return () => {
+      cancel = true;
+    };
+  }, [bytes]);
+  return <span>{text || '...'}</span>;
+}
+
+export default function QoderAccounts() {
+  const pushToast = useAppStore((s) => s.pushToast);
+  const switchTo = useAppStore((s) => s.switchTo);
+  const switchingTo = useAppStore((s) => s.switchingTo);
+  const [accounts, setAccounts] = useState<QoderAccountView[]>([]);
+  const [loading, setLoading] = useState(true);
+  // PAT 导入弹框
+  const [showImport, setShowImport] = useState(false);
+  const [patName, setPatName] = useState('');
+  const [patValue, setPatValue] = useState('');
+  const [importing, setImporting] = useState(false);
+  // 编辑弹框（改名/备注）
+  const [editing, setEditing] = useState<QoderAccountView | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editNote, setEditNote] = useState('');
+  const [editBusy, setEditBusy] = useState(false);
+  // 指纹查看弹框（§5.10）
+  const [fpViewing, setFpViewing] = useState<QoderAccountView | null>(null);
+  // OAuth 设备流登录（进度弹窗；事件契约对齐 BuddyAccounts wb-oauth 模式）
+  const [oauthRunning, setOauthRunning] = useState(false);
+  const [oauthMsg, setOauthMsg] = useState('');
+  const [oauthUrl, setOauthUrl] = useState<string | null>(null);
+  const [showOauth, setShowOauth] = useState(false);
+  // IDE 存储扫描（M3：Local State DPAPI → AES-GCM → state.vscdb secret:// 解密发现/导入）
+  const [scanningIde, setScanningIde] = useState(false);
+  // CLI 登录状态（M4 status 只读桥：available=false 时展示 reason）
+  const [cliStatus, setCliStatus] = useState<QoderCliStatus | null>(null);
+  // 快照管理弹框（M3 Icube 档案：data/profiles_qoder/<account_id>/）
+  const [showSnapshots, setShowSnapshots] = useState(false);
+  const [snapshotSlots, setSnapshotSlots] = useState<ProfileInfo[]>([]);
+  const [snapBusy, setSnapBusy] = useState<string | null>(null);
+  // 导出/导入账号池（M4，对照 BuddyAccounts F-46 扩展）
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportWithCreds, setExportWithCreds] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [importingBackup, setImportingBackup] = useState(false);
+  const importFileRef = useRef<HTMLInputElement>(null);
+  // 环境重置（M4，对照 BuddyAccounts F-14）：8 项勾选预览 → 二次确认 → 执行结果
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetLoading, setResetLoading] = useState(false);
+  const [resetItems, setResetItems] = useState<QoderResetItem[]>([]);
+  const [resetChecked, setResetChecked] = useState<Set<string>>(new Set());
+  const [resetConfirming, setResetConfirming] = useState(false);
+  const [resetBusy, setResetBusy] = useState(false);
+  const [resetResults, setResetResults] = useState<QoderResetResult[] | null>(null);
+  const unlisten = useRef<(() => void)[]>([]);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      setAccounts(await api.qoder.accountsList());
+    } catch (err) {
+      pushToast('error', `读取账号失败：${String(err)}`);
+    } finally {
+      setLoading(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const refreshSnapshots = useCallback(async () => {
+    try {
+      setSnapshotSlots(await api.profiles.list('Qoder'));
+    } catch (err) {
+      pushToast('error', `读取快照列表失败：${String(err)}`);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    // CLI 状态只读桥（M4）：拉取失败静默置空，不打扰主列表
+    api.qoder.cliStatus().then(setCliStatus).catch(() => setCliStatus(null));
+    let disposed = false;
+    void listen<QoderOauthProgress>('qoder-oauth-progress', (ev) => {
+      const p = ev.payload;
+      setOauthMsg(p.message);
+      if (p.auth_url) setOauthUrl(p.auth_url);
+    }).then((u) => {
+      if (disposed) u();
+      else unlisten.current.push(u);
+    });
+    void listen<QoderOauthDone>('qoder-oauth-done', (ev) => {
+      const d = ev.payload;
+      setOauthRunning(false);
+      setOauthMsg(d.message);
+      if (d.ok) {
+        pushToast('success', d.message);
+        void refresh();
+        setTimeout(() => setShowOauth(false), 1200);
+      } else {
+        pushToast('error', d.message);
+      }
+    }).then((u) => {
+      if (disposed) u();
+      else unlisten.current.push(u);
+    });
+    // 备份/恢复完成（全局 store 亦监听并 toast）：清 busy + 刷新快照列表
+    void listen<ProfileDoneEvent>('profile-done', () => {
+      setSnapBusy(null);
+      void refreshSnapshots();
+    }).then((u) => {
+      if (disposed) u();
+      else unlisten.current.push(u);
+    });
+    return () => {
+      disposed = true;
+      unlisten.current.forEach((u) => u());
+      unlisten.current = [];
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refresh, refreshSnapshots]);
+
+  const startOauth = async () => {
+    setOauthRunning(true);
+    setOauthMsg('正在打开 Qoder 授权页…');
+    setOauthUrl(null);
+    setShowOauth(true);
+    try {
+      await api.qoder.oauthLogin();
+    } catch (err) {
+      setOauthRunning(false);
+      setShowOauth(false);
+      pushToast('error', `发起 OAuth 登录失败：${String(err)}`);
+    }
+  };
+
+  const scanIde = async () => {
+    setScanningIde(true);
+    try {
+      const r = await api.qoder.ideScan();
+      if (r.imported) {
+        pushToast('success', `已从 IDE 本地存储导入账号：${r.nickname || r.account_id}`);
+      } else if (r.updated) {
+        pushToast('success', `IDE 登录态匹配已有账号，凭证已更新：${r.nickname || r.account_id}`);
+      } else if (r.found) {
+        pushToast('info', r.reason || '已发现 IDE 登录态，无需变更');
+      } else {
+        pushToast('warn', r.reason || '未在 Qoder IDE 本地存储发现登录态');
+      }
+      void refresh();
+    } catch (err) {
+      pushToast('error', `扫描失败：${String(err)}`);
+    } finally {
+      setScanningIde(false);
+    }
+  };
+
+  const importPat = async () => {
+    if (!patValue.trim()) {
+      pushToast('warn', '请粘贴 PAT（pt- 前缀，qoder.com.cn/account/integrations 创建）');
+      return;
+    }
+    setImporting(true);
+    try {
+      const v = await api.qoder.accountImportPat(patName.trim() || undefined, patValue.trim());
+      pushToast('success', `账号已导入：${v.nickname || v.id}`);
+      setShowImport(false);
+      setPatName('');
+      setPatValue('');
+      void refresh();
+    } catch (err) {
+      pushToast('error', `导入失败：${String(err)}`);
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const saveEdit = async () => {
+    if (!editing || editBusy) return;
+    setEditBusy(true);
+    try {
+      await api.qoder.accountSave(editing.id, editName.trim() || undefined, editNote);
+      pushToast('success', '已保存');
+      setEditing(null);
+      void refresh();
+    } catch (err) {
+      pushToast('error', `保存失败：${String(err)}`);
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
+  const removeAccount = async (a: QoderAccountView) => {
+    if (!window.confirm(`确认移除账号「${a.nickname || a.id}」？将同时清除其凭证记录与设备指纹。`)) return;
+    try {
+      await api.qoder.accountRemove(a.id);
+      pushToast('success', '已移除');
+      void refresh();
+    } catch (err) {
+      pushToast('error', `移除失败：${String(err)}`);
+    }
+  };
+
+  const backupSnapshot = async (a: QoderAccountView) => {
+    setSnapBusy(a.id);
+    try {
+      await api.profiles.backup(a.id, 'Qoder');
+      pushToast('info', `正在备份「${a.nickname || a.id}」的登录态快照…`);
+    } catch (err) {
+      setSnapBusy(null);
+      pushToast('error', `备份失败：${String(err)}`);
+    }
+  };
+
+  // I19：改为按槽位 id 操作——快照目录名即账号 id，账号已移除的孤儿快照仍可恢复/清理
+  const restoreSnapshot = async (id: string, name: string) => {
+    if (!window.confirm(`确认将账号「${name || id}」的快照恢复到 Qoder IDE？当前 IDE 登录态将被覆盖。`)) return;
+    setSnapBusy(id);
+    try {
+      await api.profiles.restore(id, 'Qoder');
+      pushToast('info', `正在恢复「${name || id}」的快照到 Qoder IDE…`);
+    } catch (err) {
+      setSnapBusy(null);
+      pushToast('error', `恢复失败：${String(err)}`);
+    }
+  };
+
+  const deleteSnapshot = async (id: string, name: string) => {
+    if (!window.confirm(`确认删除账号「${name || id}」的快照？`)) return;
+    setSnapBusy(id);
+    try {
+      await api.profiles.delete(id, 'Qoder');
+      pushToast('success', '快照已删除');
+      await refreshSnapshots();
+    } catch (err) {
+      pushToast('error', `删除失败：${String(err)}`);
+    } finally {
+      setSnapBusy(null);
+    }
+  };
+
+  const copyText = async (text: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      pushToast('success', `${label} 已复制`);
+    } catch {
+      pushToast('error', '复制失败');
+    }
+  };
+
+  // 导出确认（M4，对照 BuddyAccounts F-46 扩展）：可选是否附带凭证副本
+  const confirmExport = async () => {
+    setExportBusy(true);
+    try {
+      const data = await api.qoder.accountsExport(exportWithCreds);
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `qoder_accounts_${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      pushToast(
+        'success',
+        exportWithCreds ? '账号池已导出（含凭证，文件等同密码请妥善保管）' : '账号元数据已导出（凭证不导出）',
+      );
+      setExportOpen(false);
+    } catch (err) {
+      pushToast('error', `导出失败：${String(err)}`);
+    } finally {
+      setExportBusy(false);
+    }
+  };
+
+  // 导入账号池（M4）：选择导出文件 → kind 校验入池（uid 幂等原位更新；含凭证回写）
+  const importBackupFile = async (file: File) => {
+    setImportingBackup(true);
+    try {
+      const payload = JSON.parse(await file.text()) as Record<string, unknown>;
+      const r = await api.qoder.accountsImport(payload);
+      const parts = [`新增 ${r.added} 个账号`];
+      if (r.updated > 0) parts.push(`更新 ${r.updated} 个`);
+      pushToast('success', `导入完成：${parts.join('、')}，带凭证 ${r.with_credentials}`);
+      if (r.rejected && r.rejected.length > 0) {
+        const head = r.rejected
+          .slice(0, 3)
+          .map((x) => `「${x.id}」${x.reason}`)
+          .join('；');
+        pushToast('warn', `${r.rejected.length} 条被拒绝导入：${head}${r.rejected.length > 3 ? '…' : ''}`);
+      }
+      await refresh();
+    } catch (err) {
+      pushToast('error', `导入失败：${String(err)}`);
+    } finally {
+      setImportingBackup(false);
+    }
+  };
+
+  // 打开环境重置弹框：拉取 8 项清单（默认勾选所有存在项）
+  const openEnvReset = async () => {
+    setResetLoading(true);
+    try {
+      const items = await api.qoder.envResetItems();
+      setResetItems(items);
+      setResetChecked(new Set(items.filter((x) => x.exists).map((x) => x.id)));
+      setResetResults(null);
+      setResetConfirming(false);
+      setResetOpen(true);
+    } catch (err) {
+      pushToast('error', `读取清理清单失败：${String(err)}`);
+    } finally {
+      setResetLoading(false);
+    }
+  };
+
+  const toggleResetItem = (id: string) => {
+    setResetChecked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // 执行环境重置（二次确认后；单项失败不中断）
+  const confirmEnvReset = async () => {
+    setResetBusy(true);
+    try {
+      const results = await api.qoder.envReset([...resetChecked]);
+      setResetResults(results);
+      setResetConfirming(false);
+      const fail = results.filter((r) => !r.ok).length;
+      if (fail === 0) pushToast('success', `环境重置完成（${results.length} 项全部成功）`);
+      else pushToast('warn', `环境重置完成，${fail} 项失败，请查看详情`);
+    } catch (err) {
+      pushToast('error', `环境重置失败：${String(err)}`);
+    } finally {
+      setResetBusy(false);
+    }
+  };
+
+  return (
+    <div className="animate-fade-in">
+      <PageHeader title="Qoder · 账号管理" desc="全家桶账号池 · PAT / OAuth / IDE 存储三通道 · 快照切换（M3） · CLI 状态桥（M4）" />
+
+      <div className="card p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <span className="text-sm font-medium">账号池（{accounts.length}）</span>
+          <div className="flex gap-2">
+            <button
+              className="btn-outline !px-3 !py-1 text-xs"
+              disabled={scanningIde || oauthRunning}
+              onClick={() => void scanIde()}
+              title="解密 IDE 本地存储（Local State → state.vscdb secret://）发现并导入当前登录账号"
+            >
+              {scanningIde ? <Loader2 size={13} className="animate-spin" /> : <ScanSearch size={13} />} 扫描 IDE 登录态
+            </button>
+            <button
+              className="btn-outline !px-3 !py-1 text-xs"
+              disabled={oauthRunning}
+              onClick={() => void startOauth()}
+              title="模拟客户端设备流：浏览器授权后自动获取 dt- 凭证入池"
+            >
+              {oauthRunning ? <Loader2 size={13} className="animate-spin" /> : <KeyRound size={13} />} OAuth 登录
+            </button>
+            <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => setShowImport(true)}>
+              <UserPlus size={13} /> 导入 PAT
+            </button>
+            <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => {
+              setShowSnapshots(true);
+              void refreshSnapshots();
+            }}>
+              <Archive size={13} /> 快照管理
+            </button>
+            <button
+              className="btn-outline !px-3 !py-1 text-xs"
+              disabled={accounts.length === 0 || exportBusy}
+              onClick={() => setExportOpen(true)}
+              title="导出账号池为 JSON（可选是否附带凭证副本）"
+            >
+              <Download size={13} /> 导出账号
+            </button>
+            <button
+              className="btn-outline !px-3 !py-1 text-xs"
+              disabled={importingBackup}
+              onClick={() => importFileRef.current?.click()}
+              title="导入账号池 JSON（uid 幂等合并，设备指纹仅在本地为空时补入）"
+            >
+              {importingBackup ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />} 导入账号
+            </button>
+            <input
+              ref={importFileRef}
+              type="file"
+              accept=".json,application/json"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void importBackupFile(f);
+                e.target.value = '';
+              }}
+            />
+            <button
+              className="btn-outline !px-3 !py-1 text-xs !text-rose-600 hover:!border-rose-300"
+              disabled={resetLoading || resetBusy}
+              onClick={() => void openEnvReset()}
+              title="清除本机 Qoder CN 认证残留（vscdb / storage.json / 机器标识 / CLI 登录态等 8 项）"
+            >
+              {resetLoading ? <Loader2 size={13} className="animate-spin" /> : <ShieldAlert size={13} />} 环境重置
+            </button>
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-slate-200 dark:border-zinc-700">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-zinc-900">
+              <tr>
+                <th className="px-3 py-1.5 text-left">账号</th>
+                <th className="px-3 py-1.5 text-left">套餐</th>
+                <th className="px-3 py-1.5 text-left">凭证来源</th>
+                <th className="px-3 py-1.5 text-left">凭证状态</th>
+                <th className="px-3 py-1.5 text-left">设备指纹</th>
+                <th className="px-3 py-1.5 text-right">积分余额</th>
+                <th className="px-3 py-1.5 text-right">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading ? (
+                <tr>
+                  <td colSpan={7} className="px-3 py-4 text-center text-xs text-slate-400">加载中…</td>
+                </tr>
+              ) : accounts.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-3 py-6 text-center text-xs text-slate-400">
+                    暂无账号。可通过右上角三种方式入池：
+                    <br />
+                    <span className="text-slate-300 dark:text-zinc-600">
+                      扫描 IDE 登录态（本机已登录时一键导入）/ OAuth 登录 / 导入 PAT（qoder.com.cn → Integrations → 创建）
+                    </span>
+                  </td>
+                </tr>
+              ) : (
+                accounts.map((a) => (
+                  <tr key={a.id} className="border-t border-slate-100 dark:border-zinc-800">
+                    <td className="px-3 py-1.5">
+                      <div className="font-medium">{a.nickname || a.id}</div>
+                      <div className="text-xs text-slate-400">{[a.uid, a.note].filter(Boolean).join(' · ') || a.id}</div>
+                    </td>
+                    <td className="px-3 py-1.5 text-xs text-slate-500">
+                      {a.plan ? <span className="font-medium text-sky-600 dark:text-sky-400">{a.plan}</span> : <span className="text-slate-300 dark:text-zinc-600">—</span>}
+                    </td>
+                    <td className="px-3 py-1.5">
+                      <Badge tone={a.credential_source === 'pat' ? 'green' : 'slate'}>
+                        {a.credential_source || '—'}
+                      </Badge>
+                    </td>
+                    <td className="px-3 py-1.5"><TokenBadge a={a} /></td>
+                    <td className="px-3 py-1.5"><FingerprintBadge a={a} onOpen={setFpViewing} /></td>
+                    <td className="px-3 py-1.5 text-right tabular-nums text-xs">
+                      {a.credits_balance != null ? a.credits_balance.toLocaleString() : '-'}
+                    </td>
+                    <td className="px-3 py-1.5 text-right">
+                      <div className="flex justify-end gap-1">
+                        <button
+                          className="btn-ghost h-7 w-7 !p-0 text-emerald-600"
+                          title="切换到此账号（备份当前 IDE 登录态 → 恢复该账号快照并注入绑定指纹）"
+                          disabled={switchingTo != null}
+                          onClick={() => void switchTo(a.id, 'Qoder')}
+                        >
+                          {switchingTo === a.id ? <Loader2 size={13} className="animate-spin" /> : <LogIn size={13} />}
+                        </button>
+                        <button
+                          className="btn-ghost h-7 w-7 !p-0"
+                          title="备份当前 IDE 登录态到该账号槽位"
+                          disabled={snapBusy != null || switchingTo != null}
+                          onClick={() => void backupSnapshot(a)}
+                        >
+                          {snapBusy === a.id ? <Loader2 size={13} className="animate-spin" /> : <DatabaseBackup size={13} />}
+                        </button>
+                        <button
+                          className="btn-ghost h-7 w-7 !p-0"
+                          title="编辑名称/备注"
+                          onClick={() => {
+                            setEditing(a);
+                            setEditName(a.nickname);
+                            setEditNote(a.note);
+                          }}
+                        >
+                          <Pencil size={13} />
+                        </button>
+                        <button
+                          className="btn-ghost h-7 w-7 !p-0 text-rose-500"
+                          title="移除账号"
+                          onClick={() => void removeAccount(a)}
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* M4 CLI 状态桥：~/.qoder-cn/.qoder-app-status.json 白名单只读透传（无凭证，绝不写回） */}
+        {cliStatus?.available ? (
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+            <Terminal size={13} className="text-slate-500" />
+            <Badge tone={cliStatus.logged_in ? 'green' : 'slate'}>
+              {cliStatus.logged_in ? `CLI 已登录${cliStatus.name ? ` · ${cliStatus.name}` : ''}` : 'CLI 未登录'}
+            </Badge>
+            {cliStatus.version && <span>v{cliStatus.version}</span>}
+            {cliStatus.writer && <span>写入方 {cliStatus.writer}</span>}
+            {cliStatus.snapshot_at && (
+              <span>状态快照 {cliStatus.snapshot_at.replace('T', ' ').slice(0, 19)} UTC</span>
+            )}
+          </div>
+        ) : (
+          <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
+            <Terminal size={13} />
+            <span>{cliStatus?.reason || '未检测到 Qoder CLI'}</span>
+          </div>
+        )}
+
+        <p className="mt-3 text-xs text-slate-400">
+          凭证三通道：导入 PAT（官方认可，pt- 前缀）/ OAuth 设备流（dt-，约 30 天自动续期）/ 扫描 IDE
+          登录态（解密本机 QoderCN 存储）。同一账号的 PAT 与客户端凭证按 token 派生 id，分属两条池记录。
+          快照切换：恢复目标账号登录态快照并自动注入其绑定设备指纹（§5.10），支持多账号并存。
+          凭证由调度器每 6 小时兜底刷新（M4）；CLI 登录态（~/.qoder-cn）仅只读展示，无独立凭证通道（R-3）。
+        </p>
+      </div>
+
+      {/* OAuth 进度弹框 */}
+      <Modal
+        open={showOauth}
+        onClose={() => {
+          if (!oauthRunning) setShowOauth(false);
+        }}
+        title="Qoder OAuth 登录"
+        footer={
+          <button className="btn-ghost" disabled={oauthRunning} onClick={() => setShowOauth(false)}>
+            {oauthRunning ? '授权进行中…' : '关闭'}
+          </button>
+        }
+      >
+        <div className="space-y-3">
+          <div className="flex items-center gap-2 text-sm">
+            {oauthRunning ? (
+              <Loader2 size={16} className="animate-spin text-violet-500" />
+            ) : (
+              <KeyRound size={16} className="text-emerald-500" />
+            )}
+            <span>{oauthMsg || '等待授权…'}</span>
+          </div>
+          {oauthUrl && (
+            <div className="rounded-lg border border-slate-100 p-3 text-xs dark:border-zinc-800">
+              <p className="mb-1 text-slate-400">
+                若浏览器未自动打开，请手动访问授权页（勿泄露该链接）：
+              </p>
+              <p className="break-all font-mono text-[11px] text-slate-500 dark:text-zinc-400">{oauthUrl}</p>
+            </div>
+          )}
+          <p className="text-xs text-slate-400">
+            授权完成后本工具自动获取设备凭证（约 30 天有效，自动续期）入池，无需手工创建 PAT。
+          </p>
+        </div>
+      </Modal>
+
+      {/* 快照管理弹框（M3 Icube 档案；单应用无切换组，对齐 SnapshotModal 轻量化） */}
+      <Modal
+        open={showSnapshots}
+        onClose={() => {
+          if (!snapBusy) setShowSnapshots(false);
+        }}
+        title="登录态快照 · Qoder IDE"
+        footer={
+          <div className="flex w-full items-center justify-between">
+            <button
+              className="btn-ghost inline-flex items-center text-xs"
+              disabled={snapBusy != null}
+              onClick={() => void refreshSnapshots()}
+            >
+              <RefreshCw size={12} className="mr-1" /> 刷新
+            </button>
+            <button className="btn-ghost" disabled={snapBusy != null} onClick={() => setShowSnapshots(false)}>
+              {snapBusy ? '操作进行中…' : '关闭'}
+            </button>
+          </div>
+        }
+      >
+        <div className="space-y-3">
+          <div className="flex items-start gap-2 rounded-lg border border-sky-200 bg-sky-50 p-3 text-xs text-sky-700 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-300">
+            <Archive size={14} className="mt-0.5 shrink-0" />
+            <span>
+              快照保存于 data/profiles_qoder/&lt;账号 id&gt;/，含 IDE 登录态与本地存储；恢复到客户端时自动注入该账号
+              绑定的设备指纹。建议先在 IDE 登录目标账号后，于账号池点击「备份」保存其登录态。
+            </span>
+          </div>
+          {snapshotSlots.length === 0 ? (
+            <p className="py-4 text-center text-xs text-slate-400">
+              暂无快照。在账号池操作列点击「备份」为当前 IDE 登录态建档。
+            </p>
+          ) : (
+            <div className="rounded-lg border border-slate-200 dark:border-zinc-700">
+              <table className="w-full text-sm">
+                <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-zinc-900">
+                  <tr>
+                    <th className="px-3 py-1.5 text-left">账号</th>
+                    <th className="px-3 py-1.5 text-right">大小 / 文件数</th>
+                    <th className="px-3 py-1.5 text-right">最后修改</th>
+                    <th className="px-3 py-1.5 text-right">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {snapshotSlots.map((p) => {
+                    const a = accounts.find((x) => x.id === p.slot);
+                    const label = a?.nickname || p.slot;
+                    return (
+                      <tr key={p.slot} className="border-t border-slate-100 dark:border-zinc-800">
+                        <td className="px-3 py-1.5">
+                          <div className="font-medium">
+                            {label}
+                            {!a && <span className="ml-1 text-xs font-normal text-amber-500">（账号已移除）</span>}
+                          </div>
+                          <div className="text-xs text-slate-400">{p.slot}</div>
+                        </td>
+                        <td className="px-3 py-1.5 text-right text-xs tabular-nums text-slate-500">
+                          <SizeText bytes={p.size_bytes} /> · {p.file_count}
+                        </td>
+                        <td className="px-3 py-1.5 text-right text-xs text-slate-500">{p.last_modified || '-'}</td>
+                        <td className="px-3 py-1.5">
+                          <div className="flex justify-end gap-1">
+                            <button
+                              title="恢复（将该槽位快照恢复到 Qoder IDE，覆盖当前登录态）"
+                              className="btn-ghost !p-2 text-sky-500"
+                              disabled={snapBusy != null}
+                              onClick={() => void restoreSnapshot(p.slot, label)}
+                            >
+                              {snapBusy === p.slot ? <Loader2 size={14} className="animate-spin" /> : <ArchiveRestore size={14} />}
+                            </button>
+                            <button
+                              title="删除该槽位快照"
+                              className="btn-ghost !p-2 text-rose-500"
+                              disabled={snapBusy != null}
+                              onClick={() => void deleteSnapshot(p.slot, label)}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </Modal>
+
+      {/* PAT 导入弹框 */}
+      <Modal
+        open={showImport}
+        onClose={() => setShowImport(false)}
+        title="导入 Qoder PAT"
+        footer={
+          <>
+            <button className="btn-ghost" onClick={() => setShowImport(false)}>取消</button>
+            <button className="btn-primary" disabled={importing} onClick={() => void importPat()}>
+              {importing ? '导入中…' : '导入'}
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
+            <KeyRound size={14} className="mt-0.5 shrink-0" />
+            <span>
+              PAT 仅在创建页关闭前可见一次，请先在
+              <a href={PAT_URL} target="_blank" rel="noreferrer" className="mx-1 inline-flex items-center gap-0.5 underline">
+                qoder.com.cn/account/integrations <ExternalLink size={10} />
+              </a>
+              创建后立即粘贴到下方。PAT 等同密码，仅存储在本机。
+            </span>
+          </div>
+          <label className="block text-sm">
+            <span className="mb-1 block text-xs text-slate-500">备注名（可选）</span>
+            <input
+              className="input w-full"
+              value={patName}
+              onChange={(e) => setPatName(e.target.value)}
+              placeholder="如：主号 / 工作号"
+            />
+          </label>
+          <label className="block text-sm">
+            <span className="mb-1 block text-xs text-slate-500">Personal Access Token（pt- 前缀）</span>
+            <input
+              className="input w-full font-mono"
+              value={patValue}
+              onChange={(e) => setPatValue(e.target.value)}
+              placeholder="pt-..."
+              type="password"
+            />
+          </label>
+        </div>
+      </Modal>
+
+      {/* 指纹查看弹框（§5.10 每账号稳定绑定） */}
+      <Modal
+        open={fpViewing != null}
+        onClose={() => setFpViewing(null)}
+        title={`设备指纹 · ${fpViewing?.nickname || fpViewing?.id || ''}`}
+        footer={
+          <button className="btn-ghost" onClick={() => setFpViewing(null)}>关闭</button>
+        }
+      >
+        {fpViewing && (
+          <div className="space-y-3">
+            <div className="flex items-start gap-2 rounded-lg border border-violet-200 bg-violet-50 p-3 text-xs text-violet-700 dark:border-violet-500/30 dark:bg-violet-500/10 dark:text-violet-300">
+              <Fingerprint size={14} className="mt-0.5 shrink-0" />
+              <span>
+                每账号稳定绑定指纹（多账号并发）：入池时生成一次并持久保存，永不轮换。
+                签到/积分请求缺少真实捕获设备头时，以 machine_id 注入 Cosy-MachineId，
+                machine_token 每次现场随机（服务端无强绑定校验）。移除账号将同步删除其指纹。
+              </span>
+            </div>
+            {(
+              [
+                ['Cosy-MachineId（machine_id）', fpViewing.device_profile?.machine_id],
+                ['Device ID（device_id）', fpViewing.device_profile?.device_id],
+                ['UMID（umid）', fpViewing.device_profile?.umid],
+              ] as const
+            ).map(([label, val]) => (
+              <div key={label} className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+                <div className="mb-1 flex items-center justify-between">
+                  <span className="text-xs text-slate-400">{label}</span>
+                  <button
+                    className="btn-ghost h-6 !px-2 text-[11px]"
+                    onClick={() => void copyText(val || '', label)}
+                  >
+                    复制
+                  </button>
+                </div>
+                <p className="break-all font-mono text-xs text-slate-600 dark:text-zinc-300">
+                  {val || '—'}
+                </p>
+              </div>
+            ))}
+          </div>
+        )}
+      </Modal>
+
+      {/* 编辑弹框 */}
+      <Modal
+        open={editing != null}
+        onClose={() => setEditing(null)}
+        title="编辑账号"
+        footer={
+          <>
+            <button className="btn-ghost" onClick={() => setEditing(null)}>取消</button>
+            <button className="btn-primary" disabled={editBusy} onClick={() => void saveEdit()}>
+              {editBusy ? '保存中…' : '保存'}
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <label className="block text-sm">
+            <span className="mb-1 block text-xs text-slate-500">显示名</span>
+            <input className="input w-full" value={editName} onChange={(e) => setEditName(e.target.value)} />
+          </label>
+          <label className="block text-sm">
+            <span className="mb-1 block text-xs text-slate-500">备注</span>
+            <input className="input w-full" value={editNote} onChange={(e) => setEditNote(e.target.value)} />
+          </label>
+        </div>
+      </Modal>
+
+      {/* 导出账号池弹框（M4，对照 BuddyAccounts F-46 扩展）：可选是否附带凭证副本 */}
+      <Modal
+        open={exportOpen}
+        onClose={() => {
+          if (!exportBusy) setExportOpen(false);
+        }}
+        title="导出 Qoder 账号池"
+        footer={
+          <>
+            <button className="btn-ghost" disabled={exportBusy} onClick={() => setExportOpen(false)}>
+              取消
+            </button>
+            <button className="btn-primary" disabled={exportBusy} onClick={() => void confirmExport()}>
+              {exportBusy ? '导出中…' : '确认导出'}
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <label className="flex cursor-pointer items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="mt-1"
+              checked={exportWithCreds}
+              onChange={(e) => setExportWithCreds(e.target.checked)}
+            />
+            <span>
+              附带凭证副本（access_token / PAT）
+              <span className="ml-1 text-xs text-slate-400">不勾选时仅导出元数据，导入后需重新获取凭证</span>
+            </span>
+          </label>
+          <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
+            <ShieldAlert size={14} className="mt-0.5 shrink-0" />
+            <span>含凭证的导出文件等同密码，请妥善保管，切勿通过不可信渠道传输。</span>
+          </div>
+          <p className="text-xs text-slate-400">
+            导出格式 kind=aiwork-qoder-pool；导入端按 uid 幂等合并——已有账号仅补全空缺字段，设备指纹仅在本地为空时补入，绝不覆盖。
+          </p>
+        </div>
+      </Modal>
+
+      {/* 环境重置弹框（M4，对照 BuddyAccounts F-14，无 Keycloak 步骤）：8 项勾选 → 二次确认 → 逐项结果 */}
+      <Modal
+        open={resetOpen}
+        onClose={() => {
+          if (!resetBusy) setResetOpen(false);
+        }}
+        title="Qoder 环境重置"
+        footer={
+          resetResults ? (
+            <button className="btn-ghost" disabled={resetBusy} onClick={() => setResetOpen(false)}>
+              关闭
+            </button>
+          ) : resetConfirming ? (
+            <>
+              <button className="btn-ghost" disabled={resetBusy} onClick={() => setResetConfirming(false)}>
+                再想想
+              </button>
+              <button
+                className="btn-primary"
+                disabled={resetBusy || resetChecked.size === 0}
+                onClick={() => void confirmEnvReset()}
+              >
+                {resetBusy ? '执行中…' : `确认执行（${resetChecked.size} 项）`}
+              </button>
+            </>
+          ) : (
+            <>
+              <button className="btn-ghost" disabled={resetBusy} onClick={() => setResetOpen(false)}>
+                取消
+              </button>
+              <button
+                className="btn-primary"
+                disabled={resetBusy || resetChecked.size === 0}
+                onClick={() => setResetConfirming(true)}
+              >
+                执行清理（已选 {resetChecked.size} 项）
+              </button>
+            </>
+          )
+        }
+      >
+        <div className="space-y-3">
+          {resetResults ? (
+            <div className="space-y-2">
+              {resetResults.map((r) => (
+                <div
+                  key={r.id}
+                  className="flex items-start justify-between gap-2 rounded-lg border border-slate-100 p-2.5 text-xs dark:border-zinc-800"
+                >
+                  <div className="min-w-0">
+                    <div className="font-medium">{resetItems.find((x) => x.id === r.id)?.label || r.id}</div>
+                    <div className="mt-0.5 break-all text-slate-400">{r.detail}</div>
+                  </div>
+                  <Badge tone={r.ok ? 'green' : 'red'}>{r.ok ? '成功' : '失败'}</Badge>
+                </div>
+              ))}
+            </div>
+          ) : resetConfirming ? (
+            <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">
+              <ShieldAlert size={14} className="mt-0.5 shrink-0" />
+              <span>
+                不可逆操作：将清除所选 {resetChecked.size} 项的认证残留（含 IDE 登录态与机器标识），
+                执行时会自动关闭 Qoder CN。清除后需重新登录才能继续使用。
+              </span>
+            </div>
+          ) : (
+            <>
+              <div className="space-y-1.5">
+                {resetItems.map((item, i) => (
+                  <label
+                    key={item.id}
+                    className="flex cursor-pointer items-start gap-2 rounded-lg border border-slate-100 p-2.5 text-sm dark:border-zinc-800"
+                  >
+                    <input
+                      type="checkbox"
+                      className="mt-1"
+                      checked={resetChecked.has(item.id)}
+                      onChange={() => toggleResetItem(item.id)}
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-center gap-1.5">
+                        <span className="font-mono text-[11px] text-slate-400">{String(i + 1).padStart(2, '0')}</span>
+                        <span className="font-medium">{item.label}</span>
+                        {!item.exists && <Badge tone="slate">未检测到</Badge>}
+                      </span>
+                      <span className="mt-0.5 block text-xs text-slate-400">{item.detail}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+              <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
+                <ShieldAlert size={14} className="mt-0.5 shrink-0" />
+                <span>
+                  将清除本机 Qoder CN 的全部认证残留（默认勾选已检测到的项）；执行时会自动关闭 Qoder CN，
+                  不影响应用本体安装。Qoder 无 SSO 注销对应物，仅清理本地残留。
+                </span>
+              </div>
+            </>
+          )}
+        </div>
+      </Modal>
+    </div>
+  );
+}

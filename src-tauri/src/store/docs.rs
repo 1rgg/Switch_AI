@@ -1292,3 +1292,127 @@ pub fn doubao_health_save(s: &Store, events: &[Value]) -> Result<(), String> {
         Err(e)
     })
 }
+
+// ── Qoder 账号池（F-80 M1；qoder_accounts 表，Value 语义，与 wb_pool 同款）──
+
+/// 读整池（结构 {accounts: [...]}；账号对象原样保真）
+pub fn qoder_pool_load(s: &Store) -> Value {
+    let accounts: Vec<Value> = s
+        .rows_all("qoder_accounts")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    json!({ "accounts": accounts })
+}
+
+/// 写整池（pk = 账号 id，缺 id 用序号占位）
+pub fn qoder_pool_save(s: &Store, pool: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = pool.get("accounts").and_then(Value::as_array).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> = arr
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let id = a.get("id").and_then(Value::as_str).filter(|s| !s.is_empty());
+            (id.map(String::from).unwrap_or_else(|| format!("__idx{i}")), a.clone())
+        })
+        .collect();
+    s.rows_replace("qoder_accounts", &rows)
+}
+
+// ── Qoder token store（qoder_tokens 表；结构 {version, tokens: {id: rec}}）──
+
+/// 读整库（损坏行过滤丢弃，不混入消费方；version 存 kv qoder_tokens_meta）
+pub fn qoder_token_store_load(s: &Store) -> Value {
+    let tokens: serde_json::Map<String, Value> = s
+        .rows_all("qoder_tokens")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, v)| v.is_object())
+        .collect();
+    let version = s.kv_get_raw("qoder_tokens_meta").and_then(|v| v.parse::<i64>().ok());
+    let mut root = serde_json::Map::new();
+    root.insert("tokens".into(), Value::Object(tokens));
+    if let Some(v) = version {
+        root.insert("version".into(), json!(v));
+    }
+    Value::Object(root)
+}
+
+/// 写整库（version 闸门由调用方维持，此处整表替换）
+pub fn qoder_token_store_save(s: &Store, store_val: &Value) -> Result<(), String> {
+    let empty = serde_json::Map::new();
+    let tokens = store_val.get("tokens").and_then(Value::as_object).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> =
+        tokens.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    s.rows_replace("qoder_tokens", &rows)?;
+    if let Some(v) = store_val.get("version").and_then(Value::as_i64) {
+        s.kv_set_raw("qoder_tokens_meta", &v.to_string())?;
+    }
+    Ok(())
+}
+
+// ── Qoder 签到结果（qoder_checkin_results 表；行文档 + 90 天滚动由调用方裁剪）──
+
+/// 读回 {results: [...]}（按 pk 升序 = 原追加序）
+pub fn qoder_checkin_results_load(s: &Store) -> Value {
+    let results: Vec<Value> = s
+        .rows_all("qoder_checkin_results")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect();
+    json!({ "results": results })
+}
+
+/// 整表替换（90 天裁剪由调用方计算后传入）
+pub fn qoder_checkin_results_save(s: &Store, root: &Value) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = root.get("results").and_then(Value::as_array).unwrap_or(&empty);
+    let rows: Vec<(String, Value)> = arr
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            // pk = date|user_id|idx（同日同账号多活动记录共存）
+            let date = r.get("date").and_then(Value::as_str).unwrap_or("");
+            let uid = r.get("user_id").and_then(Value::as_str).unwrap_or("");
+            (format!("{date}|{uid}|{i}"), r.clone())
+        })
+        .collect();
+    s.rows_replace("qoder_checkin_results", &rows)
+}
+
+// ── Qoder 每日积分快照（qoder_credits_history 表；pk = date，同日覆盖）──────
+
+/// 读全部快照（按 pk 升序 = 日期升序）
+pub fn qoder_credits_history_load(s: &Store) -> Vec<Value> {
+    s.rows_all("qoder_credits_history")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(_, data)| data)
+        .collect()
+}
+
+/// 同日覆盖 upsert + 365 天裁剪（pk 即 date，YYYY-MM-DD 字符串比较即时间序）
+pub fn qoder_credits_history_upsert(s: &Store, snap: &Value) -> Result<(), String> {
+    let date = snap.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+    if date.is_empty() {
+        return Err("快照缺少 date 字段".into());
+    }
+    s.row_upsert("qoder_credits_history", &date, snap)?;
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(365))
+        .format("%Y-%m-%d")
+        .to_string();
+    let stale: Vec<String> = s
+        .rows_all("qoder_credits_history")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pk, _)| pk)
+        .filter(|pk| pk.as_str() < cutoff.as_str())
+        .collect();
+    for pk in stale {
+        let _ = s.with_conn(|c| c.execute("DELETE FROM qoder_credits_history WHERE pk = ?1", [&pk]));
+    }
+    Ok(())
+}

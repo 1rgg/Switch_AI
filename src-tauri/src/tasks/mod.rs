@@ -17,6 +17,12 @@
 pub mod doubao_chats;
 pub mod doubao_quota;
 pub mod doubao_session;
+pub mod qoder_checkin;
+pub mod qoder_common;
+pub mod qoder_credits;
+pub mod qoder_device;
+pub mod qoder_oauth;
+pub mod qoder_refresh;
 pub mod scheduler;
 pub mod trae_checkin;
 pub mod ui_click;
@@ -83,6 +89,19 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
             wb_checkin::run_growth_round(state, &flags, &[], &mut print_progress);
             Ok(serde_json::json!({ "ok": true }))
         }
+        // Qoder 每日签到（F-80；schtasks 直调 + 应用内调度器共用；10:15 单次覆盖双活动）
+        "qoder-checkin" => {
+            let s = crate::commands::qoder::load_settings(state);
+            let opts = qoder_checkin::QoderCheckinOpts {
+                multi_account_enabled: s.multi_account_enabled,
+                ..qoder_checkin::QoderCheckinOpts::daily()
+            };
+            Ok(qoder_checkin::run_checkin_round(state, &opts, &mut print_progress))
+        }
+        // Qoder 积分快照（调度器/CLI 共用；空池自然空转）
+        "qoder-credits-snapshot" => qoder_credits::run_snapshot_task(state),
+        // Qoder 凭证 6h 兜底刷新（调度器/CLI 共用；空池空转）
+        "qoder-refresh" => qoder_refresh::run_task(state),
         // Trae JWT 定时续期（issue #27；调度器/CLI 共用批量惰性刷新）
         "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(state),
         // Trae 每日签到：vault 解密全量账号跑单轮
@@ -109,6 +128,7 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                     proxy_port: None,
                     include_indexeddb: false,
                     expected_current_uid: String::new(),
+                    machine_id_override: None,
                     data_dir: state.data_dir.clone(),
                 },
                 &sink,

@@ -126,10 +126,10 @@ interface AppState {
   removeGroup: (id: string) => Promise<void>;
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
   resetDevice: (userId: string) => Promise<void>;
-  switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') => Promise<void>;
+  switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') => Promise<void>;
   /** C1：一键以账号 X 打开豆包（恢复快照后拉起客户端；代理运行中时注入代理） */
   openDoubaoAs: (userId: string, proxyPort?: number) => Promise<void>;
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') => Promise<void>;
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') => Promise<void>;
   renewJwt: (userId: string) => Promise<void>;
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
   startCheckin: (opts: {
@@ -181,7 +181,7 @@ function defaultSettings(): Settings {
     wb_auth_file_path: null,
     data_dir: null,
     log_retention_days: 30,
-    proxy_domains: 'trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com',
+    proxy_domains: 'trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com,qoder.com.cn',
     proxy_log_path: null,
     api_port: 7864,
     api_default_model: 'deepseek-v4-flash',
@@ -213,6 +213,12 @@ function defaultSettings(): Settings {
     notify_bark_url: null,
     notify_webhook_url: null,
     notify_serverchan_sendkey: null,
+    // Qoder（F-80）：客户端路径与调度时刻/开关（默认 10:15 签到 / 23:40 快照）
+    qoder_ide_path: null,
+    qoderwork_path: null,
+    qoder_checkin_hhmm: '10:15',
+    qoder_credits_sync_hhmm: '23:40',
+    qoder_credits_sync_enabled: true,
   };
 }
 

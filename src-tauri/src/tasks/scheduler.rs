@@ -65,11 +65,19 @@ const TASKS: &[SchedTask] = &[
     SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30", kind: "fix" },
     SchedTask { key: "doubao-keepalive", name: "豆包会话每日续期", hhmm: "09:20", kind: "fix" },
     SchedTask { key: "doubao-quota", name: "豆包会员额度每日巡检", hhmm: "09:30", kind: "fix" },
+    // F-80 Qoder 每日签到：默认 10:15 单次覆盖「0 点签到」与「10:00 登录奖励」双活动
+    //（§2.2 调度设计结论；settings.qoder_checkin_hhmm 可改，任务配置页）
+    SchedTask { key: "qoder-checkin", name: "Qoder 每日签到", hhmm: "10:15", kind: "fix" },
     // 看板数据同步（原快照任务升级为可配置频率：每日 HH:MM / 每小时 / 关闭）：
     // wb 侧含积分 fresh 拉取+池回写+快照、Token 统计重扫与官方用量刷新；
     // 排到晚間接近日末，差分口径最准；此前无定时写入是近 7 日消耗缺天的根因
     SchedTask { key: "wb-credits-snapshot", name: "WorkBuddy 积分与 Token 数据同步", hhmm: "23:30", kind: "credits" },
     SchedTask { key: "trae-credits-snapshot", name: "Trae 积分数据同步", hhmm: "23:40", kind: "credits" },
+    // F-80 Qoder 积分快照：每日 HH:MM（settings.qoder_credits_sync_hhmm 可改，开关独立）
+    SchedTask { key: "qoder-credits-snapshot", name: "Qoder 积分快照", hhmm: "23:40", kind: "fix" },
+    // F-80 Qoder 凭证 6h 兜底刷新（kind "refresh" → EveryHours(6)；hhmm 不参与判定）。
+    // 恒开、空池空转，无 settings 键——对齐 doubao-keepalive 惯例（规避「有配置无 UI」死配置）
+    SchedTask { key: "qoder-refresh", name: "Qoder 凭证定时刷新", hhmm: "06:00", kind: "refresh" },
     // 模型同步（每日 HH:MM，默认开；无账号时静默跳过不计失败，对齐 models-sync 惯例）
     SchedTask { key: "trae-models-sync", name: "Trae 模型列表同步", hhmm: "05:40", kind: "models" },
     SchedTask { key: "wb-catalog-sync", name: "WorkBuddy 模型目录同步", hhmm: "05:45", kind: "models" },
@@ -91,13 +99,18 @@ pub fn start(app: AppHandle) {
 const RETRY_COOLDOWN_MS: i64 = 30 * 60_000;
 /// hourly 模式节流：距上次成功执行 ≥1h 才再跑（失败走 30 分钟冷却，不受此门限制）
 const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
+/// qoder-refresh 档位：每 6 小时兜底刷新一次凭证（设计 v1.3 §M4；
+/// 客户端 token 惰性窗 7h > 6h 调度间隔，任一 tick 必落窗内，确保过期令牌被续）
+const REFRESH_INTERVAL_HOURS: i64 = 6;
 
 /// 单任务的生效调度计划：Skip=关闭；Daily=每日 HH:MM（到点+当日未跑，启动补跑）；
-/// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）
+/// Hourly=每小时（距上次成功执行 ≥1h，无记录=首次立即跑）；
+/// EveryHours(h)=每 h 小时（距上次成功执行 ≥h·1h，无记录=首次立即跑）
 enum SchedPlan {
     Skip,
     Daily(String),
     Hourly,
+    EveryHours(i64),
 }
 
 /// credits 类任务的同步模式（空/未知值按 daily 处理——state::settings 已归一，此处兜底）
@@ -121,6 +134,8 @@ fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
     match t.kind {
         // 看板数据同步：hourly 按小时节流，daily（含非法值回退）按每日时刻
         "credits" if credits_sync_mode(st, t.key) == "hourly" => SchedPlan::Hourly,
+        // Qoder 凭证兜底刷新：固定每 6 小时（无 settings 键，恒开）
+        "refresh" => SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS),
         _ => SchedPlan::Daily(effective_hhmm(st, t)),
     }
 }
@@ -131,7 +146,7 @@ fn tick(st: &AppState) {
     let today = now.format("%Y-%m-%d").to_string();
     let now_hm = now.format("%H:%M").to_string();
     for t in TASKS {
-        // 触发判定（trigger 用于日志展示：HH:MM 或「每小时」）
+        // 触发判定（trigger 用于日志展示：「每日 HH:MM」/「每小时」/「每N小时」）
         let trigger = match sched_plan(st, t) {
             SchedPlan::Skip => continue,
             SchedPlan::Daily(hhmm) => {
@@ -142,7 +157,7 @@ fn tick(st: &AppState) {
                 if now_hm.as_str() < hhmm.as_str() {
                     continue;
                 }
-                hhmm
+                format!("每日 {hhmm}")
             }
             SchedPlan::Hourly => {
                 if let Some(ts) = last_run_ts(st, t.key) {
@@ -151,6 +166,14 @@ fn tick(st: &AppState) {
                     }
                 }
                 "每小时".to_string()
+            }
+            SchedPlan::EveryHours(hours) => {
+                if let Some(ts) = last_run_ts(st, t.key) {
+                    if chrono::Utc::now().timestamp_millis() - ts < hours * HOURLY_INTERVAL_MS {
+                        continue;
+                    }
+                }
+                format!("每{hours}小时")
             }
         };
         // 失败冷却：30 分钟内静默等待重试，不重复执行也不刷日志
@@ -167,7 +190,7 @@ fn tick(st: &AppState) {
         match outcome {
             Ok(summary) => {
                 mark_run(st, t.key, &today, &summary);
-                fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（每日 {}）：{}", t.name, trigger, summary));
+                fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）：{}", t.name, trigger, summary));
             }
             Err(summary) => {
                 // 当日首败判定（在 mark_fail 覆盖前读旧值）：上次失败不在今天 → 今天首次失败。
@@ -182,7 +205,7 @@ fn tick(st: &AppState) {
                     }
                 };
                 mark_fail(st, t.key, &summary);
-                fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（每日 {}）失败，30 分钟后重试：{}", t.name, trigger, summary));
+                fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）失败，30 分钟后重试：{}", t.name, trigger, summary));
                 // 调度任务失败通知（通知渠道面板）：推 Bark/Webhook/Server酱（无 AppHandle，仅渠道；
                 // 渠道失败静默，绝不影响调度循环）
                 if first_fail_today {
@@ -210,6 +233,8 @@ fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
         "wb-checkin" => Some(st.settings().wb_checkin_hhmm),
         "wb-credits-snapshot" => Some(st.settings().wb_credits_sync_hhmm),
         "trae-credits-snapshot" => Some(st.settings().trae_credits_sync_hhmm),
+        "qoder-checkin" => Some(st.settings().qoder_checkin_hhmm),
+        "qoder-credits-snapshot" => Some(st.settings().qoder_credits_sync_hhmm),
         "wb-catalog-sync" => Some(st.settings().wb_catalog_sync_hhmm),
         "trae-models-sync" => Some(st.settings().trae_models_sync_hhmm),
         _ => None,
@@ -246,6 +271,10 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "trae-renew" => st.settings().jwt_renew_enabled,
         // WorkBuddy 每日成长（任务配置页）：跟随成长调度开关（默认开）
         "wb-growth" => st.settings().wb_growth_enabled,
+        // F-80 Qoder：签到跟随环境配置开关（qoder_settings.auto_checkin 默认开）；
+        // 积分快照独立开关（默认开；无账号时任务内部静默跳过不计失败）
+        "qoder-checkin" => crate::commands::qoder::load_settings(st).auto_checkin,
+        "qoder-credits-snapshot" => st.settings().qoder_credits_sync_enabled,
         // 看板数据同步（积分/Token）：mode=off 即关闭（hourly/daily 均视为启用）
         "wb-credits-snapshot" | "trae-credits-snapshot" => credits_sync_mode(st, key) != "off",
         // 模型同步开关（默认开；无账号时任务内部静默跳过不计失败）
@@ -291,6 +320,20 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(st),
         // WorkBuddy token 兜底续期：与 `--task-run wb-renew` 同款（lazy 24h）
         "wb-renew" => Ok(super::wb_checkin::run_renew_only(st, 24)),
+        // F-80 Qoder 每日签到：与 `--task-run qoder-checkin` 同款；抢轮次锁与 UI 路径互斥
+        "qoder-checkin" => {
+            let Ok(_round) = crate::tasks::qoder_checkin::try_acquire_qoder_round() else {
+                return Err("跳过：已有 Qoder 签到任务在执行中".into());
+            };
+            let s = crate::commands::qoder::load_settings(st);
+            let opts = super::qoder_checkin::QoderCheckinOpts {
+                multi_account_enabled: s.multi_account_enabled,
+                ..super::qoder_checkin::QoderCheckinOpts::daily()
+            };
+            Ok(super::qoder_checkin::run_checkin_round(st, &opts, &mut |_| {}))
+        }
+        // F-80 Qoder 积分快照：与 `--task-run qoder-credits-snapshot` 同款（空池空转）
+        "qoder-credits-snapshot" => super::qoder_credits::run_snapshot_task(st),
         // 豆包会话每日续期：与 `--task-run doubao-keepalive` 同款
         "doubao-keepalive" => {
             let sink = crate::switcher::CliSink::new(&st.data_dir);
@@ -302,6 +345,7 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                     proxy_port: None,
                     include_indexeddb: false,
                     expected_current_uid: String::new(),
+                    machine_id_override: None,
                     data_dir: st.data_dir.clone(),
                 },
                 &sink,
@@ -443,9 +487,10 @@ pub fn scheduler_status(st: tauri::State<AppState>) -> Value {
         .iter()
         .map(|t| {
             let e = raw.pointer(&format!("/tasks/{}", t.key)).cloned().unwrap_or(Value::Null);
-            // 展示时刻：hourly → 「每小时」；关闭 → 「已关闭」；其余 HH:MM
+            // 展示时刻：hourly → 「每小时」；EveryHours(h) → 「每h小时」；关闭 → 「已关闭」；其余 HH:MM
             let time = match sched_plan(&st, t) {
                 SchedPlan::Hourly => "每小时".to_string(),
+                SchedPlan::EveryHours(h) => format!("每{h}小时"),
                 SchedPlan::Daily(hhmm) => hhmm,
                 SchedPlan::Skip => "已关闭".to_string(),
             };
@@ -475,6 +520,7 @@ mod tests {
         AppState {
             data_dir: dir,
             jwt_refresh_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            qoder_pool_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 

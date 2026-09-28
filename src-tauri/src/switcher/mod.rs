@@ -67,6 +67,8 @@ pub enum TargetApp {
     Doubao,
     WorkBuddy,
     CodeBuddy,
+    /// F-80 M3：Qoder CN IDE（复用 icube 布局；QoderWork 即本端官方别名——v1.4.1 产品同一性澄清，无独立档案）
+    Qoder,
 }
 
 impl TargetApp {
@@ -78,6 +80,7 @@ impl TargetApp {
             "Doubao" => TargetApp::Doubao,
             "WorkBuddy" => TargetApp::WorkBuddy,
             "CodeBuddy" => TargetApp::CodeBuddy,
+            "Qoder" => TargetApp::Qoder,
             _ => TargetApp::TraeWork,
         }
     }
@@ -95,6 +98,9 @@ pub struct RunArgs {
     pub include_indexeddb: bool,
     /// -ExpectedCurrentUid（防误覆盖守卫：桌面端关闭前检测到的当前登录 uid）
     pub expected_current_uid: String,
+    /// F-80 §5.10.2 Qoder 专用：账号绑定 machine_id（切换/恢复成功后对本地存储
+    /// 三层覆写）；None = 不覆写（其余应用恒 None）
+    pub machine_id_override: Option<String>,
     /// AIWORKDATA_DIR 等价物（进程内直传；CLI 模式来自 AppState）
     pub data_dir: PathBuf,
 }
@@ -111,6 +117,8 @@ pub struct Session {
     /// PS $Script:LaunchProxyPort（>0 启动注入 --proxy-server）
     pub launch_proxy_port: Option<u16>,
     pub include_indexeddb: bool,
+    /// F-80 §5.10.2：账号绑定 machine_id（Qoder 切换/恢复后本地指纹覆写取值）
+    pub machine_id_override: Option<String>,
     /// authfile 布局：共享 auth 文件目录与文件（$Script:WbAuthDir/WbAuthFile；
     /// 独立字段便于测试注入临时路径）
     pub auth_dir: PathBuf,
@@ -126,6 +134,7 @@ impl Session {
             last_restored_count: -1,
             launch_proxy_port: args.proxy_port,
             include_indexeddb: args.include_indexeddb,
+            machine_id_override: args.machine_id_override.clone(),
             auth_dir: authfile::wb_auth_dir(),
             auth_file: authfile::wb_auth_file(),
         }
@@ -470,6 +479,7 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
             proc::stop_app(&mut sess, sink)?;
             backup_current(&sess, "last", sink)?;
             restore_profile(&mut sess, uid.trim(), sink)?;
+            apply_fingerprint_override(&sess, sink);
             set_current_account(&sess, uid.trim());
             proc::start_app(&mut sess, sink)?;
             done(
@@ -494,6 +504,32 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
     // 备份失败/设备重置未接入等）已在错误点经 thrown() 补发 fatal「失败: {msg}」；
     // PS 直接 exit 1 路径（预检失败/恢复后校验回滚完成）自带 fatal 行。此处透传。
     r
+}
+
+/// F-80 §5.10.2：Qoder 本地存储设备指纹覆写挂点（切号/恢复成功后、启动前）。
+/// 仅 icube 布局且 Session 携带 machine_id_override 时执行：machineid 文件 +
+/// storage.json 遥测三键 + state.vscdb storage.serviceMachineId 三层统一覆写为
+/// 账号绑定值。失败仅 Warn 不阻断切换（API 请求侧指纹由 tasks::qoder_common 独立
+/// 生效）；快照无效回滚路径在挂点之前 return，不会污染切换前现场。
+fn apply_fingerprint_override(sess: &Session, sink: &dyn ProgressSink) {
+    if sess.prof.layout != Layout::Icube {
+        return;
+    }
+    let Some(mid) = sess.machine_id_override.as_deref() else {
+        return;
+    };
+    match machine::apply_qoder_fingerprint(&sess.prof.data_dir, mid) {
+        Ok(n) => sink.step(
+            "fingerprint",
+            StepStatus::Ok,
+            &format!("本地设备指纹已按账号绑定覆写（{n} 处）"),
+        ),
+        Err(e) => sink.step(
+            "fingerprint",
+            StepStatus::Warn,
+            &format!("本地设备指纹覆写失败（不阻断切换）: {e}"),
+        ),
+    }
 }
 
 /// Switch 主流程（PS 1415-1477 逐段对译，含防误覆盖守卫与恢复后校验回滚）
@@ -583,6 +619,7 @@ fn switch_flow(
         }
     }
 
+    apply_fingerprint_override(sess, sink);
     set_current_account(sess, uid);
     proc::start_app(sess, sink)?;
 
@@ -700,6 +737,7 @@ mod tests {
             proxy_port: None,
             include_indexeddb: false,
             expected_current_uid: String::new(),
+            machine_id_override: None,
             data_dir: dir.clone(),
         };
         args.target_app = TargetApp::TraeWork;
@@ -728,6 +766,7 @@ mod tests {
                 proxy_port: None,
                 include_indexeddb: false,
                 expected_current_uid: String::new(),
+                machine_id_override: None,
                 data_dir: std::env::temp_dir(),
             },
             &sink,
@@ -751,6 +790,7 @@ mod tests {
                 proxy_port: None,
                 include_indexeddb: false,
                 expected_current_uid: String::new(),
+                machine_id_override: None,
                 data_dir: std::env::temp_dir(),
             },
             &sink,

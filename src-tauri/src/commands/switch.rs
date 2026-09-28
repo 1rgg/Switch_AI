@@ -49,6 +49,7 @@ fn buddy_target_slot_exists(data_dir: &std::path::Path, app: BuddyApp, uid: &str
 }
 
 /// 构造切/存/恢复类命令的通用入参
+#[allow(clippy::too_many_arguments)]
 fn build_args(
     action: Action,
     target_app: Option<&str>,
@@ -56,6 +57,7 @@ fn build_args(
     proxy_port: Option<u16>,
     include_indexeddb: bool,
     expected_current_uid: String,
+    machine_id_override: Option<String>,
     data_dir: std::path::PathBuf,
 ) -> RunArgs {
     RunArgs {
@@ -65,6 +67,7 @@ fn build_args(
         proxy_port: proxy_port.filter(|p| *p > 0),
         include_indexeddb,
         expected_current_uid,
+        machine_id_override,
         data_dir,
     }
 }
@@ -122,6 +125,8 @@ pub fn switch_account(
     // JWT 预检仅 TRAE 双应用（TraeWork/Trae，含默认）：WorkBuddy/CodeBuddy 会话模型不同，
     // 且其 uid 与 TRAE 账号池撞库时会被误探活错误拦截——非 trae 一律放行（CodeBuddy 同 WorkBuddy）
     let is_trae = matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae"));
+    // F-80 §5.10.2：Qoder 切号需携带账号绑定 machine_id 做本地存储指纹覆写
+    let is_qoder = target_app.as_deref() == Some("Qoder");
     let include_idb = is_doubao && state.settings().doubao_snapshot_include_idb;
     // 切换前服务端会话预检（仅豆包）：目标槽位快照里的会话若已被服务端吊销——常见于
     // 在豆包客户端内退出登录/重登该账号（passport logout 吊销旧会话，快照文件却完好）——
@@ -255,6 +260,12 @@ pub fn switch_account(
         None
     };
 
+    // F-80 §5.10.2：Qoder 切号取账号绑定 machine_id（池内 device_profile；无档案 → None 跳过覆写）
+    let machine_id = if is_qoder {
+        crate::commands::qoder::machine_id_of(&state, user_id.trim())
+    } else {
+        None
+    };
     let args = build_args(
         Action::Switch,
         target_app.as_deref(),
@@ -262,6 +273,7 @@ pub fn switch_account(
         proxy_port,
         include_idb,
         expected_uid,
+        machine_id,
         state.data_dir.clone(),
     );
     // 后台线程执行（流程含最长 ~45s 等待：优雅关闭 8s + auth 静默 10s + verify 30s，
@@ -269,10 +281,12 @@ pub fn switch_account(
     let app2 = app.clone();
     let uid_for_dc = user_id.clone();
     let is_doubao2 = is_doubao;
+    let is_qoder2 = is_qoder;
     run_in_background(app2, "switch-progress", "switch-done", args, migrate_job, Some(Box::new(move |_app, dc_dir| {
         // 切换成功后补充该账号的账户中心（icube-dc）id 预留记录（只记录不展示）
-        // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
-        if !is_doubao2 {
+        // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过；
+        // Qoder 无 icube-dc 通道（qoder_uid 另行回填），同样跳过
+        if !is_doubao2 && !is_qoder2 {
             let _ = crate::commands::trae_apps::backfill_dc_id_for(dc_dir, &uid_for_dc);
         }
     })));
@@ -341,15 +355,18 @@ pub fn save_current_login(
         None,
         include_idb,
         String::new(),
+        None,
         state.data_dir.clone(),
     );
     let is_doubao = target_app.as_deref() == Some("Doubao");
+    let is_qoder = target_app.as_deref() == Some("Qoder");
     let app2 = app.clone();
     let uid_for_dc = user_id.clone();
     run_in_background(app2, "save-login-progress", "save-login-done", args, None, Some(Box::new(move |_app, dc_dir| {
         // 保存登录态成功后同样补充 dc id 预留记录（快照刚生成，来源最可靠）
-        // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过
-        if !is_doubao {
+        // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过；
+        // Qoder 无 icube-dc 通道，同样跳过
+        if !is_doubao && !is_qoder {
             let _ = crate::commands::trae_apps::backfill_dc_id_for(dc_dir, &uid_for_dc);
         }
     })));
@@ -378,6 +395,7 @@ pub fn reset_device_ids(
         None,
         false,
         String::new(),
+        None,
         state.data_dir.clone(),
     );
     run_in_background(app, "device-reset-progress", "device-reset-done", args, None, None);

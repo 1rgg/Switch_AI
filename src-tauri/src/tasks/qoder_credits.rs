@@ -1,0 +1,407 @@
+//! Qoder 积分引擎（F-80；M0 抓包固化，对照 wb_credits.rs 模式）。
+//!
+//! 三通道取数设计（§5.3，按可用性降级）：
+//! - A（首选官方）：PAT `pt-` 直调 usage（jobToken 通道见下，M2 评估）
+//! - B：客户端 token（dt-/jt-，MITM 捕获透传）直调 usage
+//! - C：CLI `/usage` 输出解析 —— M4 评估
+//!
+//! R-7 已闭合（2026-09-27 抓包实测）——真正的用量端点是：
+//!   `GET {open_api}/sash/api/v2/me/usage`（Bearer + cosy-clienttype:10，UA "Qoder"）
+//! 响应（设计文档猜测的 /api/v2/quota/usage 客户端并未调用）：
+//! ```json
+//! { "displayMode":"qoder", "qoderUsage": {
+//!     "userId":"...", "userType":"personal_professional_trial", "usageType":"credits",
+//!     "isQuotaExceeded":false, "expiresAt":1791673619906,
+//!     "userQuota":  { "total":300, "used":0, "remaining":300, "percentage":0, "unit":"credits" },
+//!     "addOnQuota": { "total":100, "used":0, "remaining":100, "percentage":0,
+//!                     "unit":"credits", "detailUrl":"https://qoder.com/account/usage" } } }
+//! ```
+//! （addOnQuota 仅在账号持有 Add-on 包时出现）
+//!
+//! jobToken 端点（R-6 抓包实测，M2 通道 A 备用）：`POST /api/v1/me/jobToken`
+//! body `{"clientId":"<uuid>"}` → `{token, expires_in:86400000(ms,24h),
+//! refresh_token, refresh_token_expires_in:172800000(48h)}`。
+//!
+//! 缓存：kv `qoder_credits_cache`，TTL 600s + stale-on-error（F-59 模式）。
+//! 快照：每日 qoder_credits_history 同日覆盖 + 365 天裁剪。
+
+use serde_json::{json, Value};
+
+use crate::fs_utils;
+use crate::state::AppState;
+
+use super::http_agent;
+use super::qoder_common;
+
+/// 缓存 TTL（秒）
+const CACHE_TTL_SECS: i64 = 600;
+
+fn s_of(v: Option<&Value>) -> String {
+    v.and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+fn num_or_none(v: Option<&Value>) -> Option<f64> {
+    let v = v?;
+    match v {
+        Value::Bool(_) => None,
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// 递归找余额数值（remaining/balance 语义，排除 total；宽容兜底用）
+fn deep_balance_dig(v: &Value, depth: usize) -> Option<f64> {
+    if depth > 8 {
+        return None;
+    }
+    match v {
+        Value::Object(m) => {
+            for (k, val) in m {
+                let kl = k.to_ascii_lowercase();
+                if (kl.contains("remaining") || kl.contains("balance")) && !kl.contains("total") {
+                    if let Some(n) = num_or_none(Some(val)) {
+                        return Some(n);
+                    }
+                }
+            }
+            for val in m.values() {
+                if val.is_object() || val.is_array() {
+                    if let Some(n) = deep_balance_dig(val, depth + 1) {
+                        return Some(n);
+                    }
+                }
+            }
+            None
+        }
+        Value::Array(a) => a.iter().find_map(|x| deep_balance_dig(x, depth + 1)),
+        _ => None,
+    }
+}
+
+/// quota 子对象 → remaining（宽容：remaining/total 键序取值）
+fn quota_remaining(q: Option<&Value>) -> Option<f64> {
+    let q = q?;
+    num_or_none(q.get("remaining"))
+        .or_else(|| num_or_none(q.get("total")).map(|t| t - num_or_none(q.get("used")).unwrap_or(0.0)))
+}
+
+/// 毫秒时间戳 → YYYY-MM-DD（到期日历展示）
+fn ms_to_date(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+/// usage 响应 → (plan, addon, total, packages)。
+/// 主路径：R-7 抓包结构（qoderUsage.userQuota / addOnQuota）；
+/// 兜底：候选键 + 递归深挖（结构变更时不静默返回 0，而是全 None → 显式失败）。
+fn parse_usage(b: &Value) -> (Option<f64>, Option<f64>, Option<f64>, Vec<Value>) {
+    let q = b.get("qoderUsage");
+    let plan = quota_remaining(q.and_then(|v| v.get("userQuota")));
+    let addon = quota_remaining(q.and_then(|v| v.get("addOnQuota")));
+    let expires_at_ms = q
+        .and_then(|v| v.get("expiresAt"))
+        .and_then(Value::as_i64);
+    let total = match (plan, addon) {
+        (Some(p), Some(a)) => Some(p + a),
+        (Some(p), None) | (None, Some(p)) => Some(p),
+        _ => num_or_none(fs_utils::dig(
+            b,
+            &["totalRemaining", "remainingCredits", "remaining_credits", "remaining", "balance"],
+        ))
+        .or_else(|| deep_balance_dig(b, 0)),
+    };
+    // Add-on 包 → 到期日历（expiresAt 为 qoderUsage 级 ms 时间戳）
+    let mut packages: Vec<Value> = Vec::new();
+    if let Some(a) = addon {
+        packages.push(json!({
+            "amount": a,
+            "expire_at": expires_at_ms.map(ms_to_date).unwrap_or_default(),
+            "source": "addon",
+        }));
+    }
+    // 宽容兜底：数组形态积分包（结构变更时尽力展示）
+    if packages.is_empty() {
+        for key in ["packages", "creditPackages", "credit_packages", "items", "resources"] {
+            if let Some(arr) = fs_utils::dig(b, &[key]).and_then(Value::as_array) {
+                for p in arr {
+                    let amount = num_or_none(fs_utils::dig(p, &["amount", "remaining", "balance", "credits", "value"]));
+                    let expire = s_of(fs_utils::dig(p, &["expireAt", "expire_at", "endAt", "end_at", "expiredAt", "expiresAt"]));
+                    if amount.is_some() || !expire.is_empty() {
+                        packages.push(json!({ "amount": amount, "expire_at": expire, "source": s_of(fs_utils::dig(p, &["source", "type", "kind"])) }));
+                    }
+                }
+                if !packages.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    (plan, addon, total, packages)
+}
+
+/// 当前余额（签到奖励差值兜底数据源）：plan + addon remaining 之和；失败 None。
+pub fn fetch_usage_balance(agent: &ureq::Agent, headers: &[(String, String)]) -> Option<f64> {
+    let url = format!("{}/sash/api/v2/me/usage", qoder_common::OPEN_API_BASE);
+    let (status, body, _raw) = qoder_common::get_json(agent, &url, headers);
+    if status != 200 {
+        return None;
+    }
+    let (plan, addon, total, _) = parse_usage(&body?);
+    total.or_else(|| match (plan, addon) {
+        (Some(p), Some(a)) => Some(p + a),
+        (Some(p), None) | (None, Some(p)) => Some(p),
+        _ => None,
+    })
+}
+
+/// 单账号积分查询（token 直调 usage 通道）。creds 由调用方解析（需要 AppState 读 token store）。
+fn fetch_account(agent: &ureq::Agent, acct: &Value, creds: &qoder_common::QoderCreds) -> Value {
+    let aid = s_of(acct.get("id"));
+    let name = acct
+        .get("nickname")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| aid.clone());
+    let mut row = json!({
+        "user_id": aid,
+        "name": name,
+        "ok": false,
+        "plan_credits": Value::Null,
+        "addon_credits": Value::Null,
+        "total": Value::Null,
+        "packages": [],
+        "source": "fetch_failed",
+        "fetched_at": fs_utils::now_iso(),
+    });
+    if creds.access_token.is_empty() {
+        row["message"] = json!("无可用凭证");
+        row["source"] = json!("none");
+        return row;
+    }
+    let headers = qoder_common::build_auth_headers(&creds);
+    let url = format!("{}/sash/api/v2/me/usage", qoder_common::OPEN_API_BASE);
+    let (status, body, _raw) = qoder_common::get_json(agent, &url, &headers);
+    if status != 200 {
+        row["message"] = json!(format!("usage 不可用（HTTP {status}）"));
+        return row;
+    }
+    let Some(b) = body else {
+        row["message"] = json!("usage 响应非 JSON");
+        return row;
+    };
+    let (plan, addon, total, packages) = parse_usage(&b);
+    if plan.is_none() && addon.is_none() && total.is_none() {
+        // 结构未识别：显式失败（§九-2 不静默），不阻塞其他账号
+        row["message"] = json!("usage 结构未识别（接口可能已变更）");
+        return row;
+    }
+    row["ok"] = json!(true);
+    row["plan_credits"] = json!(plan);
+    row["addon_credits"] = json!(addon);
+    row["total"] = json!(total);
+    row["packages"] = json!(packages);
+    // source 徽标：PAT 通道（access_token 已换为作业令牌，kind 恒为 pat）/ 客户端 token（dt- 等）
+    row["source"] = json!(if creds.kind == "pat" || creds.access_token.starts_with("pt-") { "pat" } else { "client_token" });
+    row
+}
+
+/// 缓存读取（TTL 内命中返回 Some；过期/损坏返回 None）
+fn cache_valid(cache: &Value, now_ms: i64) -> bool {
+    let fetched = cache.get("fetched_at_ms").and_then(Value::as_i64);
+    cache.get("accounts").and_then(Value::as_array).is_some_and(|a| !a.is_empty())
+        && fetched.is_some_and(|t| now_ms - t < CACHE_TTL_SECS * 1000)
+}
+
+/// 单账号查询时过滤缓存（仅保留目标账号并按剩余行重算 total_balance；
+/// 缓存的 accounts[].user_id = 账号池 id，与 fetch_account 产出一致）。
+fn filter_cache_by_user(mut cache: Value, user_id: &str) -> Value {
+    if let Some(arr) = cache.get_mut("accounts").and_then(Value::as_array_mut) {
+        arr.retain(|a| a.get("user_id").and_then(Value::as_str) == Some(user_id));
+    }
+    if let Some(total) = cache
+        .get("accounts")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|r| r.get("total").and_then(Value::as_f64)).sum::<f64>())
+    {
+        cache["total_balance"] = json!(total);
+    }
+    cache
+}
+
+/// 积分查询主入口（commands 与调度共用）。
+/// user_id=None 查全部账号；fresh=true 跳过缓存。stale-on-error：刷新全失败时
+/// 回退历史缓存并标记 stale=true（F-59 模式，前端不白屏）。
+/// 成功后同日覆盖写积分快照（qoder_credits_history，365 天裁剪）。
+pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Result<Value, String> {
+    let db = crate::store::db(&state.data_dir);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let cache: Value = db.kv_get("qoder_credits_cache");
+    if !fresh && cache_valid(&cache, now_ms) {
+        // clone：命中路径不消费缓存，后面 stale-on-error 回退还要用（E0382）
+        let mut out = match user_id {
+            Some(uid) => filter_cache_by_user(cache.clone(), uid),
+            None => cache.clone(),
+        };
+        // 过滤后无该账号行（缓存未覆盖目标账号）→ 放弃缓存走实时拉取
+        if out.get("accounts").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
+            out["ok"] = json!(true);
+            out["cached"] = json!(true);
+            out["stale"] = json!(false);
+            return Ok(out);
+        }
+    }
+    let agent = http_agent(30);
+    let pool: Value = crate::store::docs::qoder_pool_load(&db);
+    let mut accounts: Vec<Value> = pool
+        .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(uid) = user_id {
+        accounts.retain(|a| a.get("id").and_then(Value::as_str) == Some(uid));
+    }
+    if accounts.is_empty() {
+        return Ok(json!({ "ok": false, "cached": false, "accounts": [], "message": "账号池为空" }));
+    }
+    let rows: Vec<Value> = accounts
+        .iter()
+        .map(|a| {
+            let aid = a.get("id").and_then(Value::as_str).unwrap_or("");
+            let creds = qoder_common::effective_creds(state, aid);
+            let row = fetch_account(&agent, a, &creds);
+            // 401 自愈：令牌失效时强制刷新一次并重试（lazy_hours=MAX 恒走刷新；
+            // PAT 通道 is_pat||has_pat 恒覆盖有备份的凭证）。刷新失败/令牌未变则
+            // 保留原失败行，不二次重试（对齐 F-09 禁二次刷新）。
+            if row.get("ok").and_then(Value::as_bool) != Some(true)
+                && row.get("message").and_then(Value::as_str).is_some_and(|m| m.contains("401"))
+            {
+                let (new_creds, refreshed, _) = qoder_common::ensure_fresh(state, &agent, aid, i64::MAX);
+                if refreshed && new_creds.access_token != creds.access_token {
+                    return fetch_account(&agent, a, &new_creds);
+                }
+            }
+            row
+        })
+        .collect();
+    let ok_count = rows.iter().filter(|r| r.get("ok").and_then(Value::as_bool) == Some(true)).count();
+    let total_balance = rows
+        .iter()
+        .filter_map(|r| r.get("total").and_then(Value::as_f64))
+        .sum::<f64>();
+    if ok_count == 0 {
+        // stale-on-error（F-59）：全失败回退缓存（无论是否过期），标记 stale；
+        // 单账号查询先过滤缓存行，过滤后为空则视为无可用历史缓存
+        let fallback = match user_id {
+            Some(uid) => filter_cache_by_user(cache, uid),
+            None => cache,
+        };
+        if fallback.get("accounts").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
+            let mut out = fallback;
+            out["ok"] = json!(false);
+            out["cached"] = json!(true);
+            out["stale"] = json!(true);
+            out["stale_reason"] = json!("本轮全部账号刷新失败，展示历史缓存");
+            return Ok(out);
+        }
+        return Ok(json!({
+            "ok": false, "cached": false, "stale": false,
+            "accounts": rows, "total_balance": 0.0,
+            "message": "全部账号查询失败且无历史缓存",
+        }));
+    }
+    // 快照落库（同日覆盖 + 365 天裁剪；失败不阻塞返回）。
+    // 仅全量查询落快照/写缓存：单账号 rows 会覆盖全量快照并污染缓存（过滤失效）
+    if user_id.is_none() {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let snap = json!({
+            "date": today,
+            "ts": now_ms,
+            "total_balance": total_balance,
+            "accounts": rows.iter()
+                .map(|r| json!({"user_id": r["user_id"], "total": r["total"]}))
+                .collect::<Vec<_>>(),
+        });
+        let _ = crate::store::docs::qoder_credits_history_upsert(&db, &snap);
+    }
+    let out = json!({
+        "ok": true, "cached": false, "stale": false,
+        "accounts": rows,
+        "total_balance": total_balance,
+        "fetched_at_ms": now_ms,
+    });
+    if user_id.is_none() {
+        let _ = db.kv_set("qoder_credits_cache", &out);
+    }
+    Ok(out)
+}
+
+/// 每日快照任务（调度器/CLI 共用；fresh 拉取全部账号 + 快照落库，空池自然空转）
+pub fn run_snapshot_task(state: &AppState) -> Result<Value, String> {
+    let pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
+    let n = pool.get("accounts").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+    if n == 0 {
+        return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号" }));
+    }
+    let parsed = fetch_credits(state, None, true)?;
+    Ok(json!({
+        "ok": parsed.get("ok").and_then(Value::as_bool).unwrap_or(false),
+        "accounts": n,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// R-7 抓包样本（2026-09-27 实测，claim 第二活动后 addOnQuota 出现）
+    const CAPTURED_SAMPLE: &str = r#"{"displayMode":"qoder","qoderUsage":{"userId":"01a0dff8-cc47-7b64-bd6d-d9cb2aea6792","userType":"personal_professional_trial","usageType":"credits","totalUsagePercentage":0,"isQuotaExceeded":false,"expiresAt":1791673619906,"upgradeUrl":"https://qoder.com/pricing?client=qoder","userQuota":{"total":300,"used":0,"remaining":300,"percentage":0,"unit":"credits"},"addOnQuota":{"total":100,"used":0,"remaining":100,"percentage":0,"unit":"credits","detailUrl":"https://qoder.com/account/usage"},"isPlanQuotaProrated":false}}"#;
+
+    #[test]
+    fn parse_usage_handles_captured_r7_structure() {
+        let b: Value = serde_json::from_str(CAPTURED_SAMPLE).unwrap();
+        let (plan, addon, total, packages) = parse_usage(&b);
+        assert_eq!(plan, Some(300.0));
+        assert_eq!(addon, Some(100.0));
+        assert_eq!(total, Some(400.0));
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0]["source"], json!("addon"));
+        assert_eq!(packages[0]["expire_at"], json!("2026-10-11"));
+    }
+
+    #[test]
+    fn parse_usage_without_addon_quota() {
+        // claim 前 addOnQuota 缺省：plan 300 / addon None / total 300
+        let b = json!({"displayMode":"qoder","qoderUsage":{"userQuota":{"total":300,"used":0,"remaining":300}}});
+        let (plan, addon, total, _) = parse_usage(&b);
+        assert_eq!(plan, Some(300.0));
+        assert_eq!(addon, None);
+        assert_eq!(total, Some(300.0));
+    }
+
+    #[test]
+    fn parse_usage_unrecognized_returns_all_none() {
+        let (plan, addon, total, packages) = parse_usage(&json!({"foo": "bar"}));
+        assert!(plan.is_none() && addon.is_none() && total.is_none() && packages.is_empty());
+    }
+
+    #[test]
+    fn deep_balance_excludes_total_key() {
+        assert_eq!(deep_balance_dig(&json!({"totalRemaining": 5}), 0), None);
+        assert_eq!(deep_balance_dig(&json!({"remainingCredits": 5}), 0), Some(5.0));
+    }
+
+    #[test]
+    fn cache_valid_requires_accounts_and_ttl() {
+        let now = 1_000_000_000_000i64;
+        let ok_cache = json!({"fetched_at_ms": now - 1000, "accounts": [{"user_id": "a"}]});
+        assert!(cache_valid(&ok_cache, now));
+        let expired = json!({"fetched_at_ms": now - CACHE_TTL_SECS * 1000 - 1, "accounts": [{"user_id": "a"}]});
+        assert!(!cache_valid(&expired, now));
+        let empty = json!({"fetched_at_ms": now, "accounts": []});
+        assert!(!cache_valid(&empty, now));
+    }
+}

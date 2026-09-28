@@ -72,6 +72,8 @@ pub const DEFAULT_TARGETS: &[&str] = &[
     "volces.com",
     "treecode.com",
     "doubao.com",
+    // F-80：Qoder CN（宽后缀覆盖 openapi./gateway. 等子域，M0 抓包支持）
+    "qoder.com.cn",
 ];
 
 // ---------------- 生命周期 ----------------

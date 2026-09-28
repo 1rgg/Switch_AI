@@ -247,6 +247,22 @@ pub struct Settings {
     ///（默认关；开启后切换前自动备份当前账号三件套并复制到目标账号名下）
     #[serde(default)]
     pub buddy_switch_migrate_chats: bool,
+    // ── Qoder（F-80；M1 签到 MVP 调度键 + 客户端路径）──
+    /// Qoder CN IDE 桌面版 exe 手动路径（M3 切换档案预留；默认 %LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe）
+    #[serde(default)]
+    pub qoder_ide_path: Option<String>,
+    /// QoderWork（= Qoder CN，经 Launcher 启动；v1.4.1 澄清同一产品）exe 手动路径；留空走默认安装布局
+    #[serde(default)]
+    pub qoderwork_path: Option<String>,
+    /// Qoder 每日签到调度触发时刻 HH:MM（默认 10:15：单次覆盖 0 点签到与 10:00 登录奖励双活动，§2.2）
+    #[serde(default = "default_qoder_checkin_hhmm")]
+    pub qoder_checkin_hhmm: String,
+    /// Qoder 积分快照调度触发时刻 HH:MM（默认 23:40）
+    #[serde(default = "default_qoder_credits_sync_hhmm")]
+    pub qoder_credits_sync_hhmm: String,
+    /// Qoder 积分快照调度开关（默认开；无账号时任务内部静默跳过不计失败）
+    #[serde(default = "default_true")]
+    pub qoder_credits_sync_enabled: bool,
 }
 
 fn default_api_port() -> u16 {
@@ -285,6 +301,13 @@ fn default_wb_growth_hhmm() -> String {
 fn default_wb_checkin_hhmm() -> String {
     "09:10".into()
 }
+/// Qoder 每日签到调度默认 10:15（F-80 §2.2：10:15 时 0 点签到与 10:00 登录奖励均可领）
+fn default_qoder_checkin_hhmm() -> String {
+    "10:15".into()
+}
+fn default_qoder_credits_sync_hhmm() -> String {
+    "23:40".into()
+}
 fn default_credits_sync_mode() -> String {
     "daily".into()
 }
@@ -307,10 +330,12 @@ fn default_retention() -> i32 {
     30
 }
 /// 解密域名白名单默认值（Charles SSL Proxying Locations 语义：列表内 MITM 解密，
-/// 其余透明直通）。完整覆盖字节系九组域；带证书锁定的客户端域（豆包 ttnet 原生栈）
-/// 由自适应降级兜底：连续 3 次握手被客户端中止自动转透明直通（重启代理复位）。
+/// 其余透明直通）。完整覆盖字节系九组域 + Qoder CN（F-80 M0 抓包支持；
+/// 宽后缀语义下 qoder.com.cn 覆盖 openapi./gateway. 等全部子域）；带证书锁定的
+/// 客户端域（豆包 ttnet 原生栈）由自适应降级兜底：连续 3 次握手被客户端中止
+/// 自动转透明直通（重启代理复位）。
 pub fn default_proxy_domains() -> String {
-    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com".into()
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com,qoder.com.cn".into()
 }
 
 /// 旧版默认域名列表（未含 doubao.com）：用于把升级前已持久化的旧默认无缝迁移到新默认
@@ -328,6 +353,12 @@ pub fn legacy_proxy_domains_with_doubao() -> String {
 /// MITM 且 Trae 抓包需要，迁移回新默认（用户自定义过则不动）
 pub fn legacy_proxy_domains_narrow() -> String {
     "trae.cn,trae.com.cn,mchost.guru,www.doubao.com,accounts.doubao.com".into()
+}
+
+/// F-80 上一版默认域名列表（未含 qoder.com.cn）：已持久化该旧默认的存量用户
+/// 升级后无缝补上 Qoder 域（用户自定义过则不动）
+pub fn legacy_proxy_domains_without_qoder() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com".into()
 }
 
 /// 豆包保活端点默认值：GET /info/v2/（通知未读数，轻量、必须登录，200=有效 / 302=过期）。

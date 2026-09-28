@@ -19,15 +19,22 @@ export type ViewKey =
   | 'buddy-checkin'
   | 'buddy-credits'
   | 'buddy-api-service'
-  | 'buddy-settings';
+  | 'buddy-settings'
+  // Qoder 应用页面（F-80：IDE / Work / CLI 三端，单一 Tab 承载）
+  | 'qoder-overview'
+  | 'qoder-accounts'
+  | 'qoder-checkin'
+  | 'qoder-credits'
+  | 'qoder-settings';
 
-/** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy 批次1接入 / 豆包 接入中 */
-export type AppKey = 'trae' | 'buddy' | 'doubao';
+/** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy / Qoder（F-80）/ 豆包 */
+export type AppKey = 'trae' | 'buddy' | 'qoder' | 'doubao';
 
 /** 各应用的默认落地页 */
 export const APP_HOME_VIEW: Record<AppKey, ViewKey> = {
   trae: 'dashboard',
   buddy: 'buddy-overview',
+  qoder: 'qoder-overview',
   doubao: 'doubao-overview',
 };
 
@@ -274,6 +281,16 @@ export interface Settings {
   api_default_model: string;
   /** F-74：WorkBuddy/CodeBuddy 切换账号时自动把当前账号会话迁移到目标账号（默认关） */
   buddy_switch_migrate_chats: boolean;
+  /** Qoder CN IDE 桌面版 exe 手动路径（环境配置页；默认 %LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe） */
+  qoder_ide_path: string | null;
+  /** QoderWork 桌面版 exe 手动路径（R-1 布局裁决后接入；M1 仅持久化预留） */
+  qoderwork_path: string | null;
+  /** Qoder 每日签到调度触发时刻 HH:MM（默认 10:15：单次覆盖 0 点签到与 10:00 登录奖励双活动） */
+  qoder_checkin_hhmm: string;
+  /** Qoder 积分快照调度触发时刻 HH:MM（默认 23:40） */
+  qoder_credits_sync_hhmm: string;
+  /** Qoder 积分快照调度开关（默认开） */
+  qoder_credits_sync_enabled: boolean;
   /** Trae 每日签到调度触发时刻 HH:MM（默认 09:00，环境配置页可改；Windows 计划任务注册时间复用该值） */
   trae_checkin_hhmm: string;
   /** Trae JWT 定时调度续期开关（issue #27，默认开：每日兜底续期临期账号） */
@@ -1163,4 +1180,178 @@ export interface WbModelInfo {
   supported_efforts: string[];
   effort_override: string | null;
   rate: number;
+}
+
+// ---- Qoder（F-80；Rust commands/qoder；字段名严格 snake_case）----
+export interface QoderEnvCheck {
+  ide_installed: boolean;
+  ide_running: boolean;
+  ide_exe: string | null;
+  ide_data_dir: string | null;
+  ide_data_dir_exists: boolean;
+  cli_dir: string;
+  cli_dir_exists: boolean;
+  /** QoderWork CN（Launcher 形态：%LOCALAPPDATA%\Qoder CN\Qoder CN Launcher）；数据目录布局待 R-1 */
+  qoderwork_installed: boolean;
+  qoderwork_running: boolean;
+  qoderwork_exe: string | null;
+}
+
+/** 每账号稳定设备指纹（§5.10 多账号并发；machine_id 32 位 hex，入池生成永不轮换） */
+export interface QoderDeviceProfile {
+  machine_id: string;
+  device_id: string;
+  umid: string;
+}
+
+export interface QoderAccountView {
+  id: string;
+  uid: string;
+  nickname: string;
+  phone_masked: string;
+  /** free | pro | pro+ | teams（userinfo 未提供时为空） */
+  plan: string;
+  /** 凭证来源：pat | ide_store | qoderwork_store | mitm | cli */
+  credential_source: string;
+  token_expires_at: number | null;
+  needs_relogin: boolean;
+  relogin_reason: string;
+  group_id: string;
+  note: string;
+  credits_balance: number | null;
+  credits_fetched_at: string | null;
+  has_credential: boolean;
+  /** token 种类徽标：pat | client | unknown（脱敏） */
+  token_kind: string;
+  /** 设备指纹徽标（machine_id 前 8 位；null = 尚未回填） */
+  fingerprint: string | null;
+  /** 完整设备指纹（指纹查看弹框数据源） */
+  device_profile: QoderDeviceProfile | null;
+}
+
+export interface QoderSettings {
+  /** 启动自动补签 + 应用内调度器启用判定（默认开） */
+  auto_checkin: boolean;
+  /** 多账号签到显式开启项（合规：默认关，开启前须知条款风险） */
+  multi_account_enabled: boolean;
+}
+
+/** 账号池导出文件（M4：aiwork-qoder-pool；include_credentials=true 时 accounts[].credential 附带凭证副本，导出文件等同密码） */
+export interface QoderPoolExport {
+  kind: 'aiwork-qoder-pool';
+  version: number;
+  exported_at: string;
+  include_credentials: boolean;
+  accounts: Record<string, unknown>[];
+}
+
+/** 账号池导入结果（M4，与 WbPoolImportResult 同构） */
+export interface QoderPoolImportResult {
+  added: number;
+  updated: number;
+  skipped: number;
+  with_credentials: number;
+  /** 被拒绝的条目（id + 原因），非空时前端需提示 */
+  rejected?: { id: string; reason: string }[];
+}
+
+/** 环境重置清单项（M4：8 项语义块，与 WbResetItem 同构） */
+export interface QoderResetItem {
+  id: string;
+  label: string;
+  detail: string;
+  exists: boolean;
+}
+
+/** 环境重置单项执行结果 */
+export interface QoderResetResult {
+  id: string;
+  ok: boolean;
+  detail: string;
+}
+
+/** OAuth 设备流进度事件（qoder-oauth-progress，对齐 WbOauthProgress） */
+export interface QoderOauthProgress {
+  stage: 'init' | 'browser' | 'polling' | 'success' | 'error';
+  message: string;
+  auth_url?: string | null;
+}
+
+/** OAuth 设备流结果事件（qoder-oauth-done，对齐 WbOauthDone） */
+export interface QoderOauthDone {
+  ok: boolean;
+  id?: string;
+  nickname?: string;
+  message: string;
+}
+
+/** IDE 存储账号发现/导入结果（qoder_ide_scan；脱敏不含 token） */
+export interface QoderIdeScanResult {
+  found: boolean;
+  imported: boolean;
+  updated: boolean;
+  account_id: string | null;
+  nickname: string | null;
+  reason: string;
+}
+
+/** Qoder CLI 登录状态（M4 status 只读桥；R-3 裁决无独立 CLI 凭证通道） */
+export interface QoderCliStatus {
+  available: boolean;
+  logged_in?: boolean;
+  name?: string;
+  avatar_url?: string;
+  version?: string;
+  product?: string;
+  snapshot_at?: string;
+  writer?: string;
+  reason?: string;
+}
+
+export interface QoderCheckinRecord {
+  date: string;
+  time: string;
+  user_id: string;
+  name: string;
+  status: string;
+  message: string;
+  reward?: number;
+}
+
+export interface QoderCreditPackage {
+  amount: number | null;
+  expire_at: string;
+  source: string;
+}
+
+export interface QoderCreditAccount {
+  user_id: string;
+  name: string;
+  ok: boolean;
+  message?: string;
+  plan_credits: number | null;
+  addon_credits: number | null;
+  total: number | null;
+  packages: QoderCreditPackage[];
+  /** 数据源徽标：pat | client_token | fetch_failed | none */
+  source: string;
+  fetched_at: string;
+}
+
+export interface QoderCreditsResult {
+  ok: boolean;
+  cached?: boolean;
+  /** F-59 stale-on-error：全部账号刷新失败时回退的历史缓存 */
+  stale?: boolean;
+  stale_reason?: string;
+  accounts: QoderCreditAccount[];
+  total_balance?: number;
+  message?: string;
+}
+
+export interface QoderCreditsSnapshot {
+  date: string;
+  ts: number;
+  total_balance: number;
+  accounts: { user_id: string; total: number | null }[];
 }

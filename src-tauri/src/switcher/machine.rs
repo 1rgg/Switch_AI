@@ -282,6 +282,74 @@ fn edit_storage_device_ids(
     Ok(changed)
 }
 
+/// F-80 §5.10.2（M3）：Qoder 每账号稳定指纹 → 本地存储覆写。切换/恢复成功后由
+/// switcher 挂点调用（回滚路径不调用，防 last 回滚后残留目标账号指纹）：
+/// ① machineid 文件 ← machine_id（32-hex 无 BOM；不存在则创建）；
+/// ② storage.json 点号键 telemetry.machineId / sqmId / devDeviceId ← machine_id
+///    （仅替换已存在键，对齐 edit_storage_device_ids 语义；sqmId/devDeviceId 同值
+///    绑定 = 单标识域模型，与 QoderPatcher 伪造口径一致，不引入第二标识源）；
+/// ③ state.vscdb ItemTable storage.serviceMachineId ← machine_id（upsert）。
+/// 返回成功层数；任何一层失败 → Err 汇总（调用侧降级 warn 不阻断切换）
+pub fn apply_qoder_fingerprint(data_dir: &Path, machine_id: &str) -> Result<usize, String> {
+    let mut ok = 0usize;
+    let mut errs: Vec<String> = Vec::new();
+
+    // ① machineid 文件（根级；Rust fs::write 天然无 BOM，同 reset_device_ids 语义）
+    match std::fs::write(data_dir.join("machineid"), machine_id) {
+        Ok(()) => ok += 1,
+        Err(e) => errs.push(format!("machineid 写入失败: {e}")),
+    }
+
+    // ② storage.json（User\globalStorage\ 下；文件不存在 = 首次使用，跳过）
+    let storage_file = data_dir.join("User").join("globalStorage").join("storage.json");
+    if storage_file.exists() {
+        match edit_qoder_storage_ids(&storage_file, machine_id) {
+            Ok(true) => ok += 1,
+            Ok(false) => {} // 三个键均不存在（该版本布局未写遥测键），无需改
+            Err(e) => errs.push(format!("storage.json 覆写失败: {e}")),
+        }
+    }
+
+    // ③ state.vscdb serviceMachineId（upsert；文件不存在 = 首装未启动过，跳过）
+    match super::vscdb::upsert_text_key(
+        &data_dir.join("User").join("globalStorage").join("state.vscdb"),
+        "storage.serviceMachineId",
+        machine_id,
+    ) {
+        Ok(true) => ok += 1,
+        Ok(false) => {}
+        Err(e) => errs.push(format!("state.vscdb 覆写失败: {e}")),
+    }
+
+    if errs.is_empty() {
+        Ok(ok)
+    } else {
+        Err(format!("成功 {ok}/3 层；{}", errs.join("；")))
+    }
+}
+
+/// storage.json Qoder 设备键覆写：点号键名整体替换（仅已存在键）。返回 false = 无键可改。
+fn edit_qoder_storage_ids(path: &Path, machine_id: &str) -> Result<bool, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut v: serde_json::Value = serde_json::from_str(raw.trim_start_matches('\u{feff}'))
+        .map_err(|e| e.to_string())?;
+    let Some(obj) = v.as_object_mut() else {
+        return Err("storage.json 非对象".to_string());
+    };
+    let mut changed = false;
+    for k in ["telemetry.machineId", "telemetry.sqmId", "telemetry.devDeviceId"] {
+        if obj.contains_key(k) {
+            obj.insert(k.to_string(), serde_json::Value::String(machine_id.to_string()));
+            changed = true;
+        }
+    }
+    if changed {
+        std::fs::write(path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -53,6 +53,9 @@ pub struct AppProfile {
     pub exe_candidates: Vec<PathBuf>,
     /// 仅 CodeBuddy：L3 vscdb 登录真源目录（%APPDATA%\CodeBuddy CN\User\globalStorage）
     pub cb_global_storage_dir: Option<PathBuf>,
+    /// icube 布局快照白名单（F-80 M3 档案化：TRAE_ICUBE_ITEMS / QODER_IDE_ITEMS；
+    /// 非 icube 布局为空表，backup/restore 不消费）
+    pub icube_items: &'static [super::icube::Item],
 }
 
 impl AppProfile {
@@ -100,6 +103,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 PathBuf::from("D:\\Programs\\Trae CN\\Trae CN.exe"),
             ],
             cb_global_storage_dir: None,
+            icube_items: super::icube::TRAE_ICUBE_ITEMS,
         },
         TargetApp::Doubao => AppProfile {
             app_name: "豆包",
@@ -120,6 +124,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 PathBuf::from(format!("{program_files}\\Doubao\\Application\\Doubao.exe")),
             ],
             cb_global_storage_dir: None,
+            icube_items: &[],
         },
         TargetApp::WorkBuddy => AppProfile {
             app_name: "WorkBuddy",
@@ -140,6 +145,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 "{local}\\Programs\\WorkBuddy\\WorkBuddy.exe"
             ))],
             cb_global_storage_dir: None,
+            icube_items: &[],
         },
         TargetApp::CodeBuddy => AppProfile {
             app_name: "CodeBuddy",
@@ -164,6 +170,7 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             cb_global_storage_dir: Some(PathBuf::from(format!(
                 "{appdata}\\CodeBuddy CN\\User\\globalStorage"
             ))),
+            icube_items: &[],
         },
         TargetApp::TraeWork => AppProfile {
             app_name: "Trae Work",
@@ -188,6 +195,34 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
                 PathBuf::from("D:\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe"),
             ],
             cb_global_storage_dir: None,
+            icube_items: super::icube::TRAE_ICUBE_ITEMS,
+        },
+        TargetApp::Qoder => AppProfile {
+            app_name: "Qoder",
+            layout: Layout::Icube,
+            // F-80 M0 实测 2026-09-27：IDE 数据目录为 %APPDATA%\QoderCN（设计文档
+            // §2.3 的 com.qodercn.app.stable 与本机不符，按实测修正）
+            data_dir: PathBuf::from(format!("{appdata}\\QoderCN")),
+            profiles_dir: data.join("data").join("profiles_qoder"),
+            settings_path_key: "qoder_path",
+            // 同 Trae 系：VSCode fork 强杀后 vscdb WAL 残留被启动回放，8s 优雅落盘
+            graceful_wait_secs: 8,
+            // 壳（Qoder CN.exe）+ IDE 本体（Qoder CN IDE.exe）一起停；
+            // proc_patterns "Qoder CN*" 防误命中 QoderWork（Launcher 进程名不匹配），
+            // 再经 exe_names 白名单过滤防串台
+            proc_names: &["Qoder CN IDE", "Qoder CN"],
+            proc_patterns: &["Qoder CN*"],
+            exe_names: &["Qoder CN IDE.exe", "Qoder CN.exe"],
+            lnk_patterns: &["*Qoder*"],
+            reg_patterns: &["*Qoder*"],
+            exe_candidates: vec![
+                PathBuf::from(format!("{local}\\Programs\\Qoder CN IDE\\Qoder CN IDE.exe")),
+                PathBuf::from(format!("{local}\\Programs\\Qoder CN\\Qoder CN.exe")),
+                PathBuf::from(format!("{program_files}\\Qoder CN IDE\\Qoder CN IDE.exe")),
+                PathBuf::from(format!("{program_files}\\Qoder CN\\Qoder CN.exe")),
+            ],
+            cb_global_storage_dir: None,
+            icube_items: super::icube::QODER_IDE_ITEMS,
         },
     }
 }
@@ -201,23 +236,25 @@ mod tests {
     }
 
     #[test]
-    fn 五应用档案字段与ps常量表一致() {
+    fn 六应用档案字段与ps常量表一致() {
         let data = temp_data();
         let tw = profile_for(TargetApp::TraeWork, &data);
         assert_eq!(tw.app_name, "Trae Work");
         assert_eq!(tw.layout, Layout::Icube);
-        assert_eq!(tw.data_dir, PathBuf::from(std::env::var("APPDATA").unwrap()).join("TRAE SOLO CN"));
+        assert_eq!(tw.data_dir, PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("TRAE SOLO CN"));
         assert_eq!(tw.profiles_dir, data.join("data").join("profiles"));
         assert_eq!(tw.settings_path_key, "trae_path");
         assert_eq!(tw.graceful_wait_secs, 8);
         assert_eq!(tw.proc_names, &["TRAE SOLO CN", "TRAE SOLO", "Trae"]);
         assert_eq!(tw.exe_candidates.len(), 7);
         assert!(tw.cb_global_storage_dir.is_none());
+        assert_eq!(tw.icube_items.len(), 15);
 
         let db = profile_for(TargetApp::Doubao, &data);
         assert_eq!(db.layout, Layout::Chromium);
         assert_eq!(db.graceful_wait_secs, 8);
         assert_eq!(db.profiles_dir, data.join("data").join("profiles_doubao"));
+        assert!(db.icube_items.is_empty());
 
         let wb = profile_for(TargetApp::WorkBuddy, &data);
         assert_eq!(wb.layout, Layout::Authfile);
@@ -232,6 +269,23 @@ mod tests {
         assert_eq!(trae.settings_path_key, "trae_cn_path");
         assert_eq!(trae.profiles_dir, data.join("data").join("profiles_trae"));
         assert_eq!(trae.exe_candidates.len(), 3);
+        assert_eq!(trae.icube_items.len(), 15);
+
+        // F-80 M3：Qoder IDE 档案（icube 布局，复用 Trae 切号管线；M0 实测数据目录 QoderCN）
+        let qd = profile_for(TargetApp::Qoder, &data);
+        assert_eq!(qd.app_name, "Qoder");
+        assert_eq!(qd.layout, Layout::Icube);
+        assert_eq!(
+            qd.data_dir,
+            PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("QoderCN")
+        );
+        assert_eq!(qd.profiles_dir, data.join("data").join("profiles_qoder"));
+        assert_eq!(qd.settings_path_key, "qoder_path");
+        assert_eq!(qd.graceful_wait_secs, 8);
+        assert_eq!(qd.proc_names, &["Qoder CN IDE", "Qoder CN"]);
+        assert_eq!(qd.exe_candidates.len(), 4);
+        assert!(qd.cb_global_storage_dir.is_none());
+        assert_eq!(qd.icube_items.len(), 15);
     }
 
     #[test]

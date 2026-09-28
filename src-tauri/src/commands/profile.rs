@@ -26,18 +26,20 @@ fn profiles_dir(state: &State<AppState>, target_app: Option<&str>) -> PathBuf {
         Some("Doubao") => state.data_dir.join("data").join("profiles_doubao"),
         Some("CodeBuddy") => state.data_dir.join("data").join("profiles_codebuddy"),
         Some("WorkBuddy") => state.data_dir.join("data").join("profiles_workbuddy"),
+        Some("Qoder") => state.data_dir.join("data").join("profiles_qoder"),
         _ => state.data_dir.join("data").join("profiles"),
     }
 }
 
 /// 归一化 target_app：仅接受 "Trae"（Trae CN IDE）/ "Doubao"（豆包）/ "CodeBuddy"（CodeBuddy 桌面）/
-/// "WorkBuddy"（WorkBuddy 桌面，authfile 布局），其余一律视为 TraeWork
+/// "WorkBuddy"（WorkBuddy 桌面，authfile 布局）/ "Qoder"（Qoder CN IDE），其余一律视为 TraeWork
 fn normalize_target_app(target_app: Option<&str>) -> &'static str {
     match target_app {
         Some("Trae") => "Trae",
         Some("Doubao") => "Doubao",
         Some("CodeBuddy") => "CodeBuddy",
         Some("WorkBuddy") => "WorkBuddy",
+        Some("Qoder") => "Qoder",
         _ => "TraeWork",
     }
 }
@@ -133,6 +135,7 @@ pub fn profile_backup(
         proxy_port: None,
         include_indexeddb: include_idb,
         expected_current_uid: String::new(),
+        machine_id_override: None,
         data_dir: state.data_dir.clone(),
     };
     let app2 = app.clone();
@@ -175,6 +178,12 @@ pub fn profile_restore(
     );
     // C4：豆包快照可选纳入 IndexedDB（恢复侧对快照内含 IndexedDB 一律回写，此开关主要影响备份）
     let include_idb = target == "Doubao" && state.settings().doubao_snapshot_include_idb;
+    // F-80 §5.10.2：Qoder 恢复取账号绑定 machine_id（须在 user_id 被 move 前计算）
+    let machine_id_override = if target == "Qoder" {
+        crate::commands::qoder::machine_id_of(&state, user_id.trim())
+    } else {
+        None
+    };
     let args = RunArgs {
         action: Action::RestoreOnly,
         target_app: TargetApp::parse(target),
@@ -182,6 +191,7 @@ pub fn profile_restore(
         proxy_port: None,
         include_indexeddb: include_idb,
         expected_current_uid: String::new(),
+        machine_id_override,
         data_dir: state.data_dir.clone(),
     };
     let app2 = app.clone();
