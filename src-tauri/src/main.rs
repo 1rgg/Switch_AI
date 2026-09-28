@@ -361,8 +361,8 @@ fn main() {
             fs_utils::app_log(
                 &state.data_dir,
                 &format!(
-                    "应用启动: tray=enabled, launch_minimized={}, auto_start_proxy={}",
-                    settings.launch_minimized, settings.auto_start_proxy
+                    "应用启动: tray=enabled, launch_minimized={}, auto_start_proxy={}, auto_start_api={}",
+                    settings.launch_minimized, settings.auto_start_proxy, settings.auto_start_api
                 ),
             );
 

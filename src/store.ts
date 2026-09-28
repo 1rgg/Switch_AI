@@ -164,6 +164,7 @@ function defaultSettings(): Settings {
     launch_minimized: false,
     silent_checkin: false,
     auto_start_proxy: true,
+    auto_start_api: false,
     tray: true,
     language: 'zh-CN',
     checkin_skip_checked: true,
@@ -377,6 +378,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     const s = get();
     if (!s.proxy.running && s.settings?.auto_start_proxy) {
       void s.startProxy();
+    }
+    // 启动时根据设置自动开启 API 网关（复刻 auto_start_proxy 模式）：
+    // Rust 侧 do_start 对已运行实例返回 Err，此处判重 + 静默兜底，避免与托盘启停竞态时误报
+    if (!s.apiStatus?.running && s.settings?.auto_start_api) {
+      try {
+        const status = await api.apiServer.start();
+        set({ apiStatus: status });
+      } catch {
+        /* 静默失败：状态栏保持未启动，用户可手动启动 */
+      }
     }
   },
 
