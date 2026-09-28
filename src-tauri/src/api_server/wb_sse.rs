@@ -303,6 +303,12 @@ pub fn stream_forward_ex(
     }
 
     loop {
+        // 客户端断连快速检测（对齐 sse.rs「发送失败即断」）：send! 宏忽略发送
+        // 失败，活跃流期间的断连依赖此处逐事件检查，最坏延迟一个事件的处理耗时；
+        // 停滞期间的断连由 next_event_polling 的 Err 分支覆盖
+        if tx.is_closed() {
+            break;
+        }
         match parser.next_event_polling(LINE_POLL, &|| tx.is_closed()) {
             None => break,
             Some(WbEvent::Done) => {
@@ -926,6 +932,33 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(2),
             "断连后应在一个轮询窗口内返回，实测 {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// 活跃流 + 断连：上游持续产出且无 [DONE]（不断流），客户端通道已关闭 →
+    /// 逐事件快速检测应立即终止（sent_any=false），而非读完整条流才结束
+    #[test]
+    fn stream_forward_aborts_immediately_when_client_gone() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        drop(rx); // 客户端已断连
+        let data: Vec<String> = (0..1000)
+            .flat_map(|i| {
+                vec![
+                    format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"t{}\"}}}}]}}", i),
+                    String::new(),
+                ]
+            })
+            .collect();
+        let src = InterruptibleLines::from_iterator(Box::new(data.into_iter()));
+        let start = std::time::Instant::now();
+        let (_err, sent_any, _fi, _u) = stream_forward_ex(
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m",
+        );
+        assert!(!sent_any, "断连后不得有任何事件下发");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "活跃流断连应立即终止，实测 {:?}",
             start.elapsed()
         );
     }
