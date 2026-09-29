@@ -161,7 +161,7 @@ export default function Settings() {
         update('trae_path', r.exe);
         toast('success', `已自动定位并填入 Trae Work 路径（${LOCATE_SOURCE_LABEL[r.source] ?? r.source}${r.version ? `，版本 ${r.version}` : ''}）`);
       } else {
-        toast('info', '未检测到 Trae Work，请手动指定 exe 路径');
+        toast('info', '未检测到 Trae Work，请手动指定 exe 路径（自定义安装目录时常见，可右键快捷方式「打开文件所在位置」获取）');
       }
     } catch (e) {
       toast('error', `检测失败：${String(e)}`);
@@ -178,7 +178,7 @@ export default function Settings() {
         update('trae_cn_path', r.exe);
         toast('success', `已自动定位并填入 Trae 路径（${LOCATE_SOURCE_LABEL[r.source] ?? r.source}${r.version ? `，版本 ${r.version}` : ''}）`);
       } else {
-        toast('info', '未检测到 Trae，请手动指定 exe 路径');
+        toast('info', '未检测到 Trae，请手动指定 exe 路径（自定义安装目录时常见，可右键快捷方式「打开文件所在位置」获取）');
       }
     } catch (e) {
       toast('error', `检测失败：${String(e)}`);
