@@ -3,6 +3,7 @@
 //! → dt- 令牌入池。事件契约对齐 wb-oauth（qoder-oauth-progress / qoder-oauth-done）。
 
 use std::os::windows::process::CommandExt;
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,10 +48,14 @@ fn emit_progress(app: &AppHandle, stage: &str, message: &str, auth_url: Option<&
     );
 }
 
-fn emit_done(app: &AppHandle, ok: bool, id: &str, nickname: &str, message: &str) {
-    let _ = app.emit(
+/// 终态事件：emit 失败落日志（issue #44 约定对齐，此前 `let _` 静默吞错——
+/// 前端 oauthRunning 弹窗将永挂且无任何日志线索）
+fn emit_done(app: &AppHandle, data_dir: &Path, ok: bool, id: &str, nickname: &str, message: &str) {
+    crate::events::emit_logged(
+        app,
         "qoder-oauth-done",
         json!({ "ok": ok, "id": id, "nickname": nickname, "message": message }),
+        Some(data_dir),
     );
 }
 
@@ -79,62 +84,71 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>) -> Result<(), S
         .name("qoder-oauth".into())
         .spawn(move || {
         let _guard = OAuthGuard;
-        let agent = http_agent(15);
-        emit_progress(&app2, "polling", "等待授权完成…", Some(&auth_url));
-        let started = std::time::Instant::now();
-        loop {
-            if started.elapsed().as_millis() as u64 > qoder_oauth::POLL_TIMEOUT_MS {
-                fs_utils::app_log(&state2.data_dir, "qoder OAuth 登录超时：180s 内未完成授权");
-                emit_done(&app2, false, "", "", "授权超时：请在浏览器完成授权后重试");
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(qoder_oauth::POLL_INTERVAL_MS));
-            let (status, body) = qoder_oauth::poll_once(&agent, &flow);
-            match status {
-                // pending：尚未授权（R-10 实测 404 NotFound）
-                404 => continue,
-                200 => {
-                    let Some(b) = body else {
-                        emit_done(&app2, false, "", "", "授权响应非 JSON，请重试");
-                        return;
-                    };
-                    let Some((creds, uid)) = qoder_oauth::parse_poll_success(&b) else {
-                        emit_done(&app2, false, "", "", "授权响应缺少令牌字段（接口结构可能已变更）");
-                        return;
-                    };
-                    match import_device_creds(&state2, creds, &uid) {
-                        Ok((id, nickname)) => {
-                            fs_utils::app_log(&state2.data_dir, &format!("qoder OAuth 登录成功: {id}"));
-                            emit_done(
-                                &app2,
-                                true,
-                                &id,
-                                &nickname,
-                                &format!("授权成功，账号 {nickname} 已入池"),
-                            );
+        // panic 不外泄线程：捕获后补发失败终态（OAUTH_RUNNING 由 OAuthGuard drop 复位），
+        // 否则前端 oauth 弹窗运行态永挂
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let agent = http_agent(15);
+            emit_progress(&app2, "polling", "等待授权完成…", Some(&auth_url));
+            let started = std::time::Instant::now();
+            loop {
+                if started.elapsed().as_millis() as u64 > qoder_oauth::POLL_TIMEOUT_MS {
+                    fs_utils::app_log(&state2.data_dir, "qoder OAuth 登录超时：180s 内未完成授权");
+                    emit_done(&app2, &state2.data_dir, false, "", "", "授权超时：请在浏览器完成授权后重试");
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(qoder_oauth::POLL_INTERVAL_MS));
+                let (status, body) = qoder_oauth::poll_once(&agent, &flow);
+                match status {
+                    // pending：尚未授权（R-10 实测 404 NotFound）
+                    404 => continue,
+                    200 => {
+                        let Some(b) = body else {
+                            emit_done(&app2, &state2.data_dir, false, "", "", "授权响应非 JSON，请重试");
+                            return;
+                        };
+                        let Some((creds, uid)) = qoder_oauth::parse_poll_success(&b) else {
+                            emit_done(&app2, &state2.data_dir, false, "", "", "授权响应缺少令牌字段（接口结构可能已变更）");
+                            return;
+                        };
+                        match import_device_creds(&state2, creds, &uid) {
+                            Ok((id, nickname)) => {
+                                fs_utils::app_log(&state2.data_dir, &format!("qoder OAuth 登录成功: {id}"));
+                                emit_done(
+                                    &app2,
+                                    &state2.data_dir,
+                                    true,
+                                    &id,
+                                    &nickname,
+                                    &format!("授权成功，账号 {nickname} 已入池"),
+                                );
+                            }
+                            Err(e) => emit_done(&app2, &state2.data_dir, false, "", "", &format!("凭证入库失败: {e}")),
                         }
-                        Err(e) => emit_done(&app2, false, "", "", &format!("凭证入库失败: {e}")),
+                        return;
                     }
-                    return;
+                    // 授权会话过期/被撤销等异常状态：立即终止（避免轮询轰炸）
+                    400 | 401 | 403 | 410 => {
+                        let msg = match body
+                            .as_ref()
+                            .and_then(|b| crate::fs_utils::dig(b, &["errorMessage", "error_message", "message"]))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                        {
+                            "" => format!("授权会话失效（HTTP {status}），请重新发起登录"),
+                            m => format!("授权失败（HTTP {status}）：{m}"),
+                        };
+                        fs_utils::app_log(&state2.data_dir, &format!("qoder OAuth 终止: {msg}"));
+                        emit_done(&app2, &state2.data_dir, false, "", "", &msg);
+                        return;
+                    }
+                    // 网络抖动等其他状态：继续轮询直至超时
+                    _ => continue,
                 }
-                // 授权会话过期/被撤销等异常状态：立即终止（避免轮询轰炸）
-                400 | 401 | 403 | 410 => {
-                    let msg = match body
-                        .as_ref()
-                        .and_then(|b| crate::fs_utils::dig(b, &["errorMessage", "error_message", "message"]))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                    {
-                        "" => format!("授权会话失效（HTTP {status}），请重新发起登录"),
-                        m => format!("授权失败（HTTP {status}）：{m}"),
-                    };
-                    fs_utils::app_log(&state2.data_dir, &format!("qoder OAuth 终止: {msg}"));
-                    emit_done(&app2, false, "", "", &msg);
-                    return;
-                }
-                // 网络抖动等其他状态：继续轮询直至超时
-                _ => continue,
             }
+        }));
+        if result.is_err() {
+            fs_utils::app_log(&state2.data_dir, "qoder OAuth 线程 panic（已捕获，补发失败终态）");
+            emit_done(&app2, &state2.data_dir, false, "", "", "OAuth 登录线程异常终止，请重试");
         }
     });
     if spawned.is_err() {

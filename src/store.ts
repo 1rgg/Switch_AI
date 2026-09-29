@@ -765,8 +765,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ switchingTo: userId, switchProgress: [] });
       // withMinDelay：切换是高风险操作，保证 busy 态至少可见 1s（避免瞬间完成导致闪烁/误触连点）
       await withMinDelay(api.switchAccount(userId, targetApp));
-      // 应用名后缀：TraeWork 静默；其余应用标注目标（Trae→Trae、WorkBuddy→WorkBuddy、Doubao→Doubao、CodeBuddy→CodeBuddy）
-      get().pushToast('info', `正在切换登录态${targetApp && targetApp !== 'TraeWork' ? `（${targetApp === 'CodeBuddy' ? 'CodeBuddy' : targetApp}）` : ''}，请稍候…`);
+      // 应用名后缀：TraeWork 静默；其余应用标注目标（Trae/WorkBuddy/Doubao/CodeBuddy/Qoder）
+      get().pushToast('info', `正在切换登录态${targetApp && targetApp !== 'TraeWork' ? `（${targetApp}）` : ''}，请稍候…`);
     } catch (err) {
       set({ switchingTo: null });
       get().pushToast('error', `切换失败：${String(err)}`);

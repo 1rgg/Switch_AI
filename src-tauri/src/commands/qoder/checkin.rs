@@ -47,8 +47,23 @@ pub fn qoder_checkin_start(
     let state2 = state.inner().clone();
     std::thread::spawn(move || {
         let _guard = round;
-        qoder_checkin::run_checkin_round(&state2, &o, &mut |ev| emit_qoder_event(&app2, ev));
-        let _ = app2.emit("qoder-checkin-progress", "{\"type\":\"exit\",\"ok\":true}");
+        // panic 不外泄线程：捕获后记录，exit 终态照常下发（否则前端运行态永挂）
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            qoder_checkin::run_checkin_round(&state2, &o, &mut |ev| emit_qoder_event(&app2, ev));
+        }));
+        if result.is_err() {
+            fs_utils::app_log(&state2.data_dir, "Qoder 签到轮次线程 panic（已捕获，exit 终态仍下发）");
+        }
+        // 终态事件（前端据 "type":"exit" 复位运行态）：emit 失败落日志（issue #44 约定对齐）。
+        // 契约同 wb：NDJSON **字符串** payload（listen<string> 后 JSON.parse），传对象会
+        // 破坏 parseLine 导致 exit 事件被静默丢弃
+        let line = serde_json::json!({ "type": "exit", "ok": true }).to_string();
+        crate::events::emit_logged(
+            &app2,
+            "qoder-checkin-progress",
+            serde_json::Value::String(line),
+            Some(state2.data_dir.as_path()),
+        );
     });
     Ok(())
 }

@@ -20,6 +20,7 @@ import {
   UserPlus,
 } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
+import SwitchProgressPanel from '../../components/SwitchProgressPanel';
 import { Badge, Modal } from '../../components/ui';
 import { api, type ProfileDoneEvent } from '../../lib/tauri';
 import { useAppStore } from '../../store';
@@ -130,6 +131,29 @@ export default function QoderAccounts() {
   const [resetBusy, setResetBusy] = useState(false);
   const [resetResults, setResetResults] = useState<QoderResetResult[] | null>(null);
   const unlisten = useRef<(() => void)[]>([]);
+
+  // 切换 90s 看门狗（对齐 Accounts/Buddy/Doubao 页，issue #44 合并审查补齐）：
+  // switch-done 事件异常缺失（桥挂死/事件丢失/后台线程 panic）时 switchingTo 永久
+  // 非空——本页全部切换/备份按钮被禁用。90s 后解除互斥并清空 store 进行中状态；
+  // 迟到的 done 事件仍会正常提示结果（onSwitchDone 对 null 幂等）。
+  const [lockTimedOut, setLockTimedOut] = useState(false);
+  const clearSwitchLocks = useAppStore((s) => s.clearSwitchLocks);
+  const savingLogin = useAppStore((s) => s.savingLogin);
+  const busy = (!!switchingTo || !!savingLogin) && !lockTimedOut;
+  useEffect(() => {
+    if (!switchingTo && !savingLogin) {
+      setLockTimedOut(false);
+      return;
+    }
+    setLockTimedOut(false);
+    const timer = setTimeout(() => {
+      setLockTimedOut(true);
+      clearSwitchLocks();
+      pushToast('warn', '切换超过 90 秒未收到完成事件，已解除按钮锁定；结果请以日志与列表状态为准');
+    }, 90_000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [switchingTo, savingLogin]);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -419,6 +443,9 @@ export default function QoderAccounts() {
     <div className="animate-fade-in">
       <PageHeader title="Qoder · 账号管理" desc="全家桶账号池 · PAT / OAuth / IDE 存储三通道 · 快照切换（M3） · CLI 状态桥（M4）" />
 
+      {/* 切换进度面板（对齐 Trae/Buddy/Doubao 页，复用全局 switch-progress NDJSON 管线） */}
+      <SwitchProgressPanel />
+
       <div className="card p-4">
         <div className="mb-3 flex items-center justify-between">
           <span className="text-sm font-medium">账号池（{accounts.length}）</span>
@@ -539,7 +566,7 @@ export default function QoderAccounts() {
                         <button
                           className="btn-ghost h-7 w-7 !p-0 text-emerald-600"
                           title="切换到此账号（备份当前 IDE 登录态 → 恢复该账号快照并注入绑定指纹）"
-                          disabled={switchingTo != null}
+                          disabled={busy}
                           onClick={() => void switchTo(a.id, 'Qoder')}
                         >
                           {switchingTo === a.id ? <Loader2 size={13} className="animate-spin" /> : <LogIn size={13} />}
@@ -547,7 +574,7 @@ export default function QoderAccounts() {
                         <button
                           className="btn-ghost h-7 w-7 !p-0"
                           title="备份当前 IDE 登录态到该账号槽位"
-                          disabled={snapBusy != null || switchingTo != null}
+                          disabled={snapBusy != null || busy}
                           onClick={() => void backupSnapshot(a)}
                         >
                           {snapBusy === a.id ? <Loader2 size={13} className="animate-spin" /> : <DatabaseBackup size={13} />}

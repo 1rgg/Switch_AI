@@ -230,6 +230,32 @@ pub fn switch_account(
                 buddy_current_account_id(&state, buddy_app).unwrap_or_default()
             }
         }
+    } else if is_qoder {
+        // F-80 §5.10 切换守卫：Qoder（icube 布局）当前登录真源 = IDE state.vscdb
+        // secret://userInfo（DPAPI 解密，与 ide_store 扫描同链路，仅 Windows）→
+        // uid 在池反查账号 id。uid 在池外时原样返回（守卫消息如实提示「与标记
+        // 账号不一致」，且 uid 与 qd- 池 id 无碰撞）；未登录/解密失败 → 空串
+        // fail-open（仅跳过回写，不阻断切换）。此前 Qoder 落入空串兜底：守卫
+        // 每次误报「未识别登录会话」且来源账号槽永不回写（合并审查修复）
+        #[cfg(windows)]
+        {
+            let detected = crate::commands::qoder::ide_data_dir()
+                .and_then(|dir| crate::commands::qoder::scan_ide_login(&dir).ok())
+                .map(|l| l.uid)
+                .filter(|u| !u.is_empty());
+            match detected {
+                Some(uid) => crate::commands::qoder::load_pool(&state)
+                    .into_iter()
+                    .find(|a| a.uid == uid)
+                    .map(|a| a.id)
+                    .unwrap_or(uid),
+                None => String::new(),
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            String::new()
+        }
     } else {
         String::new()
     };
