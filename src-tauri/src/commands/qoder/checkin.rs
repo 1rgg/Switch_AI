@@ -145,6 +145,19 @@ fn qoder_checkin_task_names() -> Vec<String> {
     }
 }
 
+/// 删除单个计划任务：run_schtasks 三态归一为 Result（Ok(true)=成功；
+/// Ok(false) 取 stderr，Err 透传）——替代原 `let _ = run_schtasks(...)` 静默吞错
+fn delete_task_checked(name: &str) -> Result<(), String> {
+    match run_schtasks(&["/Delete", "/TN", name, "/F"]) {
+        Ok((true, _, _)) => Ok(()),
+        Ok((false, _, stderr)) => {
+            let msg = stderr.trim().to_string();
+            Err(if msg.is_empty() { "schtasks 返回失败".into() } else { msg })
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[tauri::command(async)]
 pub fn qoder_checkin_task_register(state: State<AppState>, times: Vec<String>) -> Result<(), String> {
     if times.is_empty() {
@@ -154,16 +167,31 @@ pub fn qoder_checkin_task_register(state: State<AppState>, times: Vec<String>) -
         crate::commands::misc::validate_hhmm(t)?;
     }
     let tr = build_qoder_task_tr(&state, "qoder-checkin")?;
-    for name in qoder_checkin_task_names() {
-        let _ = run_schtasks(&["/Delete", "/TN", &name, "/F"]);
-    }
+    // 先建后删：/Create /F 直接覆盖同名旧任务，全部创建成功后再清理不在新集合内的
+    // 旧任务——原实现先删后建，创建中途失败会导致旧调度已被删除（定时签到整体丢失）
+    let mut new_names: Vec<String> = Vec::with_capacity(times.len());
     for t in &times {
         let hhmm = t.replace(':', "");
         let name = format!("{QODER_CHECKIN_TASK_PREFIX}_{hhmm}");
         let (ok, _, stderr) =
             run_schtasks(&["/Create", "/TN", &name, "/TR", &tr, "/SC", "DAILY", "/ST", t, "/F"])?;
         if !ok {
-            return Err(format!("注册任务 {t} 失败: {}", stderr.trim()));
+            // 先建后删流：此处失败时旧任务尚未清理，仍按原时间正常触发
+            return Err(format!(
+                "注册任务 {t} 失败: {}（原任务未被改动，仍按原时间正常触发；可重试本操作）",
+                stderr.trim()
+            ));
+        }
+        new_names.push(name);
+    }
+    for name in qoder_checkin_task_names() {
+        if !new_names.contains(&name) {
+            if let Err(e) = delete_task_checked(&name) {
+                fs_utils::app_log(&state.data_dir, &format!("清理旧签到任务 {name} 失败: {e}"));
+                return Err(format!(
+                    "新任务已注册成功，但清理旧任务 {name} 失败（残留任务会重复触发签到）: {e}"
+                ));
+            }
         }
     }
     fs_utils::app_log(
@@ -191,8 +219,17 @@ pub fn qoder_checkin_task_status() -> Result<Vec<String>, String> {
 
 #[tauri::command(async)]
 pub fn qoder_checkin_task_unregister(state: State<AppState>) -> Result<(), String> {
+    // 删除失败如实反馈（残留任务会继续触发签到），全部成功才记「已注销」；
+    // 原实现 `let _ =` 静默吞错，用户以为已注销实际任务仍在跑
+    let mut failed: Vec<String> = Vec::new();
     for name in qoder_checkin_task_names() {
-        let _ = run_schtasks(&["/Delete", "/TN", &name, "/F"]);
+        if let Err(e) = delete_task_checked(&name) {
+            fs_utils::app_log(&state.data_dir, &format!("注销签到任务 {name} 失败: {e}"));
+            failed.push(format!("{name}: {e}"));
+        }
+    }
+    if !failed.is_empty() {
+        return Err(format!("部分签到任务注销失败: {}", failed.join("；")));
     }
     fs_utils::app_log(&state.data_dir, "Qoder 每日签到定时任务已注销");
     Ok(())

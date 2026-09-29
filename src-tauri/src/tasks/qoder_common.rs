@@ -34,7 +34,7 @@ pub const CLIENT_USER_AGENT: &str = "Qoder";
 
 // ── 凭证结构 ────────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Clone, Default, Debug)]
+#[derive(Serialize, Clone, Default)]
 pub struct QoderCreds {
     #[serde(default)]
     pub access_token: String,
@@ -59,6 +59,25 @@ pub struct QoderCreds {
     pub machine_id: String,
     #[serde(default)]
     pub machine_token: String,
+}
+
+// 手写脱敏 Debug（derive(Debug) 会把 access_token/refresh_token/pat/machine_token
+// 全量打进日志——触犯「凭证不入日志」红线）：敏感字段仅显 **（空则空串便于排障）
+impl std::fmt::Debug for QoderCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mask = |s: &str| if s.is_empty() { "" } else { "**" };
+        f.debug_struct("QoderCreds")
+            .field("access_token", &mask(&self.access_token))
+            .field("refresh_token", &mask(&self.refresh_token))
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("uid", &self.uid)
+            .field("nickname", &self.nickname)
+            .field("kind", &self.kind)
+            .field("pat", &mask(&self.pat))
+            .field("machine_id", &self.machine_id)
+            .field("machine_token", &mask(&self.machine_token))
+            .finish()
+    }
 }
 
 fn s_of(v: Option<&Value>) -> String {
@@ -95,6 +114,11 @@ pub fn creds_of(source: &Value) -> QoderCreds {
 
 // ── token store（qoder_tokens 表；结构 {version, tokens: {id: rec}}）────────
 
+/// token store 读改写互斥：load→merge→save 非原子，签到/积分/刷新/导入多通道
+/// 并发写会互相覆盖丢更新（last-writer-wins 抹掉彼此的新 token）。进程内全局锁
+/// 串行化表级读改写；仅持锁做本地 IO，不覆盖网络请求路径（无死锁面）。
+static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn load_token_store(state: &AppState) -> Value {
     crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir))
 }
@@ -128,6 +152,7 @@ fn load_device_profile(state: &AppState, acct_id: &str) -> Option<super::qoder_d
 
 /// 写工具侧凭证副本（version≠1 拒写；非空字段 merge + updated_at，对齐 wb_common 同语义）
 pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Result<(), String> {
+    let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut store = load_token_store(state);
     if !store.is_object() {
         store = serde_json::json!({});
@@ -160,6 +185,7 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
 
 /// 删除 token store 记录（账号移除时同步清理）
 pub fn remove_token(state: &AppState, id: &str) -> Result<(), String> {
+    let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut store = load_token_store(state);
     if let Some(t) = store.get_mut("tokens").and_then(Value::as_object_mut) {
         t.remove(id);
@@ -312,10 +338,11 @@ fn job_client_id(pat: &str) -> String {
     )
 }
 
-/// expires_in 归一为毫秒（R-6 抓包实测 86400000 = 24h，即毫秒；秒级值兼容 ×1000。
-/// 阈值 1e7：24h 秒级 8.64e4、毫秒级 8.64e7，无现实重叠区）
-fn normalize_expires_in(e: i64) -> i64 {
-    if e > 10_000_000 {
+/// expires_in 归一为毫秒（R-6 抓包实测 86400000 = 24h，即毫秒；秒级值兼容 ×1000）。
+/// 阈值 2_592_000 = 30 天的秒数：秒级上限（30d=2.592e6）与毫秒级下限（1h=3.6e6）
+/// 之间留出安全间隔，杜绝「秒级超长有效期被误当毫秒」的歧义
+pub(crate) fn normalize_expires_in(e: i64) -> i64 {
+    if e > 2_592_000 {
         e
     } else {
         e * 1000
@@ -403,7 +430,8 @@ pub fn exchange_job_token(
 /// refreshed/refresh_failed/pat_rejected。
 ///
 /// PAT 通道（R-6）：pt- 不被 sash 业务端点接受（实测 401），先经 jobToken 换取
-/// 24h 作业令牌；作业令牌临期（<1h）或已过期时用原始 PAT 重换（PAT 长期有效）。
+/// 24h 作业令牌；作业令牌临期（< lazy_hours，与客户端通道同语义）或已过期时用
+/// 原始 PAT 重换（PAT 长期有效）；调用方传 i64::MAX（401 自愈/恒刷路径）即无条件重换。
 pub fn ensure_fresh(
     state: &AppState,
     agent: &ureq::Agent,
@@ -427,14 +455,22 @@ pub fn ensure_fresh(
         } else {
             creds.pat.clone()
         };
+        // 临期窗口消费 lazy_hours（与客户端通道同语义，不再写死 1h）：调用方传
+        // i64::MAX（401 自愈/恒刷路径）时 saturating_mul 封顶 → 无条件重换——原硬编码
+        // 1h 窗口会把「服务端已吊销但本地未临期」的令牌挡回 fresh，401 自愈失效
         let need_exchange = is_pat
-            || creds.expires_at_ms.is_none_or(|e| e - now_ms < 3_600_000); // 临期 1h 内重换
+            || creds
+                .expires_at_ms
+                .is_none_or(|e| e - now_ms < lazy_hours.saturating_mul(3_600_000));
         if !need_exchange {
             return (creds, false, "fresh");
         }
         return match exchange_job_token(agent, &pat, &state.data_dir) {
             Some(new) => {
-                let _ = save_token_store(state, acct_id, &new);
+                // 落库失败不能静默：否则新作业令牌只存活本轮，下轮仍走 PAT 重换
+                if let Err(e) = save_token_store(state, acct_id, &new) {
+                    fs_utils::app_log(&state.data_dir, &format!("[qoder] token 落库失败(id={acct_id}, PAT通道): {e}"));
+                }
                 // §5.10：换取产物为全新 Creds 不含指纹，返回前在内存层补注入账号绑定
                 // 指纹（effective_creds 同款合并语义）——否则本轮后续请求丢
                 // Cosy-MachineId/Cosy-MachineToken 头。随机 machine_token 不落库
@@ -466,10 +502,40 @@ pub fn ensure_fresh(
         let mut persist = new.clone();
         persist.machine_id.clear();
         persist.machine_token.clear();
-        let _ = save_token_store(state, acct_id, &persist);
+        // 落库失败不能静默：否则刷新结果只存活本轮，凭证可能在下轮前过期
+        if let Err(e) = save_token_store(state, acct_id, &persist) {
+            fs_utils::app_log(&state.data_dir, &format!("[qoder] token 落库失败(id={acct_id}, 客户端通道): {e}"));
+        }
         return (new, true, "refreshed");
     }
     (creds, false, "refresh_failed")
+}
+
+// ── 账号池回写 ─────────────────────────────────────────────────────────────
+
+/// 刷新成功后回写账号池过期时间与登录态标记（调度/到期数据源）。
+/// 供 qoder_checkin / qoder_credits（401 自愈）等通道共用。
+pub fn sync_pool_expiry(state: &AppState, aid: &str, creds: &QoderCreds) {
+    // I09：直操原始 JSON 保留未知字段（不可走 with_pool_mut），持池锁防并发整池覆盖丢写
+    let _guard = state
+        .qoder_pool_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
+    let mut changed = false;
+    if let Some(accounts) = pool.get_mut("accounts").and_then(Value::as_array_mut) {
+        for a in accounts.iter_mut() {
+            if a.get("id").and_then(Value::as_str) == Some(aid) {
+                a["token_expires_at"] = serde_json::json!(creds.expires_at_ms.map(|ms| ms.div_euclid(1000)));
+                a["needs_relogin"] = serde_json::json!(false);
+                a["relogin_reason"] = serde_json::json!("");
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let _ = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool);
+    }
 }
 
 // ── 账号 id（对齐 wb- 惯例：qd- + sha256[..12]）────────────────────────────
@@ -543,6 +609,12 @@ mod tests {
     fn normalize_expires_in_handles_ms_and_seconds() {
         assert_eq!(normalize_expires_in(86_400_000), 86_400_000, "毫秒原样");
         assert_eq!(normalize_expires_in(86_400), 86_400_000, "秒级 ×1000");
+        // 阈值边界：30 天秒级恰为分界（>2_592_000 判毫秒原样），其下判秒级 ×1000
+        assert_eq!(normalize_expires_in(2_592_000), 2_592_000_000, "30 天秒级 ×1000");
+        assert_eq!(normalize_expires_in(2_592_001), 2_592_001, "超阈值判毫秒原样");
+        // 1h 秒级（3600）不得被误判为毫秒（3.6e6 ms 恰为 1h 毫秒级下限之下仍安全）
+        assert_eq!(normalize_expires_in(3_600_000), 3_600_000, "1h 毫秒原样");
+        assert_eq!(normalize_expires_in(3_600), 3_600_000, "1h 秒级 ×1000");
         let now = chrono::Utc::now().timestamp_millis();
         let exp = now + normalize_expires_in(86_400_000);
         let hours = (exp - now) as f64 / 3_600_000.0;

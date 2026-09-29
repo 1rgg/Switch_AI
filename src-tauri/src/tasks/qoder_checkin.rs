@@ -22,7 +22,7 @@ use crate::fs_utils;
 use crate::state::AppState;
 
 use super::http_agent;
-use super::qoder_common::{self, QoderCreds};
+use super::qoder_common;
 
 /// 签到轮次参数（对齐 wb_checkin::CheckinOpts；skip_checked 保留契约字段）
 #[derive(Clone, Default)]
@@ -114,53 +114,21 @@ fn post_empty(agent: &ureq::Agent, url: &str, headers: &[(String, String)]) -> (
     }
 }
 
-// ── 账号池回写 / 结果存储 ──────────────────────────────────────────────────
+// ── 结果存储 ───────────────────────────────────────────────────────────────
 
-/// 刷新成功后回写账号池过期时间与登录态标记（调度/到期数据源）
-fn sync_pool_expiry(state: &AppState, aid: &str, creds: &QoderCreds) {
-    // I09：直操原始 JSON 保留未知字段（不可走 with_pool_mut），持池锁防并发整池覆盖丢写
-    let _guard = state
-        .qoder_pool_lock
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
-    let mut changed = false;
-    if let Some(accounts) = pool.get_mut("accounts").and_then(Value::as_array_mut) {
-        for a in accounts.iter_mut() {
-            if a.get("id").and_then(Value::as_str) == Some(aid) {
-                a["token_expires_at"] = json!(creds.expires_at_ms.map(|ms| ms.div_euclid(1000)));
-                a["needs_relogin"] = json!(false);
-                a["relogin_reason"] = json!("");
-                changed = true;
-            }
-        }
-    }
-    if changed {
-        let _ = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool);
-    }
-}
-
-/// 签到结果 90 天滚动存储（趋势/日志数据源；SQLite 化：qoder_checkin_results 表）
+/// 签到结果 90 天滚动存储（趋势/日志数据源；SQLite 化：qoder_checkin_results 表）。
+/// 写入为逐条 UPSERT（pk = date|user_id|time，内容派生）：原「整表 load→save」
+/// 在计划任务与 UI 并发触发时互相覆盖丢记录（数组下标 pk 冲突）；90 天裁剪内置于
+/// docs::qoder_checkin_results_upsert（逐 pk DELETE，不触碰新写入）。
 fn append_results(state: &AppState, events: &[Value]) {
     let store = crate::store::db(&state.data_dir);
-    let mut data: Value = crate::store::docs::qoder_checkin_results_load(&store);
-    let results: Vec<Value> = data
-        .get("results")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(90))
-        .format("%Y-%m-%d")
-        .to_string();
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let mut kept: Vec<Value> = results
-        .into_iter()
-        .filter(|r| r.get("date").and_then(Value::as_str).unwrap_or("") >= cutoff.as_str())
-        .collect();
     for ev in events {
         let mut rec = json!({
             "date": today,
             "time": fs_utils::now_ts(),
+            // pk 去重源：毫秒时间戳（now_ts 秒级，同账号同秒两进程并发写入会碰撞互覆）
+            "time_ms": chrono::Utc::now().timestamp_millis(),
             "user_id": ev.get("user_id").cloned().unwrap_or_default(),
             "name": ev.get("name").cloned().unwrap_or_default(),
             "status": ev.get("status").cloned().unwrap_or_default(),
@@ -169,10 +137,10 @@ fn append_results(state: &AppState, events: &[Value]) {
         if let Some(r) = ev.get("reward").filter(|r| !r.is_null()) {
             rec["reward"] = r.clone();
         }
-        kept.push(rec);
+        if let Err(e) = crate::store::docs::qoder_checkin_results_upsert(&store, &rec) {
+            fs_utils::app_log(&state.data_dir, &format!("[qoder] 签到结果落库失败: {e}"));
+        }
     }
-    data["results"] = json!(kept);
-    let _ = crate::store::docs::qoder_checkin_results_save(&store, &data);
 }
 
 // ── 签到主流程 ─────────────────────────────────────────────────────────────
@@ -357,7 +325,7 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                        "message": "PAT 校验失败（无效或已吊销）：请到 qoder.com.cn/account/integrations 重新创建并导入" });
     }
     if refreshed {
-        sync_pool_expiry(state, &aid, &creds);
+        qoder_common::sync_pool_expiry(state, &aid, &creds);
     }
     let urls = urls_for();
     let mut headers = qoder_common::build_auth_headers(&creds);
@@ -380,10 +348,12 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                     if k == "auth" {
                         kind = "auth".into();
                         auth_msg = m;
-                        reward = None;
+                        // 已领取活动的累计奖励不丢弃（真实入账，原 reward=None 会抹掉）
                         break;
                     }
                     if k == "success" {
+                        // kind 优先级：success 覆写任何中间态（部分活动失败不掩盖整体成功）；
+                        // 其余 kind 仅在首个出现时定型（kind.is_empty() 门控），不互相覆盖
                         kind = "success".into();
                     } else if kind.is_empty() {
                         kind = k.clone();
@@ -397,7 +367,7 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                     }
                 }
                 if kind == "auth" {
-                    (kind, auth_msg, None)
+                    (kind, auth_msg, reward)
                 } else {
                     if kind.is_empty() {
                         kind = "fail".into();
@@ -421,7 +391,7 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
             if refreshed && new.access_token != creds.access_token { Some(new) } else { None };
         match retry_cred {
             Some(new) => {
-                sync_pool_expiry(state, &aid, &new);
+                qoder_common::sync_pool_expiry(state, &aid, &new);
                 headers = qoder_common::build_auth_headers(&new);
                 let retry = match list_claimable(agent, &headers, &urls) {
                     Ok(claimable) => {
@@ -458,12 +428,17 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                 };
                 kind = retry.0;
                 message = retry.1;
-                reward = retry.2;
+                // 重试奖励合并进首次已累计部分（auth 中断前可能已领到部分活动）：
+                // 原实现整体覆盖，401 前已入账的奖励被抹掉
+                reward = match (reward, retry.2) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    (a, b) => b.or(a),
+                };
             }
             None => {
                 kind = "fail".into();
                 message = "登录态失效且刷新失败，需重新登录".into();
-                reward = None;
+                // 已累计奖励保留（真实入账不因刷新失败而回滚；原 reward=None 丢弃）
             }
         }
     }
@@ -508,7 +483,7 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
         fs_utils::app_log(&state.data_dir, &format!("Qoder 设备指纹回填失败（继续签到）: {e}"));
     }
     let agent = http_agent(30);
-    let mut pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
+    let pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
     let mut accounts: Vec<Value> = pool
         .get("accounts")
         .and_then(Value::as_array)
@@ -526,10 +501,6 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
             "index": 0,
             "message": format!("多账号签到未显式开启：本轮仅处理首个账号，其余 {skipped} 个已跳过（平台条款风险，见环境配置页说明）"),
         }));
-        // 同步裁剪落库池引用（仅本轮内存视图，不改账号池）
-        if let Some(arr) = pool.get_mut("accounts").and_then(Value::as_array_mut) {
-            arr.truncate(1);
-        }
     }
     emit(&json!({"type": "start", "total": accounts.len()}));
 

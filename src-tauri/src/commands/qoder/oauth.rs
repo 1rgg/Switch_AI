@@ -191,7 +191,10 @@ fn import_device_creds(
                 a.plan = tier;
             }
             a.credential_source = "client".into();
-            a.uid = uid.clone();
+            // uid 空时不清空既有绑定（userinfo 失败且设备流未返回 uid 的降级场景）
+            if !uid.is_empty() {
+                a.uid = uid.clone();
+            }
             a.needs_relogin = false;
             a.relogin_reason = String::new();
             // 指纹回填（幂等：已有稳定绑定不覆盖，§5.10）

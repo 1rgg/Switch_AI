@@ -32,6 +32,24 @@ pub fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<(), Str
     Ok(())
 }
 
+/// 文本原子写（同 write_json 的 temp+rename 模型；供 machineid / storage.json 等
+/// 非 JSON 序列化路径复用，防断电产生半截指纹文件）。
+pub fn write_text_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), nanos));
+    {
+        let mut f = fs::File::create(&tmp).map_err(|e| format!("创建临时文件失败: {e}"))?;
+        f.write_all(content.as_bytes())
+            .map_err(|e| format!("写入失败: {e}"))?;
+        f.flush().map_err(|e| format!("刷新失败: {e}"))?;
+    }
+    fs::rename(&tmp, path).map_err(|e| format!("替换文件失败: {e}"))?;
+    Ok(())
+}
+
 /// 掩码：保留前4后4，中间用 … 代替。
 pub fn mask(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();

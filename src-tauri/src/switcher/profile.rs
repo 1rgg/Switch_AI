@@ -204,7 +204,10 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             // §2.3 的 com.qodercn.app.stable 与本机不符，按实测修正）
             data_dir: PathBuf::from(format!("{appdata}\\QoderCN")),
             profiles_dir: data.join("data").join("profiles_qoder"),
-            settings_path_key: "qoder_path",
+            // F-80 R-2：与前端写入键对齐（QoderSettings 写 qoder_ide_path = IDE exe 路径，
+            // commands/qoder/common.rs::ide_exe_candidates 同源消费）；原 "qoder_path" 为死键，
+            // locate 按它读 settings 永得 None，用户显式指定的路径在切换链路中失效
+            settings_path_key: "qoder_ide_path",
             // 同 Trae 系：VSCode fork 强杀后 vscdb WAL 残留被启动回放，8s 优雅落盘
             graceful_wait_secs: 8,
             // 壳（Qoder CN.exe）+ IDE 本体（Qoder CN IDE.exe）一起停；
@@ -280,7 +283,7 @@ mod tests {
             PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("QoderCN")
         );
         assert_eq!(qd.profiles_dir, data.join("data").join("profiles_qoder"));
-        assert_eq!(qd.settings_path_key, "qoder_path");
+        assert_eq!(qd.settings_path_key, "qoder_ide_path");
         assert_eq!(qd.graceful_wait_secs, 8);
         assert_eq!(qd.proc_names, &["Qoder CN IDE", "Qoder CN"]);
         assert_eq!(qd.exe_candidates.len(), 4);

@@ -98,17 +98,13 @@ pub fn parse_poll_success(body: &Value) -> Option<(QoderCreds, String)> {
         .unwrap_or("")
         .to_string();
     let now_ms = chrono::Utc::now().timestamp_millis();
+    // expires_in 毫秒/秒归一统一走 qoder_common::normalize_expires_in
+    //（原内联阈值 1e7 与 common 的 2_592_000 两套口径，中间值语义有歧义）
     let expires_at_ms = fs_utils::dig(body, &["expires_in", "expiresIn"])
         .and_then(|v| {
             v.as_i64().or_else(|| v.as_str()?.trim().parse::<i64>().ok())
         })
-        .map(|e| {
-            if e > 10_000_000 {
-                now_ms + e
-            } else {
-                now_ms + e * 1000
-            }
-        });
+        .map(|e| now_ms + qoder_common::normalize_expires_in(e));
     let refresh_token = fs_utils::dig(body, &["refresh_token", "refreshToken"])
         .and_then(Value::as_str)
         .unwrap_or("")

@@ -49,11 +49,19 @@ pub fn run_task(state: &AppState) -> Result<Value, String> {
     let credits_ok = qoder_credits::fetch_credits(state, None, true)
         .map(|v| v.get("ok").and_then(Value::as_bool).unwrap_or(false))
         .unwrap_or(false);
+    // 有账号刷新失败时返 Err：调度器按失败处理（记 last_fail_ts，30 分钟冷却后重试），
+    // 避免 ok:false 被误判为成功而错过当日后续兜底；CLI `--task-run` 同样输出 ok:false 退出码 1
+    if failed > 0 {
+        return Err(format!(
+            "刷新完成：{refreshed} 成功 / {failed} 失败（共 {} 账号，30 分钟后重试）",
+            accounts.len()
+        ));
+    }
     Ok(json!({
-        "ok": failed == 0,
+        "ok": true,
         "accounts": accounts.len(),
         "refreshed": refreshed,
-        "failed": failed,
+        "failed": 0,
         "credits_ok": credits_ok,
     }))
 }

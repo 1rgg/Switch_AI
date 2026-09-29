@@ -69,10 +69,45 @@ fn default_true() -> bool {
 // ── 账号池 / 设置读写 ───────────────────────────────────────────────────────
 
 pub(crate) fn load_pool(state: &AppState) -> Vec<QoderAccount> {
+    // 只读路径容错：逐行解析，损坏行跳过（原实现整组解析失败 → 静默空池）
+    load_pool_rows(state).0
+}
+
+/// 逐行解析池：返回 (正常账号, 损坏行原始值)。写入路径必须走 load_pool_checked
+/// 拒绝损坏池，避免「load 丢行 → save 整池覆盖」静默永久丢账号。
+fn load_pool_rows(state: &AppState) -> (Vec<QoderAccount>, Vec<serde_json::Value>) {
     let v = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
-    v.get("accounts")
-        .and_then(|a| serde_json::from_value::<Vec<QoderAccount>>(a.clone()).ok())
-        .unwrap_or_default()
+    let Some(rows) = v.get("accounts").and_then(|a| a.as_array()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let mut ok = Vec::new();
+    let mut corrupt = Vec::new();
+    for r in rows {
+        match serde_json::from_value::<QoderAccount>(r.clone()) {
+            Ok(a) => ok.push(a),
+            Err(_) => corrupt.push(r.clone()),
+        }
+    }
+    (ok, corrupt)
+}
+
+/// 严格版池读（供 with_pool_mut 写路径把关）：存在损坏行时先把损坏行原文备份到
+/// data_dir/qoder_pool.corrupt.json，再拒绝返回——整池覆盖前必须显式处理。
+pub(crate) fn load_pool_checked(state: &AppState) -> Result<Vec<QoderAccount>, String> {
+    let (accounts, corrupt) = load_pool_rows(state);
+    if corrupt.is_empty() {
+        return Ok(accounts);
+    }
+    let backup = state.data_dir.join("qoder_pool.corrupt.json");
+    let _ = crate::fs_utils::write_json(&backup, &serde_json::json!({ "corrupt_rows": corrupt }));
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        "qoder 账号池存在损坏行，已备份到 qoder_pool.corrupt.json，拒绝整池覆盖以防丢账号",
+    );
+    Err(
+        "账号池数据存在损坏行，已备份到 qoder_pool.corrupt.json；本次修改已取消以保护其余账号，请处理备份文件后重试"
+            .into(),
+    )
 }
 
 pub(crate) fn save_pool(state: &AppState, accounts: &[QoderAccount]) -> Result<(), String> {
@@ -96,7 +131,7 @@ pub(crate) fn with_pool_mut<T>(
         .qoder_pool_lock
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mut accounts = load_pool(state);
+    let mut accounts = load_pool_checked(state)?;
     let out = f(&mut accounts)?;
     save_pool(state, &accounts)?;
     Ok(out)
@@ -224,8 +259,9 @@ fn launcher_running() -> bool {
     false
 }
 
-/// 环境检测（环境配置页/概述页/顶栏数据源）：IDE / 数据目录 / CLI / QoderWork
-#[tauri::command]
+/// 环境检测（环境配置页/概述页/顶栏数据源）：IDE / 数据目录 / CLI / QoderWork。
+/// async 命令：内部 tasklist 子进程 + 磁盘探测会阻塞数百毫秒，同步命令会卡死主线程
+#[tauri::command(async)]
 pub fn qoder_env_check(state: State<AppState>) -> serde_json::Value {
     let exe = ide_exe_candidates(&state)
         .into_iter()

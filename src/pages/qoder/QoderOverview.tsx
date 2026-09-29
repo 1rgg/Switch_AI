@@ -78,19 +78,30 @@ export default function QoderOverview() {
   const [records, setRecords] = useState<QoderCheckinRecord[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [openingClient, setOpeningClient] = useState(false);
+  const [checkinHhmm, setCheckinHhmm] = useState('10:15');
 
   const refresh = async () => {
     setRefreshing(true);
     try {
-      const [e, accs, cr, recs] = await Promise.all([
+      // creditsFetch 失败不拖垮整页（原裸 await 使单路 reject 连带其余三路 setState
+      // 全部跳过），同时保留 QoderCredits 页 I18 意图「不内联吞错」：ok/err 包裹后
+      // 失败显式 toast 并保留旧数据；其余三路为本地读库/环境探测，降级不阻塞
+      const [e, accs, crRes, recs] = await Promise.all([
         api.qoder.envCheck().catch(() => null),
         api.qoder.accountsList().catch(() => [] as QoderAccountView[]),
-        api.qoder.creditsFetch().catch(() => null),
+        api.qoder.creditsFetch().then(
+          (cr) => ({ ok: true as const, cr }),
+          (err: unknown) => ({ ok: false as const, err }),
+        ),
         api.qoder.checkinResults(30).catch(() => [] as QoderCheckinRecord[]),
       ]);
       setEnv(e);
       setAccounts(accs);
-      setCredits(cr);
+      if (crRes.ok) {
+        setCredits(crRes.cr);
+      } else {
+        pushToast('error', `积分查询失败（展示缓存数据）：${String(crRes.err)}`);
+      }
       setRecords(recs);
     } catch (err) {
       pushToast('error', `Qoder 概述刷新失败：${String(err)}`);
@@ -101,6 +112,11 @@ export default function QoderOverview() {
 
   useEffect(() => {
     void refresh();
+    // 签到调度卡显示全局设置中的签到时刻（原硬编码「每日 10:15」与设置页脱节）
+    api.misc
+      .settingsGet()
+      .then((s) => setCheckinHhmm(s.qoder_checkin_hhmm || '10:15'))
+      .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -196,7 +212,12 @@ export default function QoderOverview() {
     const which = env?.ide_installed ? 'ide' : 'work';
     (which === 'ide' ? api.qoder.openIde() : api.qoder.openWork())
       .then(() => pushToast('success', '已启动 Qoder 客户端'))
-      .catch((e) => pushToast('error', `打开客户端失败：${String(e)}`))
+      .catch((e) => {
+        // 对齐 TopBar 分级：「未检测到」是可修复的环境问题（warn），其余才是 error
+        const msg = String(e);
+        if (msg.includes('未检测到')) pushToast('warn', msg);
+        else pushToast('error', `打开客户端失败：${msg}`);
+      })
       .finally(() => setOpeningClient(false));
   };
 
@@ -234,7 +255,7 @@ export default function QoderOverview() {
         />
         <StatCard
           label="签到调度"
-          value="每日 10:15"
+          value={`每日 ${checkinHhmm}`}
           hint="单次覆盖 0 点签到 + 10:00 登录奖励"
           tone="violet"
         />

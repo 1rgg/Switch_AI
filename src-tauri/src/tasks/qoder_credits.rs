@@ -280,6 +280,9 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
             {
                 let (new_creds, refreshed, _) = qoder_common::ensure_fresh(state, &agent, aid, i64::MAX);
                 if refreshed && new_creds.access_token != creds.access_token {
+                    // 401 自愈成功：回写池过期时间/登录态（原自愈路径只刷新不回写，
+                    // 池内 token_expires_at 仍是旧值，到期看板会误报「已过期」）
+                    qoder_common::sync_pool_expiry(state, aid, &new_creds);
                     return fetch_account(&agent, a, &new_creds);
                 }
             }
@@ -311,6 +314,29 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
             "accounts": rows, "total_balance": 0.0,
             "message": "全部账号查询失败且无历史缓存",
         }));
+    }
+    // 池回写（QoderAccount.credits_balance/credits_fetched_at 为 Overview 余额展示数据源，
+    // 原实现只写快照/缓存不回写池，Overview 永远显示空余额）：
+    // I09：直操原始 JSON 保留未知字段（不可走 with_pool_mut），持池锁防并发整池覆盖丢写
+    let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pool = crate::store::docs::qoder_pool_load(&db);
+    let mut changed = false;
+    if let Some(accounts) = pool.get_mut("accounts").and_then(Value::as_array_mut) {
+        for a in accounts.iter_mut() {
+            let Some(aid) = a.get("id").and_then(Value::as_str).map(str::to_string) else { continue };
+            let Some(row) = rows.iter().find(|r| {
+                r.get("user_id").and_then(Value::as_str) == Some(aid.as_str())
+                    && r.get("ok").and_then(Value::as_bool) == Some(true)
+            }) else {
+                continue;
+            };
+            a["credits_balance"] = row.get("total").cloned().unwrap_or(Value::Null);
+            a["credits_fetched_at"] = json!(fs_utils::now_iso());
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = crate::store::docs::qoder_pool_save(&db, &pool);
     }
     // 快照落库（同日覆盖 + 365 天裁剪；失败不阻塞返回）。
     // 仅全量查询落快照/写缓存：单账号 rows 会覆盖全量快照并污染缓存（过滤失效）

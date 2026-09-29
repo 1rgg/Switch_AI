@@ -1355,7 +1355,7 @@ pub fn qoder_token_store_save(s: &Store, store_val: &Value) -> Result<(), String
 
 // ── Qoder 签到结果（qoder_checkin_results 表；行文档 + 90 天滚动由调用方裁剪）──
 
-/// 读回 {results: [...]}（按 pk 升序 = 原追加序）
+/// 读回 {results: [...]}（rows_all 按 rowid 序 = 原追加序）
 pub fn qoder_checkin_results_load(s: &Store) -> Value {
     let results: Vec<Value> = s
         .rows_all("qoder_checkin_results")
@@ -1366,21 +1366,53 @@ pub fn qoder_checkin_results_load(s: &Store) -> Value {
     json!({ "results": results })
 }
 
-/// 整表替换（90 天裁剪由调用方计算后传入）
-pub fn qoder_checkin_results_save(s: &Store, root: &Value) -> Result<(), String> {
-    let empty = Vec::new();
-    let arr = root.get("results").and_then(Value::as_array).unwrap_or(&empty);
-    let rows: Vec<(String, Value)> = arr
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            // pk = date|user_id|idx（同日同账号多活动记录共存）
-            let date = r.get("date").and_then(Value::as_str).unwrap_or("");
-            let uid = r.get("user_id").and_then(Value::as_str).unwrap_or("");
-            (format!("{date}|{uid}|{i}"), r.clone())
-        })
+/// 单条签到结果 UPSERT + 90 天滚动裁剪。
+/// pk = `date|user_id|time_ms`（内容派生）：原 `date|user_id|idx` 的 idx 是「载入时数组
+/// 下标」，计划任务与 UI 触发两进程各自从 0 计数，同日同账号并发写入必然互相覆盖；
+/// 秒级 time 同账号同秒仍会碰撞，故优先毫秒级 time_ms（旧记录/旧调用方回退 time 兼容）。
+/// 裁剪为逐 pk DELETE，仅删过期行不触碰新写入（对齐 qoder_credits_history_upsert 模式）。
+pub fn qoder_checkin_results_upsert(s: &Store, rec: &Value) -> Result<(), String> {
+    let date = rec.get("date").and_then(Value::as_str).unwrap_or("").to_string();
+    let uid = rec.get("user_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let tail = match rec.get("time_ms").and_then(Value::as_i64) {
+        Some(ms) => ms.to_string(),
+        None => rec
+            .get("time")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    };
+    if date.is_empty() || uid.is_empty() || tail.is_empty() {
+        return Err("签到结果缺少 date/user_id/time_ms(time)".into());
+    }
+    s.row_upsert("qoder_checkin_results", &format!("{date}|{uid}|{tail}"), rec)?;
+    let cutoff = (chrono::Local::now().date_naive() - chrono::Duration::days(90))
+        .format("%Y-%m-%d")
+        .to_string();
+    let stale: Vec<String> = s
+        .rows_all("qoder_checkin_results")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(pk, _)| pk)
+        .filter(|pk| pk.as_str() < cutoff.as_str())
         .collect();
-    s.rows_replace("qoder_checkin_results", &rows)
+    let mut fail = 0usize;
+    let mut first_err = String::new();
+    for pk in stale {
+        if let Err(e) =
+            s.with_conn(|c| c.execute("DELETE FROM qoder_checkin_results WHERE pk = ?1", [&pk]))
+        {
+            fail += 1;
+            if first_err.is_empty() {
+                first_err = e;
+            }
+        }
+    }
+    if fail > 0 {
+        // store 层无 data_dir 不可 app_log；裁剪失败不影响本次写入，过期行留待下次
+        eprintln!("[qoder] 签到结果滚动裁剪删除失败 {fail} 条（首错: {first_err}），过期行将留待下次裁剪");
+    }
+    Ok(())
 }
 
 // ── Qoder 每日积分快照（qoder_credits_history 表；pk = date，同日覆盖）──────
@@ -1411,8 +1443,20 @@ pub fn qoder_credits_history_upsert(s: &Store, snap: &Value) -> Result<(), Strin
         .map(|(pk, _)| pk)
         .filter(|pk| pk.as_str() < cutoff.as_str())
         .collect();
+    let mut fail = 0usize;
+    let mut first_err = String::new();
     for pk in stale {
-        let _ = s.with_conn(|c| c.execute("DELETE FROM qoder_credits_history WHERE pk = ?1", [&pk]));
+        if let Err(e) =
+            s.with_conn(|c| c.execute("DELETE FROM qoder_credits_history WHERE pk = ?1", [&pk]))
+        {
+            fail += 1;
+            if first_err.is_empty() {
+                first_err = e;
+            }
+        }
+    }
+    if fail > 0 {
+        eprintln!("[qoder] 积分快照滚动裁剪删除失败 {fail} 条（首错: {first_err}），过期行将留待下次裁剪");
     }
     Ok(())
 }

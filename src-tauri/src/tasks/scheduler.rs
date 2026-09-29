@@ -334,6 +334,9 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         }
         // F-80 Qoder 积分快照：与 `--task-run qoder-credits-snapshot` 同款（空池空转）
         "qoder-credits-snapshot" => super::qoder_credits::run_snapshot_task(st),
+        // Qoder Token 定时刷新：与 `--task-run qoder-refresh` 同款（6h 周期，lazy 7h 惰性门；
+        // 有账号刷新失败时返 Err，交由调度器 30 分钟冷却重试）
+        "qoder-refresh" => super::qoder_refresh::run_task(st),
         // 豆包会话每日续期：与 `--task-run doubao-keepalive` 同款
         "doubao-keepalive" => {
             let sink = crate::switcher::CliSink::new(&st.data_dir);

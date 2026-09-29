@@ -28,7 +28,7 @@ fn qoder_reset_catalog() -> &'static [(&'static str, &'static str, &'static str)
     &[
         ("vscdb_auth", "登录令牌库", "删除 User\\globalStorage\\state.vscdb 及 -wal/-shm/.backup 边车（登录态真源，客户端启动重建）"),
         ("storage_json", "storage.json", "删除 User\\globalStorage\\storage.json（设备标识/遥测/认证信息）"),
-        ("machine_identity", "机器身份文件", "删除根级 machineid / Local State / Preferences（设备指纹与窗口状态）"),
+        ("machine_identity", "机器身份文件", "删除根级 machineid / Local State / Preferences（设备指纹与窗口状态；Local State 含 vscdb 解密密钥，清理后残留 vscdb 登录密文不可解，客户端需重新登录）"),
         ("local_storage", "Local Storage", "删除 Local Storage\\leveldb（web 侧登录/偏好 KV）"),
         ("network_cookies", "Network Cookies", "删除 Network 目录（Cookie 等网络会话数据）"),
         ("session_storage", "Session Storage", "删除 Session Storage 目录（会话级 KV）"),
@@ -68,8 +68,10 @@ fn remove_files(dir: &Path, names: &[&str]) -> Result<usize, String> {
     Ok(n)
 }
 
-/// 执行单个清理项，返回人类可读结果描述
-fn run_reset_item(id: &str) -> Result<String, String> {
+/// 执行单个清理项，返回人类可读结果描述。
+/// items 供关联项校验：machine_identity 删除 Local State 后残留 vscdb 登录密文
+/// 不可解，未勾选 vscdb_auth 时追加联动提示（不自动连带删除，保持用户勾选语义）
+fn run_reset_item(id: &str, items: &[String]) -> Result<String, String> {
     let base = ide_data_dir().ok_or("无法解析 %APPDATA%（QoderCN 数据目录不可用）")?;
     let gs = base.join("User").join("globalStorage");
     match id {
@@ -86,7 +88,13 @@ fn run_reset_item(id: &str) -> Result<String, String> {
         },
         "machine_identity" => {
             let n = remove_files(&base, &["machineid", "Local State", "Preferences"])?;
-            Ok(format!("已删除机器身份文件 {n}/3 个"))
+            let mut detail = format!("已删除机器身份文件 {n}/3 个");
+            if n > 0 && !items.iter().any(|i| i == "vscdb_auth") && gs.join("state.vscdb").exists() {
+                detail.push_str(
+                    "（注意：Local State 已删但「登录令牌库」未勾选，残留 state.vscdb 的解密密钥已丢失，客户端需重新登录；建议下次一并勾选）",
+                );
+            }
+            Ok(detail)
         }
         "local_storage" => match force_rmtree(&base.join("Local Storage").join("leveldb"))? {
             true => Ok("已删除 Local Storage\\leveldb".into()),
@@ -179,7 +187,7 @@ pub fn qoder_env_reset(
 
     // 按勾选项执行（单项失败不中断其余项）
     for id in &items {
-        match run_reset_item(id) {
+        match run_reset_item(id, &items) {
             Ok(detail) => results.push(serde_json::json!({ "id": id, "ok": true, "detail": detail })),
             Err(e) => results.push(serde_json::json!({ "id": id, "ok": false, "detail": e })),
         }

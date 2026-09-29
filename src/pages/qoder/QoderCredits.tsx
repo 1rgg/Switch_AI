@@ -33,7 +33,7 @@ export default function QoderCredits() {
       setCredits(c);
       setSnapshots(h.snapshots ?? []);
     } catch (err) {
-      setCredits(null);
+      // 失败保留已有数据（原 setCredits(null) 把可用的历史缓存清掉呈空态）
       pushToast('error', `读取积分失败：${String(err)}`);
     } finally {
       setLoading(false);

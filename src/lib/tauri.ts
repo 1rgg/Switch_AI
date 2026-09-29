@@ -416,9 +416,9 @@ export const api = {
     accountSave: (userId: string, name?: string, note?: string) =>
       invoke('qoder_account_save', { userId, name: name ?? null, note: note ?? null }),
     accountRemove: (userId: string) => invoke('qoder_account_remove', { userId }),
-    /** PAT 手工导入（M1 最可靠凭证通道；qoder.com.cn/account/integrations 自建，pt- 前缀） */
-    accountImportPat: (name?: string, pat?: string) =>
-      invoke<QoderAccountView>('qoder_account_import_pat', { name: name ?? null, pat: pat ?? null }),
+    /** PAT 手工导入（M1 最可靠凭证通道；qoder.com.cn/account/integrations 自建，pt- 前缀）。pat 后端必填 */
+    accountImportPat: (name: string | undefined, pat: string) =>
+      invoke<QoderAccountView>('qoder_account_import_pat', { name: name ?? null, pat }),
     /** OAuth 设备流登录（浏览器授权页 + deviceToken/poll 轮询；事件 qoder-oauth-progress/done） */
     oauthLogin: () => invoke<void>('qoder_oauth_login'),
     /** IDE 存储账号发现/导入（M3；secret://aicoding.auth.userInfo DPAPI+AES-GCM 解密） */

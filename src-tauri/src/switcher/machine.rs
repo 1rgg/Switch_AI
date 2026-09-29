@@ -276,8 +276,8 @@ fn edit_storage_device_ids(
         changed = true;
     }
     if changed {
-        std::fs::write(path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        // 原子写（write_json 同款 temp+rename），防断电损坏 storage.json
+        crate::fs_utils::write_json(path, &v).map_err(|e| e.to_string())?;
     }
     Ok(changed)
 }
@@ -294,8 +294,8 @@ pub fn apply_qoder_fingerprint(data_dir: &Path, machine_id: &str) -> Result<usiz
     let mut ok = 0usize;
     let mut errs: Vec<String> = Vec::new();
 
-    // ① machineid 文件（根级；Rust fs::write 天然无 BOM，同 reset_device_ids 语义）
-    match std::fs::write(data_dir.join("machineid"), machine_id) {
+    // ① machineid 文件（根级；原子写防断电产生半截指纹文件，无 BOM 语义不变）
+    match crate::fs_utils::write_text_atomic(&data_dir.join("machineid"), machine_id) {
         Ok(()) => ok += 1,
         Err(e) => errs.push(format!("machineid 写入失败: {e}")),
     }

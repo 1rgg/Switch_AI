@@ -180,7 +180,8 @@ pub struct QoderIdeScanResult {
 /// 扫描 IDE 存储当前登录账号并导入账号池（幂等：同 token 稳定同 id，重复=更新）。
 /// 凭证入 token store（kind=client，dt-/drt- 原样入 store；effective_creds 请求侧
 /// 仍按 §5.10 注入每账号绑定指纹——IDE 本机指纹不入 store，避免多账号共享单指纹）。
-#[tauri::command]
+/// async：命令含 DPAPI 解密 + SQLite 读取等阻塞 IO，移出主线程避免卡 UI。
+#[tauri::command(async)]
 pub fn qoder_ide_scan(state: State<AppState>) -> Result<QoderIdeScanResult, String> {
     #[cfg(windows)]
     {

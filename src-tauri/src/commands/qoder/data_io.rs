@@ -130,6 +130,10 @@ pub fn qoder_accounts_import(state: State<AppState>, payload: Value) -> Result<V
     if payload.get("kind").and_then(Value::as_str) != Some("aiwork-qoder-pool") {
         return Err("文件格式无法识别（缺少 aiwork-qoder-pool 标记）".into());
     }
+    // 导出方恒写 version:1；导入同样校验（后续格式演进时可按版本分支）
+    if payload.get("version").and_then(Value::as_i64) != Some(1) {
+        return Err("导出文件版本不识别（version 必须为 1）".into());
+    }
     let accounts = payload
         .get("accounts")
         .and_then(Value::as_array)
@@ -138,6 +142,8 @@ pub fn qoder_accounts_import(state: State<AppState>, payload: Value) -> Result<V
     let mut updated = 0usize;
     let mut with_cred = 0usize;
     let mut rejected: Vec<Value> = Vec::new();
+    // 全程持池锁：签到/刷新/积分回写等通道的「load→改→save」并发时整池覆盖会丢导入
+    let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut pool = load_pool(&state);
     for a in accounts {
         match merge_account(&mut pool, a) {
@@ -149,10 +155,21 @@ pub fn qoder_accounts_import(state: State<AppState>, payload: Value) -> Result<V
                 }
                 // 凭证副本回写（导出时含凭证才有效）：至少有作业令牌或 PAT 才落库
                 if let Some(cred) = a.get("credential").filter(|c| c.is_object()) {
-                    let creds = crate::tasks::qoder_common::creds_of(cred);
+                    // §5.10 红线纵深：入库前剥离设备字段（指纹只存账号池 device_profile，
+                    // token store 不落指纹——与 ensure_fresh 客户端通道落库语义一致）
+                    let mut creds = crate::tasks::qoder_common::creds_of(cred);
+                    creds.machine_id.clear();
+                    creds.machine_token.clear();
                     if !creds.access_token.is_empty() || !creds.pat.is_empty() {
-                        crate::tasks::qoder_common::save_token_store(&state, &final_id, &creds)?;
-                        with_cred += 1;
+                        // 单账号凭证落库失败不再 `?` 中断整体（部分导入比整体中断更糟）：
+                        // 聚合进 rejected 继续导入；账号信息照常入池，重新导入可补齐凭证
+                        match crate::tasks::qoder_common::save_token_store(&state, &final_id, &creds) {
+                            Ok(()) => with_cred += 1,
+                            Err(e) => rejected.push(serde_json::json!({
+                                "id": final_id,
+                                "reason": format!("账号已入池，但凭证落库失败：{e}（重新导入可补齐）"),
+                            })),
+                        }
                     }
                 }
             }
