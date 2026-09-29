@@ -383,6 +383,10 @@ fn main() {
             // 敏感数据迁移：库中明文 jwt/refresh_token → Stronghold vault（幂等，失败不阻断启动）
             vault::migrate_on_startup(&state);
 
+            // 凭证收敛（审查 P0-1）：WB/Qoder token store 与豆包账号池的明文凭证
+            // → Stronghold vault，SQLite 行占位化（幂等，失败不阻断启动）
+            vault::migrate_ns_on_startup(&state);
+
             fs_utils::app_log(
                 &state.data_dir,
                 &format!(

@@ -119,8 +119,109 @@ pub fn creds_of(source: &Value) -> QoderCreds {
 /// 串行化表级读改写；仅持锁做本地 IO，不覆盖网络请求路径（无死锁面）。
 static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 敏感字段键名（审查 P0-1 凭证收敛）：rec 中这些字段一律占位（空串）存 DB，
+/// 明文进 vault（Stronghold + DPAPI，与 Trae/WB 同一 vault，ns="qoder"）。
+/// machine_id 是设备标识符（非凭证），保留在 DB 供排障。
+const TOKEN_SENSITIVE_KEYS: [&str; 4] = [
+    "access_token",
+    "refresh_token",
+    "pat",
+    "machine_token",
+];
+
+/// DB 读取 + vault 回填（仅内存）：敏感字段为占位空串时从 vault 回填。
+/// vault 不可用 / 无记录 → 保持空串（上层按 no_credential 处理，fail-secure）。
+pub fn token_store_load_secure(data_dir: &std::path::Path) -> Value {
+    let mut store = crate::store::docs::qoder_token_store_load(&crate::store::db(data_dir));
+    let Some(tokens) = store.get_mut("tokens").and_then(Value::as_object_mut) else {
+        return store;
+    };
+    for (id, rec) in tokens.iter_mut() {
+        let Some(rm) = rec.as_object_mut() else { continue };
+        let Some(sec) = crate::vault::ns_get(data_dir, "qoder", id) else { continue };
+        for k in TOKEN_SENSITIVE_KEYS {
+            let Some(val) = sec.get(k).and_then(Value::as_str) else { continue };
+            if val.is_empty() {
+                continue;
+            }
+            // 仅填空值：DB 明文优先（更新鲜，如迁移残留，待下次写入收敛）
+            if rm.get(k).and_then(Value::as_str).map_or(true, |s| s.is_empty()) {
+                rm.insert(k.to_string(), serde_json::json!(val));
+            }
+        }
+    }
+    store
+}
+
+/// 整库敏感字段收敛：每个 rec 的非空敏感值字段级合并写入 vault，随后整库占位
+///（明文只留 vault）。返回写入 vault 的账号数。
+fn secure_store_for_save(
+    data_dir: &std::path::Path,
+    store: &mut Value,
+) -> Result<usize, String> {
+    let Some(tokens) = store.get_mut("tokens").and_then(Value::as_object_mut) else {
+        return Ok(0);
+    };
+    let ids: Vec<String> = tokens.keys().cloned().collect();
+    let mut wrote = 0usize;
+    for id in &ids {
+        let Some(rec) = tokens.get(id.as_str()) else { continue };
+        let mut entry = crate::vault::ns_get(data_dir, "qoder", id)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut dirty = false;
+        for k in TOKEN_SENSITIVE_KEYS {
+            if let Some(v) = rec.get(k).and_then(Value::as_str) {
+                if !v.is_empty() {
+                    entry[k] = serde_json::json!(v);
+                    dirty = true;
+                }
+            }
+        }
+        if dirty {
+            crate::vault::ns_set(data_dir, "qoder", id, &entry)?;
+            wrote += 1;
+        }
+    }
+    // 整库占位（整表替换写回：所有 rec 的敏感字段一律清空）
+    for rec in tokens.values_mut() {
+        if let Some(rm) = rec.as_object_mut() {
+            for k in TOKEN_SENSITIVE_KEYS {
+                if rm.contains_key(k) {
+                    rm.insert(k.to_string(), serde_json::json!(""));
+                }
+            }
+        }
+    }
+    Ok(wrote)
+}
+
+/// 启动迁移（P0-1）：存量明文凭证收敛进 vault + DB 占位化（幂等，无明文时零开销）
+pub fn migrate_token_store(state: &AppState) -> Result<usize, String> {
+    let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
+    let has_plain = store
+        .get("tokens")
+        .and_then(Value::as_object)
+        .map(|tokens| {
+            tokens.values().any(|rec| {
+                TOKEN_SENSITIVE_KEYS.iter().any(|k| {
+                    rec.get(k)
+                        .and_then(Value::as_str)
+                        .map_or(false, |s| !s.is_empty())
+                })
+            })
+        })
+        .unwrap_or(false);
+    if !has_plain {
+        return Ok(0);
+    }
+    let wrote = secure_store_for_save(&state.data_dir, &mut store)?;
+    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store)?;
+    Ok(wrote)
+}
+
 pub fn load_token_store(state: &AppState) -> Value {
-    crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir))
+    token_store_load_secure(&state.data_dir)
 }
 
 /// 生效凭证（M1 单源：token store；客户端存储通道 R-8 闭合后接入双源比较）。
@@ -150,7 +251,9 @@ fn load_device_profile(state: &AppState, acct_id: &str) -> Option<super::qoder_d
         .and_then(|p| serde_json::from_value(p).ok())
 }
 
-/// 写工具侧凭证副本（version≠1 拒写；非空字段 merge + updated_at，对齐 wb_common 同语义）
+/// 写工具侧凭证副本（version≠1 拒写；非空字段 merge + updated_at，对齐 wb_common 同语义）。
+/// 凭证收敛（P0-1）：敏感字段进 vault、DB 占位；vault 写失败时仍落占位库并返回 Err
+///（对齐 Trae 红线：宁可丢本次凭据更新，也不把 token/pat 明文写进 SQLite）。
 pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Result<(), String> {
     let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut store = load_token_store(state);
@@ -180,17 +283,23 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
         }
         t.insert(id.to_string(), rec);
     }
-    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store)
+    let vault_result = secure_store_for_save(&state.data_dir, &mut store).map(|_| ());
+    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store)?;
+    vault_result.map_err(|e| {
+        format!("Qoder 凭据加密存储失败（已仅保存占位信息，重新登录可恢复）: {e}")
+    })
 }
 
-/// 删除 token store 记录（账号移除时同步清理）
+/// 删除 token store 记录（账号移除时同步清理 vault 凭证）
 pub fn remove_token(state: &AppState, id: &str) -> Result<(), String> {
     let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut store = load_token_store(state);
     if let Some(t) = store.get_mut("tokens").and_then(Value::as_object_mut) {
         t.remove(id);
     }
-    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store)
+    let r = crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store);
+    crate::vault::ns_remove(&state.data_dir, "qoder", id);
+    r
 }
 
 // ── 统一请求头（§5.2：Cosy 头必带）─────────────────────────────────────────

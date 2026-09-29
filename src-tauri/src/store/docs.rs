@@ -938,6 +938,11 @@ pub fn wb_token_store_upsert(s: &Store, id: &str, rec: &Value) -> Result<(), Str
     s.row_upsert("wb_tokens", id, rec)
 }
 
+/// 仅写 version kv 元数据（供凭证收敛后的单行 upsert 路径维持版本闸门）
+pub fn wb_token_store_save_version(s: &Store, version: i64) -> Result<(), String> {
+    s.kv_set_raw("wb_tokens_meta", &version.to_string())
+}
+
 // ── API 用量（api_usage.json → api_usage 表，(bucket, day) 行文档）───────────
 
 fn bucket_name(b: UsageBucket) -> &'static str {

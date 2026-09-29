@@ -159,8 +159,10 @@ fn generate_password() -> Vec<u8> {
 }
 
 /// 读取（或首次生成）DPAPI 保护的主密码
-fn vault_password(state: &AppState) -> Result<Vec<u8>, String> {
-    let key_path = state.conf_path("vault_key.bin");
+fn vault_password_at(data_dir: &Path) -> Result<Vec<u8>, String> {
+    let conf = data_dir.join("conf");
+    let _ = std::fs::create_dir_all(&conf);
+    let key_path = conf.join("vault_key.bin");
     if key_path.exists() {
         let blob = std::fs::read(&key_path).map_err(|e| format!("读取 vault 密钥失败: {e}"))?;
         dpapi::unprotect(&blob)
@@ -173,13 +175,17 @@ fn vault_password(state: &AppState) -> Result<Vec<u8>, String> {
 }
 
 /// 打开（并缓存）vault：首次调用时加载快照或创建新 client
-fn open(state: &AppState) -> Result<std::sync::MutexGuard<'static, Option<Stronghold>>, String> {
+fn open_at(
+    data_dir: &Path,
+) -> Result<std::sync::MutexGuard<'static, Option<Stronghold>>, String> {
     // 锁中毒恢复：另一线程在持锁期间 panic 毒化锁时，直接恢复内部数据继续使用，
     // 而不是让「vault 锁已被毒化」错误在所有后续调用上永久传播
     let mut guard = VAULT.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
-        let path = state.conf_path("vault.stronghold");
-        let password = vault_password(state)?;
+        let conf = data_dir.join("conf");
+        let _ = std::fs::create_dir_all(&conf);
+        let path = conf.join("vault.stronghold");
+        let password = vault_password_at(data_dir)?;
         let sh = Stronghold::new(&path, password).map_err(|e| format!("打开 vault 失败: {e}"))?;
         // 快照数据不会自动进入 clients map，必须显式 load_client（见单元测试 stronghold_快照往返）；
         // 仅当快照中不存在该 client（首次创建）时才新建，防止空 client 覆盖已有快照导致凭据丢失
@@ -190,6 +196,75 @@ fn open(state: &AppState) -> Result<std::sync::MutexGuard<'static, Option<Strong
         *guard = Some(sh);
     }
     Ok(guard)
+}
+
+fn open(state: &AppState) -> Result<std::sync::MutexGuard<'static, Option<Stronghold>>, String> {
+    open_at(&state.data_dir)
+}
+
+// ---------------- 通用命名空间凭证（WB / Qoder / 豆包等非 Trae 家族） ----------------
+//
+// 设计（审查 P0-1 凭证收敛）：Trae 家族凭据长期走 Stronghold + DPAPI，而 wb_tokens /
+// qoder_tokens / doubao_accounts 表为 SQLite 明文行——本节提供按 (namespace, key)
+// 寻址的通用加密存储，供上述家族把 token / sessionid 等敏感字段收敛进同一 vault。
+// key 编码 `ns:<ns>:<key>`，与 Trae 账号裸 uid key 天然隔离（uid 不含冒号前缀）。
+
+fn ns_vault_key(ns: &str, key: &str) -> Vec<u8> {
+    format!("ns:{ns}:{key}").into_bytes()
+}
+
+/// 读取命名空间凭证（vault 不可用 / 记录缺失 / 解析失败均返回 None，fail-secure）
+pub fn ns_get(data_dir: &Path, ns: &str, key: &str) -> Option<serde_json::Value> {
+    if ns.is_empty() || key.is_empty() {
+        return None;
+    }
+    let guard = open_at(data_dir).ok()?;
+    let sh = guard.as_ref()?;
+    let client = sh.get_client(CLIENT_PATH.to_vec()).ok()?;
+    let v = client.store().get(&ns_vault_key(ns, key)).ok()??;
+    serde_json::from_slice(&v).ok()
+}
+
+/// 写入命名空间凭证 + 快照落盘。失败返回 Err（调用方对齐 Trae 红线：
+/// 禁止在 vault 写失败时把明文落库，应只落占位并报错）。
+pub fn ns_set(data_dir: &Path, ns: &str, key: &str, v: &serde_json::Value) -> Result<(), String> {
+    if ns.is_empty() || key.is_empty() {
+        return Err("命名空间凭证 key 为空".into());
+    }
+    let guard = open_at(data_dir)?;
+    let Some(sh) = guard.as_ref() else {
+        return Err("vault 未初始化".into());
+    };
+    let client = sh
+        .get_client(CLIENT_PATH.to_vec())
+        .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+    let value = serde_json::to_vec(v).map_err(|e| format!("凭证序列化失败: {e}"))?;
+    client
+        .store()
+        .insert(ns_vault_key(ns, key), value, None)
+        .map_err(|e| format!("vault 写入失败: {e}"))?;
+    sh.save().map_err(|e| format!("vault 快照落盘失败: {e}"))
+}
+
+/// 删除命名空间凭证（失败仅日志，不阻断上层删除流程——残留加密记录无碍安全）
+pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
+    let result = (|| -> Result<(), String> {
+        let guard = open_at(data_dir)?;
+        let Some(sh) = guard.as_ref() else {
+            return Err("vault 未初始化".into());
+        };
+        let client = sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+        client
+            .store()
+            .delete(&ns_vault_key(ns, key))
+            .map_err(|e| format!("vault 删除失败: {e}"))?;
+        sh.save().map_err(|e| format!("vault 快照落盘失败: {e}"))
+    })();
+    if let Err(e) = result {
+        fs_utils::app_log(data_dir, &format!("vault: 删除 {ns}:{key} 凭证失败（残留加密记录无碍安全）: {e}"));
+    }
 }
 
 // ---------------- 公共 API ----------------
@@ -373,6 +448,95 @@ pub fn migrate_on_startup(state: &AppState) {
             &state.data_dir,
             &format!("启动迁移: 写入 vault 失败（已仅保留占位信息，禁止明文落盘）: {e}"),
         ),
+    }
+}
+
+/// 启动时幂等迁移（审查 P0-1 凭证收敛）：WB / Qoder token store 与豆包账号池中的
+/// 明文凭证（access_token / refresh_token / pat / machine_token / sessionid / sid_guard /
+/// ttwid）→ vault（Stronghold + DPAPI），SQLite 行占位化。失败不阻断启动（下次启动重试；
+/// 运行时读写路径已全部 secure 化，明文只会在 JSON→SQLite 一次性迁移后短暂存在）。
+pub fn migrate_ns_on_startup(state: &AppState) {
+    // ① WB token store（wb_tokens 表）
+    {
+        let store = crate::store::docs::wb_token_store_load(&crate::store::db(&state.data_dir));
+        let plain: Vec<(String, serde_json::Value)> = store
+            .get("tokens")
+            .and_then(|t| t.as_object())
+            .map(|tokens| {
+                tokens
+                    .iter()
+                    .filter(|(_, rec)| {
+                        ["access_token", "accessToken", "refresh_token", "refreshToken"]
+                            .iter()
+                            .any(|k| {
+                                rec.get(k)
+                                    .and_then(|v| v.as_str())
+                                    .map_or(false, |s| !s.is_empty())
+                            })
+                    })
+                    .map(|(id, rec)| (id.clone(), rec.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !plain.is_empty() {
+            let mut ok = 0usize;
+            for (id, rec) in &plain {
+                match crate::tasks::wb_common::token_store_upsert_secure(&state.data_dir, id, rec)
+                {
+                    Ok(()) => ok += 1,
+                    Err(e) => fs_utils::app_log(
+                        &state.data_dir,
+                        &format!(
+                            "启动迁移: WB 账号 {id} 凭证入 vault 失败（已落占位，禁止明文）: {e}"
+                        ),
+                    ),
+                }
+            }
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "启动迁移: 已将 {ok}/{} 个 WB 账号的明文凭证加密写入 vault",
+                    plain.len()
+                ),
+            );
+        }
+    }
+    // ② Qoder token store（qoder_tokens 表）
+    match crate::tasks::qoder_common::migrate_token_store(state) {
+        Ok(n) if n > 0 => fs_utils::app_log(
+            &state.data_dir,
+            &format!("启动迁移: 已将 {n} 个 Qoder 账号的明文凭证加密写入 vault"),
+        ),
+        Ok(_) => {}
+        Err(e) => fs_utils::app_log(
+            &state.data_dir,
+            &format!("启动迁移: Qoder 凭证入 vault 失败（已落占位，禁止明文）: {e}"),
+        ),
+    }
+    // ③ 豆包账号池（doubao_accounts 表）
+    {
+        let pool = crate::store::docs::doubao_pool_load(&crate::store::db(&state.data_dir));
+        let plain = pool
+            .accounts
+            .iter()
+            .filter(|a| {
+                [a.session_id.as_deref(), a.sid_guard.as_deref(), a.ttwid.as_deref()]
+                    .iter()
+                    .any(|v| v.map_or(false, |s| !s.is_empty()))
+            })
+            .count();
+        if plain > 0 {
+            match crate::commands::doubao::save_pool(state, &pool) {
+                Ok(()) => fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("启动迁移: 已将 {plain} 个豆包账号的明文凭证加密写入 vault"),
+                ),
+                Err(e) => fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("启动迁移: 豆包凭证入 vault 失败（已落占位，禁止明文）: {e}"),
+                ),
+            }
+        }
     }
 }
 

@@ -113,6 +113,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower-service",
  "ureq 2.12.1",
+ "url",
  "urlencoding",
  "uuid",
  "webpki-roots 0.26.11",

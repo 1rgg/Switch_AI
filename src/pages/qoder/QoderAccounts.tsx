@@ -42,6 +42,13 @@ import type {
 
 const PAT_URL = 'https://qoder.com.cn/account/integrations';
 
+/** 破坏性操作确认弹框目标（禁 window.confirm，红线）：移除账号 / 恢复快照 / 删除快照 */
+type QoderConfirm =
+  | { kind: 'remove-account'; account: QoderAccountView }
+  | { kind: 'restore'; slot: string; name: string }
+  | { kind: 'delete'; slot: string; name: string }
+  | null;
+
 function TokenBadge({ a }: { a: QoderAccountView }) {
   if (!a.has_credential) return <Badge tone="red">无凭证</Badge>;
   if (a.needs_relogin) return <Badge tone="red">需重新登录</Badge>;
@@ -116,9 +123,14 @@ export default function QoderAccounts() {
   const [showSnapshots, setShowSnapshots] = useState(false);
   const [snapshotSlots, setSnapshotSlots] = useState<ProfileInfo[]>([]);
   const [snapBusy, setSnapBusy] = useState<string | null>(null);
+  // 破坏性操作确认弹框（禁 window.confirm，红线）：移除账号 / 恢复快照 / 删除快照
+  const [confirmTarget, setConfirmTarget] = useState<QoderConfirm>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   // 导出/导入账号池（M4，对照 BuddyAccounts F-46 扩展）
   const [exportOpen, setExportOpen] = useState(false);
   const [exportWithCreds, setExportWithCreds] = useState(false);
+  // 含凭证导出的二次确认弹框（审查 P0-2；禁 window.confirm，红线）
+  const [credExportConfirm, setCredExportConfirm] = useState(false);
   const [exportBusy, setExportBusy] = useState(false);
   const [importingBackup, setImportingBackup] = useState(false);
   const importFileRef = useRef<HTMLInputElement>(null);
@@ -290,15 +302,9 @@ export default function QoderAccounts() {
     }
   };
 
-  const removeAccount = async (a: QoderAccountView) => {
-    if (!window.confirm(`确认移除账号「${a.nickname || a.id}」？将同时清除其凭证记录与设备指纹。`)) return;
-    try {
-      await api.qoder.accountRemove(a.id);
-      pushToast('success', '已移除');
-      void refresh();
-    } catch (err) {
-      pushToast('error', `移除失败：${String(err)}`);
-    }
+  // 移除账号 / 恢复快照 / 删除快照：先弹确认弹框（禁 window.confirm，红线），确认后由 confirmDestructive 执行
+  const removeAccount = (a: QoderAccountView) => {
+    setConfirmTarget({ kind: 'remove-account', account: a });
   };
 
   const backupSnapshot = async (a: QoderAccountView) => {
@@ -313,29 +319,45 @@ export default function QoderAccounts() {
   };
 
   // I19：改为按槽位 id 操作——快照目录名即账号 id，账号已移除的孤儿快照仍可恢复/清理
-  const restoreSnapshot = async (id: string, name: string) => {
-    if (!window.confirm(`确认将账号「${name || id}」的快照恢复到 Qoder IDE？当前 IDE 登录态将被覆盖。`)) return;
-    setSnapBusy(id);
-    try {
-      await api.profiles.restore(id, 'Qoder');
-      pushToast('info', `正在恢复「${name || id}」的快照到 Qoder IDE…`);
-    } catch (err) {
-      setSnapBusy(null);
-      pushToast('error', `恢复失败：${String(err)}`);
-    }
+  const restoreSnapshot = (id: string, name: string) => {
+    setConfirmTarget({ kind: 'restore', slot: id, name });
   };
 
-  const deleteSnapshot = async (id: string, name: string) => {
-    if (!window.confirm(`确认删除账号「${name || id}」的快照？`)) return;
-    setSnapBusy(id);
+  const deleteSnapshot = (id: string, name: string) => {
+    setConfirmTarget({ kind: 'delete', slot: id, name });
+  };
+
+  // 确认弹框执行器：行为对齐原 window.confirm 版本（恢复为后台管线，
+  // snapBusy 由 profile-done 事件收尾；删除同步完成后即复位）
+  const confirmDestructive = async () => {
+    const t = confirmTarget;
+    if (!t) return;
+    setConfirmBusy(true);
     try {
-      await api.profiles.delete(id, 'Qoder');
-      pushToast('success', '快照已删除');
-      await refreshSnapshots();
+      if (t.kind === 'remove-account') {
+        await api.qoder.accountRemove(t.account.id);
+        pushToast('success', '已移除');
+        void refresh();
+      } else if (t.kind === 'restore') {
+        setSnapBusy(t.slot);
+        await api.profiles.restore(t.slot, 'Qoder');
+        pushToast('info', `正在恢复「${t.name || t.slot}」的快照到 Qoder IDE…`);
+      } else {
+        setSnapBusy(t.slot);
+        await api.profiles.delete(t.slot, 'Qoder');
+        pushToast('success', '快照已删除');
+        await refreshSnapshots();
+        setSnapBusy(null);
+      }
+      setConfirmTarget(null);
     } catch (err) {
-      pushToast('error', `删除失败：${String(err)}`);
+      if (t.kind !== 'remove-account') {
+        setSnapBusy(null);
+      }
+      const label = t.kind === 'remove-account' ? '移除' : t.kind === 'restore' ? '恢复' : '删除';
+      pushToast('error', `${label}失败：${String(err)}`);
     } finally {
-      setSnapBusy(null);
+      setConfirmBusy(false);
     }
   };
 
@@ -348,8 +370,18 @@ export default function QoderAccounts() {
     }
   };
 
-  // 导出确认（M4，对照 BuddyAccounts F-46 扩展）：可选是否附带凭证副本
-  const confirmExport = async () => {
+  // 导出确认（M4，对照 BuddyAccounts F-46 扩展）：可选是否附带凭证副本。
+  // 含凭证时先弹独立确认弹框（审查 P0-2；禁 window.confirm，红线）
+  const confirmExport = () => {
+    if (exportWithCreds) {
+      setCredExportConfirm(true);
+      return;
+    }
+    void doExport();
+  };
+
+  const doExport = async () => {
+    setCredExportConfirm(false);
     setExportBusy(true);
     try {
       const data = await api.qoder.accountsExport(exportWithCreds);
@@ -593,7 +625,7 @@ export default function QoderAccounts() {
                         <button
                           className="btn-ghost h-7 w-7 !p-0 text-rose-500"
                           title="移除账号"
-                          onClick={() => void removeAccount(a)}
+                          onClick={() => removeAccount(a)}
                         >
                           <Trash2 size={13} />
                         </button>
@@ -738,7 +770,7 @@ export default function QoderAccounts() {
                               title="恢复（将该槽位快照恢复到 Qoder IDE，覆盖当前登录态）"
                               className="btn-ghost !p-2 text-sky-500"
                               disabled={snapBusy != null}
-                              onClick={() => void restoreSnapshot(p.slot, label)}
+                              onClick={() => restoreSnapshot(p.slot, label)}
                             >
                               {snapBusy === p.slot ? <Loader2 size={14} className="animate-spin" /> : <ArchiveRestore size={14} />}
                             </button>
@@ -746,7 +778,7 @@ export default function QoderAccounts() {
                               title="删除该槽位快照"
                               className="btn-ghost !p-2 text-rose-500"
                               disabled={snapBusy != null}
-                              onClick={() => void deleteSnapshot(p.slot, label)}
+                              onClick={() => deleteSnapshot(p.slot, label)}
                             >
                               <Trash2 size={14} />
                             </button>
@@ -758,6 +790,51 @@ export default function QoderAccounts() {
                 </tbody>
               </table>
             </div>
+          )}
+        </div>
+      </Modal>
+
+      {/* 破坏性操作确认弹框（禁 window.confirm，红线）：移除账号 / 恢复快照 / 删除快照 */}
+      <Modal
+        open={confirmTarget != null}
+        onClose={() => {
+          if (!confirmBusy) setConfirmTarget(null);
+        }}
+        title={confirmTarget?.kind === 'remove-account' ? '移除账号' : confirmTarget?.kind === 'restore' ? '恢复快照' : '删除快照'}
+        footer={
+          <>
+            <button className="btn-outline" disabled={confirmBusy} onClick={() => setConfirmTarget(null)}>
+              取消
+            </button>
+            <button
+              className={`btn-primary ${confirmTarget?.kind !== 'restore' ? '!bg-rose-600 hover:!bg-rose-500' : ''}`}
+              disabled={confirmBusy}
+              onClick={() => void confirmDestructive()}
+            >
+              {confirmBusy ? <Loader2 size={14} className="animate-spin" /> : null}
+              确认{confirmTarget?.kind === 'remove-account' ? '移除' : confirmTarget?.kind === 'restore' ? '恢复' : '删除'}
+            </button>
+          </>
+        }
+      >
+        <div className="text-sm">
+          {confirmTarget?.kind === 'remove-account' && (
+            <>
+              确认移除账号「{confirmTarget.account.nickname || confirmTarget.account.id}」？
+              <div className="mt-1 text-xs text-rose-500">将同时清除其凭证记录与设备指纹。</div>
+            </>
+          )}
+          {confirmTarget?.kind === 'restore' && (
+            <>
+              确认将账号「{confirmTarget.name || confirmTarget.slot}」的快照恢复到 Qoder IDE？
+              <div className="mt-1 text-xs text-amber-600 dark:text-amber-400">当前 IDE 登录态将被覆盖。</div>
+            </>
+          )}
+          {confirmTarget?.kind === 'delete' && (
+            <>
+              确认删除账号「{confirmTarget.name || confirmTarget.slot}」的快照？
+              <div className="mt-1 text-xs text-slate-400">删除后需重新备份登录态才能再次恢复该快照。</div>
+            </>
           )}
         </div>
       </Modal>
@@ -892,7 +969,7 @@ export default function QoderAccounts() {
             <button className="btn-ghost" disabled={exportBusy} onClick={() => setExportOpen(false)}>
               取消
             </button>
-            <button className="btn-primary" disabled={exportBusy} onClick={() => void confirmExport()}>
+            <button className="btn-primary" disabled={exportBusy} onClick={() => confirmExport()}>
               {exportBusy ? '导出中…' : '确认导出'}
             </button>
           </>
@@ -918,6 +995,39 @@ export default function QoderAccounts() {
           <p className="text-xs text-slate-400">
             导出格式 kind=aiwork-qoder-pool；导入端按 uid 幂等合并——已有账号仅补全空缺字段，设备指纹仅在本地为空时补入，绝不覆盖。
           </p>
+        </div>
+      </Modal>
+
+      {/* 含凭证导出二次确认弹框（审查 P0-2；禁 window.confirm，红线） */}
+      <Modal
+        open={credExportConfirm}
+        onClose={() => {
+          if (!exportBusy) setCredExportConfirm(false);
+        }}
+        title="确认导出明文凭证"
+        footer={
+          <>
+            <button className="btn-outline" disabled={exportBusy} onClick={() => setCredExportConfirm(false)}>
+              取消
+            </button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              disabled={exportBusy}
+              onClick={() => void doExport()}
+            >
+              {exportBusy ? '导出中…' : '我已知晓风险，继续导出'}
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-3 text-sm">
+          <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">
+            <ShieldAlert size={14} className="mt-0.5 shrink-0" />
+            <span>
+              导出文件将包含账号的明文凭证（accessToken / refreshToken / PAT），文件等同密码。
+              仅应在可信环境用于账号迁移，导出后请妥善保管，切勿通过不可信渠道传输。
+            </span>
+          </div>
         </div>
       </Modal>
 

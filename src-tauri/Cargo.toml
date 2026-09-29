@@ -25,6 +25,9 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 ureq = { version = "2", features = ["json"] }
 urlencoding = "2"
+# SSRF host 精确判定（审查 P2）：与 ureq 请求层同源的 WHATWG URL 解析，
+# 识别 0x7f000001 / 0177.0.0.1 / 127.1 等 IPv4 变体（ureq 传递依赖，仅显式声明）
+url = "2"
 axum = "0.7"
 tokio = { version = "1", features = ["sync", "io-util", "net", "rt", "rt-multi-thread", "time", "macros"] }
 tokio-stream = "0.1"

@@ -188,52 +188,72 @@ fn pem_cert_der(pem: &str) -> Result<Vec<u8>, String> {
 
 /// 生成随机 hex 字符串。
 /// 熵源：OS CSPRNG（Windows BCryptGenRandom 系统首选 RNG）。旧 LCG 以时间戳作种子，
-/// 输出可预测，不适合 OAuth state / machine_id 等安全场景（审查 P2）；BCrypt 失败时
-/// 保留 LCG 兜底（仅影响随机性，不中断流程）。
+/// 输出可预测，不适合 OAuth state / PKCE verifier / nonce 等安全场景（审查 P1-6）——
+/// 已移除：CSPRNG 失败直接 panic（系统熵池不可用时继续只会产生可预测输出，
+/// 等同把授权码暴露给可猜 state 的劫持者），不再静默降级。
+#[cfg(windows)]
 pub(crate) fn random_hex(len: usize) -> String {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Security::Cryptography::{
-            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        };
-        let mut bytes = vec![0u8; len.div_ceil(2)];
-        let halg: windows_sys::Win32::Security::Cryptography::BCRYPT_ALG_HANDLE =
-            unsafe { std::mem::zeroed() };
-        // STATUS_SUCCESS == 0
-        let status = unsafe {
-            BCryptGenRandom(halg, bytes.as_mut_ptr(), bytes.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
-        };
-        if status == 0 {
-            let mut out = String::with_capacity(len);
-            for b in bytes {
-                if out.len() >= len {
-                    break;
-                }
-                out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
-                if out.len() >= len {
-                    break;
-                }
-                out.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
-            }
-            return out;
-        }
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+    let mut bytes = vec![0u8; len.div_ceil(2)];
+    let halg: windows_sys::Win32::Security::Cryptography::BCRYPT_ALG_HANDLE =
+        unsafe { std::mem::zeroed() };
+    // STATUS_SUCCESS == 0
+    let status = unsafe {
+        BCryptGenRandom(halg, bytes.as_mut_ptr(), bytes.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+    };
+    if status != 0 {
+        panic!(
+            "BCryptGenRandom 失败（status={status:#x}）：系统熵池不可用，拒绝降级为可预测随机"
+        );
     }
-    // 兜底：旧 LCG（仅非 Windows 或 BCrypt 调用失败时）
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let mut seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(42);
     let mut out = String::with_capacity(len);
-    for _ in 0..len {
-        // 简单 LCG
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let nibble = ((seed >> 32) & 0xF) as u8;
-        out.push(if nibble < 10 {
-            (b'0' + nibble) as char
-        } else {
-            (b'a' + nibble - 10) as char
-        });
+    for b in bytes {
+        if out.len() >= len {
+            break;
+        }
+        out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+        if out.len() >= len {
+            break;
+        }
+        out.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// 非 Windows（仅本地开发编译）：哈希熵链代替已移除的 LCG（审查 P1-6）。
+/// sha256（时间纳秒 + pid + 计数器）迭代扩展；官方构建仅产 Windows（build-windows.yml）。
+#[cfg(not(windows))]
+pub(crate) fn random_hex(len: usize) -> String {
+    use sha2::{Digest, Sha256};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut h = Sha256::new();
+    h.update(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos().to_le_bytes())
+            .unwrap_or([0u8; 16]),
+    );
+    h.update(std::process::id().to_le_bytes());
+    h.update(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+    let mut digest = h.finalize();
+    let mut out = String::with_capacity(len);
+    while out.len() < len {
+        for b in digest.iter() {
+            if out.len() >= len {
+                break;
+            }
+            out.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+            if out.len() >= len {
+                break;
+            }
+            out.push(char::from_digit((b & 0xF) as u32, 16).unwrap_or('0'));
+        }
+        let mut h2 = Sha256::new();
+        h2.update(digest);
+        h2.update(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed).to_le_bytes());
+        digest = h2.finalize();
     }
     out
 }

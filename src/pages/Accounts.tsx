@@ -16,6 +16,7 @@ import {
   RotateCcw,
   Save,
   ScanSearch,
+  ShieldAlert,
   Snowflake,
   SquareTerminal,
   Tags,
@@ -25,7 +26,7 @@ import {
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import SwitchProgressPanel from '../components/SwitchProgressPanel';
-import { Badge, EmptyState } from '../components/ui';
+import { Badge, EmptyState, Modal } from '../components/ui';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
@@ -110,6 +111,8 @@ export default function Accounts() {
   // 删除确认（禁 window.confirm，红线）：删除账号 / 删除快照
   const [deleteTarget, setDeleteTarget] = useState<AccountView | null>(null);
   const [deleteSlot, setDeleteSlot] = useState<string | null>(null);
+  // 导出凭证确认（审查 P0-2；禁 window.confirm，红线）：Trae 导出恒含明文 JWT / refreshToken
+  const [exportConfirming, setExportConfirming] = useState(false);
   // 切换/保存 90s 看门狗（对齐 BuddyAccounts）：switch-done / save-login-done 事件异常缺失
   // （桥挂死/事件丢失/后台线程 panic）时 switchingTo/savingLogin 会永久非空——全部切换/保存/
   // 续期/重置按钮被禁用、appMenu 不再弹出，用户感知为「点击切换账号无反应」。90s 后解除
@@ -217,11 +220,17 @@ export default function Accounts() {
     }
   };
 
-  const exportAccounts = async () => {
+  const exportAccounts = () => {
     if (accounts.length === 0) {
       toast('warn', '没有账号可导出');
       return;
     }
+    // 凭证导出强确认（审查 P0-2；禁 window.confirm，红线）：导出文件恒含明文 JWT / refreshToken
+    setExportConfirming(true);
+  };
+
+  const doExportAccounts = async () => {
+    setExportConfirming(false);
     try {
       const payload = await api.accounts.exportRaw();
       const content = JSON.stringify(payload, null, 2);
@@ -332,7 +341,7 @@ export default function Accounts() {
             <button onClick={() => setAddOpen(true)} className="btn-outline" title="手动粘贴 JWT 添加账号">
               <Plus size={15} /> 添加账号
             </button>
-            <button onClick={() => void exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
+            <button onClick={() => exportAccounts()} className="btn-outline" title="导出所有账号为 JSON 文件">
               <Download size={15} /> 导出账号
             </button>
             <button
@@ -691,6 +700,31 @@ export default function Accounts() {
         onClose={() => setDeleteSlot(null)}
         onConfirm={() => void confirmDeleteSlot()}
       />
+      {/* 导出凭证确认弹框（审查 P0-2；禁 window.confirm，红线） */}
+      <Modal
+        open={exportConfirming}
+        onClose={() => setExportConfirming(false)}
+        title="确认导出明文凭证"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setExportConfirming(false)}>取消</button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              onClick={() => void doExportAccounts()}
+            >
+              我已知晓风险，继续导出
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-3 text-sm">
+          <div>即将导出 {accounts.length} 个账号，文件包含明文 JWT / refreshToken 凭证（等同密码）。</div>
+          <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">
+            <ShieldAlert size={14} className="mt-0.5 shrink-0" />
+            <span>仅应在可信环境用于账号迁移，导出后请妥善保管，切勿通过不可信渠道传输。</span>
+          </div>
+        </div>
+      </Modal>
       <OAuthLoginModal
         open={oauthOpen}
         onClose={() => setOAuthOpen(false)}

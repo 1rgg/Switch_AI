@@ -292,9 +292,8 @@ pub fn workbuddy_settings_set(state: State<AppState>, patch: WorkBuddySettings) 
 // ── 工具侧凭证副本写入（F-10 双源化）───────────────────────────────────────
 
 pub(super) fn upsert_token_store(state: &AppState, id: &str, creds: &serde_json::Value) -> Result<(), String> {
-    // SQLite 化（P3）：wb_tokens 表单行 UPSERT（merge 语义保留）
-    let store = crate::store::db(&state.data_dir);
-    let existing = crate::store::docs::wb_token_store_load(&store);
+    // 凭证收敛（P0-1）：读走 secure 回填，写走 secure 占位（敏感字段进 vault，DB 不落明文）
+    let existing = crate::tasks::wb_common::token_store_load_secure(&state.data_dir);
     let mut rec = existing
         .get("tokens")
         .and_then(|t| t.get(id))
@@ -308,7 +307,7 @@ pub(super) fn upsert_token_store(state: &AppState, id: &str, creds: &serde_json:
         }
         rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
     }
-    crate::store::docs::wb_token_store_upsert(&store, id, &rec)
+    crate::tasks::wb_common::token_store_upsert_secure(&state.data_dir, id, &rec)
 }
 
 // ── M3 凭证续期互斥（F-09，Rust 侧手动触发；schtasks 每周兜底走 python --renew-only）──
