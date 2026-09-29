@@ -31,8 +31,6 @@ pub struct QoderCheckinOpts {
     #[allow(dead_code)]
     pub skip_checked: bool,
     pub lazy_hours: i64,
-    /// 多账号显式开启项（合规 §七-1：单账号默认；未开启时多账号池仅处理首个）
-    pub multi_account_enabled: bool,
 }
 
 impl QoderCheckinOpts {
@@ -42,7 +40,6 @@ impl QoderCheckinOpts {
             uids: vec![],
             skip_checked: true,
             lazy_hours: 24,
-            multi_account_enabled: false,
         }
     }
 }
@@ -492,16 +489,6 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
     if !opts.uids.is_empty() {
         accounts.retain(|a| opts.uids.iter().any(|u| s_of(a.get("id")) == *u));
     }
-    // 合规门控（§七-1）：多账号为显式开启项——未开启时仅处理首个账号，其余提示跳过
-    if accounts.len() > 1 && !opts.multi_account_enabled {
-        let skipped = accounts.len() - 1;
-        accounts.truncate(1);
-        emit(&json!({
-            "type": "account", "user_id": "", "name": "合规提示", "status": "skip",
-            "index": 0,
-            "message": format!("多账号签到未显式开启：本轮仅处理首个账号，其余 {skipped} 个已跳过（平台条款风险，见环境配置页说明）"),
-        }));
-    }
     emit(&json!({"type": "start", "total": accounts.len()}));
 
     let mut events: Vec<Value> = Vec::new();
@@ -532,7 +519,6 @@ mod tests {
         let o = QoderCheckinOpts::daily();
         assert!(o.skip_checked);
         assert_eq!(o.lazy_hours, 24);
-        assert!(!o.multi_account_enabled, "多账号默认关闭（合规门控）");
     }
 
     /// R-9 抓包样本：claim 成功响应顶层含 grantId/status/replayed + 完整 benefit

@@ -103,6 +103,12 @@ pub fn qoder_account_move(
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
+    // 目标分组校验：group_id 传了非空值但分组已删除/不存在时直接拒绝，防幽灵分组
+    if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
+        if !load_defs(&state).iter().any(|g| g.id == gid) {
+            return Err(format!("目标分组不存在: {gid}"));
+        }
+    }
     with_pool_mut(&state, |accounts| {
         let acct = accounts
             .iter_mut()

@@ -149,10 +149,13 @@ pub async fn qoder_account_import_pat(
         return Err("凭证格式不识别：应为 qoder.com.cn/account/integrations 创建的 PAT（pt- 前缀）".into());
     }
     let id = account_id_of(&pat);
-    let (uid, nickname, plan) = {
+    // spawn_blocking：fetch_userinfo/fetch_plan 为阻塞 ureq 网络请求（15s 超时），
+    // async 命令体内直接执行会占用 async worker 线程
+    let pat2 = pat.clone();
+    let (uid, nickname, plan) = tauri::async_runtime::spawn_blocking(move || {
         let agent = crate::tasks::http_agent(15);
         let creds = QoderCreds {
-            access_token: pat.clone(),
+            access_token: pat2,
             kind: "pat".into(),
             ..Default::default()
         };
@@ -160,7 +163,9 @@ pub async fn qoder_account_import_pat(
         // 套餐回填（R-7 抓包固化：GET /api/v2/user/plan → plan_tier_name，如 "Pro Trial"；失败容错）
         let (tier, _user_type, _end) = qoder_common::fetch_plan(&agent, &creds);
         (uid.unwrap_or_default(), nickname.unwrap_or_default(), tier.unwrap_or_default())
-    };
+    })
+    .await
+    .map_err(|e| format!("PAT 账号探测任务失败: {e}"))?;
     // 幂等入池：同 id 保留旧 uid/nickname（userinfo 失败时不覆盖既有信息）；持锁读-改-写（I09）
     let display = name
         .filter(|s| !s.trim().is_empty())

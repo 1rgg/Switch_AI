@@ -399,10 +399,7 @@ export default function CreditsTab({
                     <Tooltip
                       cursor={{ stroke: isDark ? '#52525b' : '#cbd5e1', strokeWidth: 1, strokeDasharray: '3 3' }}
                       contentStyle={tooltipStyle(isDark)}
-                      formatter={(v: number, name: string) => [
-                        isGateway ? String(v) : fmtCredits(v),
-                        name === 'consumed' ? consumeLabel : '获得积分',
-                      ]}
+                      formatter={(v: number, name: string) => [isGateway ? String(v) : fmtCredits(v), name]}
                     />
                     <Bar dataKey="consumed" name={consumeLabel} fill="#f59e0b" maxBarSize={22} radius={[3, 3, 0, 0]} />
                     {!isGateway && (

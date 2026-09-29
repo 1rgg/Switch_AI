@@ -2,6 +2,7 @@
 //! 浏览器打开授权页（qoder.cn/device/selectAccounts）→ 轮询 deviceToken/poll
 //! → dt- 令牌入池。事件契约对齐 wb-oauth（qoder-oauth-progress / qoder-oauth-done）。
 
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
@@ -19,6 +20,8 @@ use super::common::{account_id_of, with_pool_mut, QoderAccount};
 
 /// OAuth 防重入（与 wb oauth 同款 AtomicBool；RAII guard 保证异常路径复位）
 static OAUTH_RUNNING: AtomicBool = AtomicBool::new(false);
+/// 取消标志（用户在弹框点「取消授权」）：轮询线程检测到即发失败终态并退出
+static OAUTH_CANCEL: AtomicBool = AtomicBool::new(false);
 
 struct OAuthGuard;
 impl Drop for OAuthGuard {
@@ -28,6 +31,7 @@ impl Drop for OAuthGuard {
 }
 
 /// 系统浏览器打开 URL（复用 wb oauth 同款实现：cmd /c start + raw_arg 防 & 截断）
+#[cfg(windows)]
 fn open_in_browser(url: &str) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(['"', '\'', ' ']) {
         return Err(format!("拒绝打开非法 URL：{url}"));
@@ -39,6 +43,13 @@ fn open_in_browser(url: &str) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("打开浏览器失败: {e}"))
+}
+
+/// 非 Windows 占位（cmd/raw_arg/creation_flags 为 Windows 专属，逐函数门控
+/// 对齐 common.rs is_running 惯例）
+#[cfg(not(windows))]
+fn open_in_browser(_url: &str) -> Result<(), String> {
+    Err("打开浏览器仅支持 Windows".into())
 }
 
 fn emit_progress(app: &AppHandle, stage: &str, message: &str, auth_url: Option<&str>) {
@@ -67,6 +78,8 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>) -> Result<(), S
     if OAUTH_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("已有 OAuth 登录在执行中，请等待完成".into());
     }
+    // 复位取消标志（上一轮会话的取消请求不应影响本次登录）
+    OAUTH_CANCEL.store(false, Ordering::SeqCst);
     let flow = DeviceFlow::new();
     let auth_url = flow.auth_url.clone();
     emit_progress(&app, "init", "正在打开 Qoder 授权页…", Some(&auth_url));
@@ -97,6 +110,11 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>) -> Result<(), S
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(qoder_oauth::POLL_INTERVAL_MS));
+                if OAUTH_CANCEL.load(Ordering::SeqCst) {
+                    fs_utils::app_log(&state2.data_dir, "qoder OAuth 登录已由用户取消");
+                    emit_done(&app2, &state2.data_dir, false, "", "", "已取消授权");
+                    return;
+                }
                 let (status, body) = qoder_oauth::poll_once(&agent, &flow);
                 match status {
                     // pending：尚未授权（R-10 实测 404 NotFound）
@@ -155,6 +173,13 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>) -> Result<(), S
         OAUTH_RUNNING.store(false, Ordering::SeqCst);
         return Err("OAuth 后台线程启动失败，请重试".into());
     }
+    Ok(())
+}
+
+/// 取消进行中的 OAuth 轮询（弹框「取消授权」）：置标志后轮询线程自行收尾。
+#[tauri::command(async)]
+pub fn qoder_oauth_cancel() -> Result<(), String> {
+    OAUTH_CANCEL.store(true, Ordering::SeqCst);
     Ok(())
 }
 

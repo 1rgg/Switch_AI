@@ -57,9 +57,6 @@ pub struct QoderSettings {
     /// 启动自动补签 + 应用内调度器 qoder-checkin 启用判定（默认开，§5.7）
     #[serde(default = "default_true")]
     pub auto_checkin: bool,
-    /// 多账号签到显式开启项（合规 §七-1：默认关；固定条款风险提示）
-    #[serde(default)]
-    pub multi_account_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -259,6 +256,27 @@ fn launcher_running() -> bool {
     false
 }
 
+/// QoderWork 真实产品版本：Launcher exe 本体未打版本号（ProductVersion 恒 0.0.0），
+/// 实际版本由 Launcher 写入同目录 state.ini 的 [launcher] targetVersion（如 0.4.3，
+/// 对应 appExecutable=.qoder-versions\0.4.3\Qoder CN.exe）；读不到时回退 install.ini
+/// 的 targetVersion，最后由调用方回退 exe 版本探测。
+fn launcher_version(launcher_exe: &std::path::Path) -> Option<String> {
+    let dir = launcher_exe.parent()?;
+    for name in ["state.ini", "install.ini"] {
+        if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
+            for line in text.lines() {
+                if let Some(v) = line.strip_prefix("targetVersion=") {
+                    let v = v.trim();
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 环境检测（环境配置页/概述页/顶栏数据源）：IDE / 数据目录 / CLI / QoderWork。
 /// async 命令：内部 tasklist 子进程 + 磁盘探测会阻塞数百毫秒，同步命令会卡死主线程
 #[tauri::command(async)]
@@ -272,10 +290,19 @@ pub fn qoder_env_check(state: State<AppState>) -> serde_json::Value {
     let data_dir = ide_data_dir();
     let data_dir_str = data_dir.as_ref().map(|p| p.to_string_lossy().to_string());
     let home = std::env::var("USERPROFILE").unwrap_or_default();
+    // 版本号（对齐 Trae/Buddy 顶栏 hover：exe ProductVersion，PowerShell 子进程读取）
+    let ide_version = exe
+        .as_ref()
+        .and_then(|p| crate::commands::env::version_of(&p.to_string_lossy()));
+    let work_version = work_exe.as_ref().and_then(|p| {
+        // Launcher exe ProductVersion 恒 0.0.0：真实版本优先读同目录 state.ini targetVersion
+        launcher_version(p).or_else(|| crate::commands::env::version_of(&p.to_string_lossy()))
+    });
     serde_json::json!({
         "ide_installed": exe.is_some(),
         "ide_running": is_running(),
         "ide_exe": exe.map(|p| p.to_string_lossy().to_string()),
+        "ide_version": ide_version,
         "ide_data_dir": data_dir_str,
         "ide_data_dir_exists": data_dir.map(|p| p.exists()).unwrap_or(false),
         "cli_dir": home,
@@ -285,6 +312,7 @@ pub fn qoder_env_check(state: State<AppState>) -> serde_json::Value {
         "qoderwork_installed": work_exe.is_some(),
         "qoderwork_running": launcher_running(),
         "qoderwork_exe": work_exe.map(|p| p.to_string_lossy().to_string()),
+        "qoderwork_version": work_version,
     })
 }
 

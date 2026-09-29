@@ -126,6 +126,7 @@ export default function QoderAccounts() {
   const [fpViewing, setFpViewing] = useState<QoderAccountView | null>(null);
   // OAuth 设备流登录（进度弹窗；事件契约对齐 BuddyAccounts wb-oauth 模式）
   const [oauthRunning, setOauthRunning] = useState(false);
+  const [oauthCanceling, setOauthCanceling] = useState(false);
   const [oauthMsg, setOauthMsg] = useState('');
   const [oauthUrl, setOauthUrl] = useState<string | null>(null);
   const [showOauth, setShowOauth] = useState(false);
@@ -157,6 +158,8 @@ export default function QoderAccounts() {
   const [resetBusy, setResetBusy] = useState(false);
   const [resetResults, setResetResults] = useState<QoderResetResult[] | null>(null);
   const unlisten = useRef<(() => void)[]>([]);
+  // OAuth 完成延迟关弹框的定时器（卸载时清理，防卸载后 setState）
+  const oauthTimers = useRef<number[]>([]);
 
   // 切换 90s 看门狗（对齐 Accounts/Buddy/Doubao 页，issue #44 合并审查补齐）：
   // switch-done 事件异常缺失（桥挂死/事件丢失/后台线程 panic）时 switchingTo 永久
@@ -232,11 +235,12 @@ export default function QoderAccounts() {
     void listen<QoderOauthDone>('qoder-oauth-done', (ev) => {
       const d = ev.payload;
       setOauthRunning(false);
+      setOauthCanceling(false);
       setOauthMsg(d.message);
       if (d.ok) {
         pushToast('success', d.message);
         void refresh();
-        setTimeout(() => setShowOauth(false), 1200);
+        oauthTimers.current.push(window.setTimeout(() => setShowOauth(false), 1200));
       } else {
         pushToast('error', d.message);
       }
@@ -256,12 +260,15 @@ export default function QoderAccounts() {
       disposed = true;
       unlisten.current.forEach((u) => u());
       unlisten.current = [];
+      oauthTimers.current.forEach((t) => clearTimeout(t));
+      oauthTimers.current = [];
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refresh, refreshSnapshots]);
 
   const startOauth = async () => {
     setOauthRunning(true);
+    setOauthCanceling(false);
     setOauthMsg('正在打开 Qoder 授权页…');
     setOauthUrl(null);
     setShowOauth(true);
@@ -269,9 +276,28 @@ export default function QoderAccounts() {
       await api.qoder.oauthLogin();
     } catch (err) {
       setOauthRunning(false);
+      setOauthCanceling(false);
       setShowOauth(false);
       pushToast('error', `发起 OAuth 登录失败：${String(err)}`);
     }
+  };
+
+  // 取消授权（弹框「取消授权」/运行中关闭弹框时自动触发）：后端轮询线程自行发失败终态
+  const cancelOauth = async () => {
+    setOauthCanceling(true);
+    try {
+      await api.qoder.oauthCancel();
+    } catch {
+      // 后端取消失败不阻塞 UI：终态仍由 done 事件或 180s 超时兜底
+    } finally {
+      setOauthCanceling(false);
+    }
+  };
+
+  // 关闭 OAuth 弹框：运行中先发取消（避免后台轮询空转至超时），其余直接关
+  const closeOauthModal = () => {
+    if (oauthRunning) void cancelOauth();
+    setShowOauth(false);
   };
 
   const scanIde = async () => {
@@ -390,6 +416,10 @@ export default function QoderAccounts() {
   };
 
   const copyText = async (text: string, label: string) => {
+    if (!text) {
+      pushToast('warn', `${label}为空，暂无可复制内容`);
+      return;
+    }
     try {
       await navigator.clipboard.writeText(text);
       pushToast('success', `${label} 已复制`);
@@ -419,7 +449,8 @@ export default function QoderAccounts() {
       a.href = url;
       a.download = `qoder_accounts_${new Date().toISOString().slice(0, 10)}.json`;
       a.click();
-      URL.revokeObjectURL(url);
+      // 延迟回收 blob URL：click() 后立即 revoke 可能中断部分浏览器对 blob 的异步读取
+      setTimeout(() => URL.revokeObjectURL(url), 1_000);
       pushToast(
         'success',
         exportWithCreds ? '账号池已导出（含凭证，文件等同密码请妥善保管）' : '账号元数据已导出（凭证不导出）',
@@ -534,7 +565,7 @@ export default function QoderAccounts() {
             >
               {oauthRunning ? <Loader2 size={15} className="animate-spin" /> : <KeyRound size={15} />} OAuth登录
             </button>
-            <button className="btn-outline" onClick={() => setShowImport(true)}>
+            <button className="btn-outline" disabled={importing} onClick={() => setShowImport(true)}>
               <UserPlus size={15} /> 导入 PAT
             </button>
             <button
@@ -596,13 +627,13 @@ export default function QoderAccounts() {
         <div className="mb-3 mt-5 flex flex-wrap items-center gap-2 text-sm">
           <button
             onClick={() => setFilter('all')}
-            className={`chip border ${filter === 'all' ? 'border-brand-500 text-brand-600' : 'border-slate-300 text-slate-500'}`}
+            className={`chip border ${filter === 'all' ? 'border-brand-500 text-brand-600 dark:text-brand-400' : 'border-slate-300 text-slate-500 dark:border-zinc-700 dark:text-zinc-400'}`}
           >
             全部 ({accounts.length})
           </button>
           <button
             onClick={() => setFilter('ungrouped')}
-            className={`chip border ${filter === 'ungrouped' ? 'border-brand-500 text-brand-600' : 'border-slate-300 text-slate-500'}`}
+            className={`chip border ${filter === 'ungrouped' ? 'border-brand-500 text-brand-600 dark:text-brand-400' : 'border-slate-300 text-slate-500 dark:border-zinc-700 dark:text-zinc-400'}`}
           >
             未分组 ({accounts.filter((a) => !a.group_id).length})
           </button>
@@ -610,7 +641,7 @@ export default function QoderAccounts() {
             <button
               key={g.id}
               onClick={() => setFilter(g.id)}
-              className={`chip border ${filter === g.id ? 'border-brand-500 text-brand-600' : 'border-slate-300 text-slate-500'}`}
+              className={`chip border ${filter === g.id ? 'border-brand-500 text-brand-600 dark:text-brand-400' : 'border-slate-300 text-slate-500 dark:border-zinc-700 dark:text-zinc-400'}`}
               style={{ borderColor: filter === g.id ? g.color : undefined }}
             >
               <span className="inline-block h-2 w-2 rounded-full" style={{ background: g.color }} />
@@ -623,11 +654,17 @@ export default function QoderAccounts() {
       {/* 账号池列表（对齐 BuddyAccounts：无账号 EmptyState，有账号全宽卡片表格） */}
       {accounts.length === 0 ? (
         <div className="mt-5">
-          <EmptyState
-            icon={<Users size={26} />}
-            title="暂无 Qoder 账号"
-            hint="三种方式入池：导入 PAT（qoder.com.cn → Integrations 创建）/ OAuth 设备流登录 / 扫描 IDE 登录态（本机已登录 Qoder CN IDE 时一键导入）。"
-          />
+          {loading ? (
+            <div className="flex items-center justify-center gap-2 py-12 text-sm text-slate-400">
+              <Loader2 size={16} className="animate-spin" /> 加载中…
+            </div>
+          ) : (
+            <EmptyState
+              icon={<Users size={26} />}
+              title="暂无 Qoder 账号"
+              hint="三种方式入池：导入 PAT（qoder.com.cn → Integrations 创建）/ OAuth 设备流登录 / 扫描 IDE 登录态（本机已登录 Qoder CN IDE 时一键导入）。"
+            />
+          )}
         </div>
       ) : (
       <div className="mt-5 card overflow-x-auto">
@@ -764,17 +801,17 @@ export default function QoderAccounts() {
           凭证由调度器每 6 小时兜底刷新（M4）；CLI 登录态（~/.qoder-cn）仅只读展示，无独立凭证通道（R-3）。
         </p>
 
-      {/* OAuth 进度弹框 */}
-      <Modal
-        open={showOauth}
-        onClose={() => {
-          if (!oauthRunning) setShowOauth(false);
-        }}
-        title="Qoder OAuth 登录"
+      {/* OAuth 进度弹框（随时可关；运行中关闭自动取消后台轮询） */}
+      <Modal open={showOauth} onClose={closeOauthModal} title="Qoder OAuth 登录"
         footer={
-          <button className="btn-outline" disabled={oauthRunning} onClick={() => setShowOauth(false)}>
-            {oauthRunning ? '授权进行中…' : '关闭'}
-          </button>
+          oauthRunning ? (
+            <button className="btn-outline" onClick={closeOauthModal}>
+              {oauthCanceling ? <Loader2 size={14} className="animate-spin" /> : null}
+              取消授权
+            </button>
+          ) : (
+            <button className="btn-outline" onClick={() => setShowOauth(false)}>关闭</button>
+          )
         }
       >
         <div className="space-y-3">

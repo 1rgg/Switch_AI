@@ -1189,6 +1189,8 @@ export interface QoderEnvCheck {
   ide_installed: boolean;
   ide_running: boolean;
   ide_exe: string | null;
+  /** IDE exe ProductVersion（顶栏 hover 展示，对齐 Trae/Buddy） */
+  ide_version: string | null;
   ide_data_dir: string | null;
   ide_data_dir_exists: boolean;
   cli_dir: string;
@@ -1197,6 +1199,7 @@ export interface QoderEnvCheck {
   qoderwork_installed: boolean;
   qoderwork_running: boolean;
   qoderwork_exe: string | null;
+  qoderwork_version: string | null;
 }
 
 /** 每账号稳定设备指纹（§5.10 多账号并发；machine_id 32 位 hex，入池生成永不轮换） */
@@ -1234,8 +1237,6 @@ export interface QoderAccountView {
 export interface QoderSettings {
   /** 启动自动补签 + 应用内调度器启用判定（默认开） */
   auto_checkin: boolean;
-  /** 多账号签到显式开启项（合规：默认关，开启前须知条款风险） */
-  multi_account_enabled: boolean;
 }
 
 /** 账号池导出文件（M4：aiwork-qoder-pool；include_credentials=true 时 accounts[].credential 附带凭证副本，导出文件等同密码） */
@@ -1333,6 +1334,11 @@ export interface QoderCreditAccount {
   message?: string;
   plan_credits: number | null;
   addon_credits: number | null;
+  /** 订阅周期内已消耗（userQuota.used，看板「订阅版本的资源」进度数据源） */
+  plan_used?: number | null;
+  addon_used?: number | null;
+  /** 订阅周期到期日（qoderUsage.expiresAt → YYYY-MM-DD） */
+  plan_expires_at?: string;
   total: number | null;
   packages: QoderCreditPackage[];
   /** 数据源徽标：pat | client_token | fetch_failed | none */
@@ -1355,5 +1361,9 @@ export interface QoderCreditsSnapshot {
   date: string;
   ts: number;
   total_balance: number;
+  /** 当日消耗（快照差分：前日余额 − 当日余额 + 当日签到奖励，负值记 0；首日 null） */
+  consumed?: number | null;
+  /** 当日获得（签到奖励合计；无签到数据 null） */
+  earned?: number | null;
   accounts: { user_id: string; total: number | null }[];
 }

@@ -91,11 +91,7 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         }
         // Qoder 每日签到（F-80；schtasks 直调 + 应用内调度器共用；10:15 单次覆盖双活动）
         "qoder-checkin" => {
-            let s = crate::commands::qoder::load_settings(state);
-            let opts = qoder_checkin::QoderCheckinOpts {
-                multi_account_enabled: s.multi_account_enabled,
-                ..qoder_checkin::QoderCheckinOpts::daily()
-            };
+            let opts = qoder_checkin::QoderCheckinOpts::daily();
             Ok(qoder_checkin::run_checkin_round(state, &opts, &mut print_progress))
         }
         // Qoder 积分快照（调度器/CLI 共用；空池自然空转）

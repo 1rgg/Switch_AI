@@ -36,12 +36,10 @@ pub fn qoder_checkin_start(
     opts: QoderCheckinOptsDto,
 ) -> Result<(), String> {
     let round = qoder_checkin::try_acquire_qoder_round()?;
-    let s = load_settings(&state);
     let o = QoderCheckinOpts {
         uids: opts.user_ids.unwrap_or_default(),
         skip_checked: opts.skip_checked_in,
         lazy_hours: opts.lazy_hours.unwrap_or(24),
-        multi_account_enabled: s.multi_account_enabled,
     };
     let app2 = app.clone();
     let state2 = state.inner().clone();
@@ -266,11 +264,7 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
             fs_utils::app_log(&state2.data_dir, "Qoder 启动补签跳过：已有签到任务在执行中");
             return;
         };
-        let s2 = load_settings(&state2);
-        let opts = QoderCheckinOpts {
-            multi_account_enabled: s2.multi_account_enabled,
-            ..QoderCheckinOpts::daily()
-        };
+        let opts = QoderCheckinOpts::daily();
         fs_utils::app_log(&state2.data_dir, "Qoder 启动补签：开始核验签到状态");
         let done = qoder_checkin::run_checkin_round(&state2, &opts, &mut |_| {});
         let msg = format!(

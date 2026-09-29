@@ -593,13 +593,25 @@ pub fn ensure_fresh(
         };
     }
     // ── 客户端 token 通道：惰性刷新（deviceToken/refresh）──
+    // 空 refresh_token 检查统一前置：过期/临期/未知过期（expires_at 缺失）一律无法
+    // 客户端刷新。原实现仅在「已过期且带 expires_at」时前置判定，其余空 refresh_token
+    // 场景会掉进 refresh_token_once 的空守卫被误报 refresh_failed（暂态），触发无效重试
+    if creds.refresh_token.is_empty() {
+        if let Some(exp) = creds.expires_at_ms {
+            let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
+            if remain_h > lazy_hours as f64 {
+                return (creds, false, "fresh");
+            }
+        } else {
+            // 无 expires_at 也无 refresh_token：无法判定新鲜度也无法刷新，按需重登
+            return (creds, false, "expired_needs_relogin");
+        }
+        return (creds, false, "expired_needs_relogin");
+    }
     if let Some(exp) = creds.expires_at_ms {
         let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
         if remain_h > lazy_hours as f64 {
             return (creds, false, "fresh");
-        }
-        if remain_h < 0.0 && creds.refresh_token.is_empty() {
-            return (creds, false, "expired_needs_relogin");
         }
     }
     if let Some(new) = refresh_token_once(agent, &creds) {

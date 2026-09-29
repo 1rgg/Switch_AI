@@ -21,15 +21,17 @@ import type {
   ViewKey,
   QoderAccountView,
   QoderCheckinRecord,
+  QoderCliStatus,
   QoderCreditsResult,
   QoderEnvCheck,
 } from '../../types';
 
 /**
  * qoder-overview 概述（F-80 §5.8，对照 BuddyOverview 结构逐块对齐）：
- * 顶部统计卡 + 近 30 天签到结果（堆叠柱状）+ 积分榜 Top 榜 + 配置导航。
- * 差异：无成长中心（Qoder 无对应玩法）；「登录账号/套餐」M1 无客户端在线态数据源，
- * 以客户端环境卡替代（R-2/R-8 闭合后补登录态）。
+ * 顶部统计卡（含登录账号/本机套餐，对齐 Buddy 卡形态）+ 近 30 天签到结果（堆叠柱状）
+ * + 积分榜 Top 榜 + 配置导航。
+ * 差异：无成长中心（Qoder 无对应玩法）；本机登录态取 CLI 状态桥（IDE/Work/CLI 全家桶共享登录），
+ * 套餐从账号池按昵称匹配（userinfo 口径）。
  */
 
 /** 概述页近 30 天签到趋势数据点（由 QoderCheckinRecord 按日聚合） */
@@ -78,7 +80,8 @@ export default function QoderOverview() {
   const [records, setRecords] = useState<QoderCheckinRecord[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [openingClient, setOpeningClient] = useState(false);
-  const [checkinHhmm, setCheckinHhmm] = useState('10:15');
+  // CLI 状态只读桥（本机登录账号数据源，对齐 BuddyOverview 登录账号卡）
+  const [cliStatus, setCliStatus] = useState<QoderCliStatus | null>(null);
 
   const refresh = async () => {
     setRefreshing(true);
@@ -89,7 +92,7 @@ export default function QoderOverview() {
       const [e, accs, crRes, recs] = await Promise.all([
         api.qoder.envCheck().catch(() => null),
         api.qoder.accountsList().catch(() => [] as QoderAccountView[]),
-        api.qoder.creditsFetch().then(
+        api.qoder.creditsFetch(undefined, true).then(
           (cr) => ({ ok: true as const, cr }),
           (err: unknown) => ({ ok: false as const, err }),
         ),
@@ -112,16 +115,17 @@ export default function QoderOverview() {
 
   useEffect(() => {
     void refresh();
-    // 签到调度卡显示全局设置中的签到时刻（原硬编码「每日 10:15」与设置页脱节）
-    api.misc
-      .settingsGet()
-      .then((s) => setCheckinHhmm(s.qoder_checkin_hhmm || '10:15'))
-      .catch(() => {});
+    // 本机登录态（CLI 状态桥只读，失败静默——不影响主列表）
+    api.qoder.cliStatus().then(setCliStatus).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const total = accounts.length;
-  const totalBalance = credits?.accounts.reduce((s, a) => s + (a.total ?? 0), 0) ?? null;
+  // 空账号列表显示空态（—）而非误导性的 0.00：未导入账号 ≠ 零积分
+  const totalBalance =
+    credits && credits.accounts.length > 0
+      ? credits.accounts.reduce((s, a) => s + (a.total ?? 0), 0)
+      : null;
   const okAccounts = credits?.accounts.filter((a) => a.ok).length ?? 0;
   // 今日签到账号数（今日记录去重 user_id）
   const today = new Date().toLocaleDateString('sv-SE');
@@ -132,19 +136,28 @@ export default function QoderOverview() {
 
   const trends = useMemo(() => aggregateTrends(records), [records]);
 
-  // 客户端环境摘要（Buddy「登录账号」卡的 Qoder 等价物：三端装机/就绪态）
-  const envSummary = env
-    ? [env.ide_installed ? 'IDE ✓' : 'IDE ✗', env.qoderwork_installed ? 'Work ✓' : 'Work ✗', env.cli_dir_exists ? 'CLI ✓' : 'CLI ✗'].join(' · ')
-    : '检测中…';
+  // 客户端就绪态（配置导航步骤判定用）
   const clientReady = !!env && (env.ide_installed || env.qoderwork_installed || env.cli_dir_exists);
+
+  // 登录账号 / 本机套餐（对齐 BuddyOverview 卡形态）：本机当前登录取 CLI 状态桥
+  // （IDE/Work/CLI 全家桶共享登录），套餐从账号池按昵称匹配（userinfo plan 口径）
+  const currentAccount = useMemo(
+    () => accounts.find((a) => a.nickname && a.nickname === cliStatus?.name) ?? null,
+    [accounts, cliStatus],
+  );
+  const loginName = cliStatus?.logged_in ? (cliStatus.name ?? currentAccount?.nickname ?? null) : (currentAccount?.nickname ?? null);
+  const loginPlan = currentAccount?.plan || null;
 
   // 告警提醒：Token 24h 内将过期（含已过期）账号数 + 需重新登录账号数
   const nowSec = Math.floor(Date.now() / 1000);
-  const tokenSoon = accounts.filter(
-    (a) => a.token_expires_at != null && a.token_expires_at <= nowSec + 86400,
-  ).length;
-  const relogin = accounts.filter((a) => a.needs_relogin).length;
-  const alertCount = tokenSoon + relogin;
+  const tokenSoonSet = new Set(
+    accounts
+      .filter((a) => a.token_expires_at != null && a.token_expires_at <= nowSec + 86400)
+      .map((a) => a.id),
+  );
+  const reloginSet = new Set(accounts.filter((a) => a.needs_relogin).map((a) => a.id));
+  // 并集去重：同一账号可能既 token 临期又需重登，相加会重复计数
+  const alertCount = new Set([...tokenSoonSet, ...reloginSet]).size;
 
   // 积分榜 Top（按余额降序，对齐 Buddy 概述）
   const top = useMemo(
@@ -225,7 +238,7 @@ export default function QoderOverview() {
     <div className="animate-fade-in">
       <PageHeader
         title="Qoder · 概述"
-        desc="Qoder CN（IDE / Work / CLI）运行总览 · 客户端环境 / 告警提醒 / 签到趋势与积分榜"
+        desc="Qoder CN（IDE / Work / CLI）运行总览 · 登录账号 / 本机套餐 / 告警提醒 / 签到趋势与积分榜"
         actions={
           <button onClick={() => void refresh()} className="btn-outline" disabled={refreshing}>
             <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
@@ -248,21 +261,21 @@ export default function QoderOverview() {
           tone="amber"
         />
         <StatCard
-          label="客户端环境"
-          value={clientReady ? '就绪' : '未检测到'}
-          hint={envSummary}
+          label="登录账号"
+          value={loginName ?? '未登录'}
+          hint={cliStatus?.logged_in ? '本机登录态有效（CLI 状态桥）' : `账号池 ${accounts.length} 个 · 可从账号管理一键切换`}
           tone="violet"
         />
         <StatCard
-          label="签到调度"
-          value={`每日 ${checkinHhmm}`}
-          hint="单次覆盖 0 点签到 + 10:00 登录奖励"
+          label="本机套餐"
+          value={loginPlan ?? '—'}
+          hint={loginPlan ? '当前登录账号的套餐（userinfo 口径）' : '套餐随登录账号变化'}
           tone="violet"
         />
         <StatCard
           label="告警提醒"
           value={alertCount}
-          hint={`Token 24h 内过期 ${tokenSoon} · 需重新登录 ${relogin}`}
+          hint={`Token 24h 内过期 ${tokenSoonSet.size} · 需重新登录 ${reloginSet.size}`}
           tone={alertCount > 0 ? 'red' : 'slate'}
         />
       </div>

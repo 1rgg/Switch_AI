@@ -3,7 +3,9 @@
 //! 客户端真实链路（PKCE device flow）：
 //! 1. 生成 `nonce`（uuid v4）、`verifier`（64 字符）、`machine_id`/`client_id`（uuid v4）
 //! 2. 浏览器打开 `https://qoder.cn/device/selectAccounts?challenge=<BASE64URL(SHA256(verifier))>
-//!    &challenge_method=S256&nonce=..&machine_id=..&client_id=..`（用户在页面完成授权）
+//!    &challenge_method=S256&nonce=..&machine_id=..&client_id=..&directLogin=true`
+//!    （用户在页面完成授权；directLogin 必须显式携带——缺省时授权页前端自行补参，
+//!    实测出现 `directLogin=true&directLogin=true` 重复参数导致页面报「参数无效」）
 //! 3. 轮询 `GET {open_api}/api/v1/deviceToken/poll?nonce=..&verifier=..&challenge_method=S256`
 //!    - **pending = HTTP 404** `{"errorCode":"NotFound",...}`（实测）
 //!    - **成功 = HTTP 200**：`{id, token(dt-), user_id, expires_in:2591999999(≈30d ms),
@@ -54,7 +56,7 @@ impl DeviceFlow {
         let digest = Sha256::digest(verifier.as_bytes());
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
         let auth_url = format!(
-            "{DEVICE_AUTH_BASE}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}&client_id={client_id}"
+            "{DEVICE_AUTH_BASE}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}&client_id={client_id}&directLogin=true"
         );
         Self { nonce, verifier, machine_id, client_id, auth_url }
     }
@@ -141,7 +143,7 @@ mod tests {
         assert_eq!(f1.verifier.len(), 64);
         assert!(f1.auth_url.starts_with(DEVICE_AUTH_BASE));
         // query 参数完整性
-        for key in ["challenge=", "challenge_method=S256", "nonce=", "machine_id=", "client_id="] {
+        for key in ["challenge=", "challenge_method=S256", "nonce=", "machine_id=", "client_id=", "directLogin=true"] {
             assert!(f1.auth_url.contains(key), "auth_url 缺少 {key}");
         }
         // challenge 可由 verifier 复算（S256 绑定）

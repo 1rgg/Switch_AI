@@ -128,7 +128,8 @@ fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
     }
 }
 
-fn version_of(path: &str) -> Option<String> {
+/// exe 文件版本（ProductVersion 优先，回退 FileVersion）——qoder_env_check 复用
+pub(crate) fn version_of(path: &str) -> Option<String> {
     // 优先 ProductVersion（用户认知的产品版本，如 Trae 3.3.100 / Trae Work 0.1.65 /
     // CodeBuddy 4.12.0），缺失时回退 FileVersion（内部构建号）——实测 Electron 系客户端
     // 两者差异巨大（TRAE SOLO CN.exe FileVersion=2.3.83557 而 ProductVersion=0.1.65，

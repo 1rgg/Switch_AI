@@ -437,6 +437,8 @@ export const api = {
       invoke<QoderAccountView>('qoder_account_import_pat', { name: name ?? null, pat }),
     /** OAuth 设备流登录（浏览器授权页 + deviceToken/poll 轮询；事件 qoder-oauth-progress/done） */
     oauthLogin: () => invoke<void>('qoder_oauth_login'),
+    /** 取消进行中的 OAuth 轮询（弹框「取消授权」）：后端置标志后轮询线程自行发失败终态 */
+    oauthCancel: () => invoke<void>('qoder_oauth_cancel'),
     /** IDE 存储账号发现/导入（M3；secret://aicoding.auth.userInfo DPAPI+AES-GCM 解密） */
     ideScan: () => invoke<QoderIdeScanResult>('qoder_ide_scan'),
     /** CLI 登录状态只读桥（M4；~/.qoder-cn/.qoder-app-status.json 白名单透传，无凭证） */

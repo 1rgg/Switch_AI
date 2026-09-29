@@ -12,7 +12,7 @@
 use serde_json::Value;
 use tauri::State;
 
-use super::common::{load_pool, save_pool, QoderAccount};
+use super::common::{load_pool, load_pool_checked, save_pool, QoderAccount};
 use crate::fs_utils;
 use crate::state::AppState;
 
@@ -142,9 +142,11 @@ pub fn qoder_accounts_import(state: State<AppState>, payload: Value) -> Result<V
     let mut updated = 0usize;
     let mut with_cred = 0usize;
     let mut rejected: Vec<Value> = Vec::new();
-    // 全程持池锁：签到/刷新/积分回写等通道的「load→改→save」并发时整池覆盖会丢导入
+    // 全程持池锁：签到/刷新/积分回写等通道的「load→改→save」并发时整池覆盖会丢导入。
+    // 写路径必须走 checked 版：池存在损坏行时拒绝导入（坏行静默丢弃后 save 会整池
+    // 覆盖永久丢账号，违反 common.rs 红线）
     let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let mut pool = load_pool(&state);
+    let mut pool = load_pool_checked(&state)?;
     for a in accounts {
         match merge_account(&mut pool, a) {
             Ok((final_id, is_new)) => {

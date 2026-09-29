@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useState } from 'react';
-import { CalendarClock, RefreshCw, ShieldAlert } from 'lucide-react';
+import { ListChecks, RefreshCw, Save, Search, ShieldAlert, SlidersHorizontal } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
-import { Badge } from '../../components/ui';
+import { Badge, Spinner } from '../../components/ui';
+import { withMinDelay } from '../../lib/delay';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import type { QoderEnvCheck, QoderSettings } from '../../types';
 
 /**
- * qoder-settings 环境配置（F-80 §5.8）：
- * 客户端路径 + 签到/快照调度（app settings）+ 自动签到开关（qoder_settings）
- * + schtasks 注册 + 合规提示（条款风险固定展示，不可跳过）。
+ * qoder-settings 环境配置（F-80 §5.8，布局对齐 BuddySettings）：
+ * 左列 通用配置（应用环境路径 + 签到行为）；右列 任务配置（每日签到 + 积分快照）。
+ * 顶部「重新检测」+ 右上角「保存配置」统一提交（路径 / 时刻 / 开关一处生效）；
+ * Windows 计划任务注册、路径自动检测为独立即时动作。
+ * 合规提示（条款风险固定展示，不可跳过）。
  */
 
 const isValidHHMM = (s: string) => /^([01]\d|2[0-3]):[0-5]\d$/.test(s.trim());
@@ -19,32 +22,46 @@ export default function QoderSettings() {
   const settings = useAppStore((s) => s.settings);
   const saveSettings = useAppStore((s) => s.saveSettings);
   const [qoderSettings, setQoderSettings] = useState<QoderSettings | null>(null);
+  const [settingsErr, setSettingsErr] = useState(false);
   const [env, setEnv] = useState<QoderEnvCheck | null>(null);
   const [taskTimes, setTaskTimes] = useState<string[]>([]);
   const [idePath, setIdePath] = useState('');
   const [workPath, setWorkPath] = useState('');
   const [checkinHhmm, setCheckinHhmm] = useState('10:15');
   const [creditsHhmm, setCreditsHhmm] = useState('23:40');
+  const [creditsSyncEnabled, setCreditsSyncEnabled] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  /** qoder-settings 加载（签到开关数据源）：失败置错误态——null 时 checkbox 恒显默认 true
+   *  且点击 no-op、保存会静默跳过 settingsSet 仍报「已保存」，必须显式拦截 */
+  const loadQoderSettings = useCallback(async () => {
+    try {
+      setQoderSettings(await api.qoder.settingsGet());
+      setSettingsErr(false);
+    } catch {
+      setQoderSettings(null);
+      setSettingsErr(true);
+    }
+  }, []);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [qs, ts, e] = await Promise.all([
-        api.qoder.settingsGet().catch(() => null),
+      const [ts, e] = await Promise.all([
         api.qoder.checkinTaskStatus().catch(() => [] as string[]),
         api.qoder.envCheck().catch(() => null),
       ]);
-      setQoderSettings(qs);
       setTaskTimes(ts);
       setEnv(e);
+      await loadQoderSettings();
     } catch (err) {
-      pushToast('error', `读取设置失败：${String(err)}`);
+      pushToast('error', `检测失败：${String(err)}`);
     } finally {
       setRefreshing(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [loadQoderSettings]);
 
   useEffect(() => {
     void refresh();
@@ -56,27 +73,46 @@ export default function QoderSettings() {
       setWorkPath(settings.qoderwork_path ?? '');
       setCheckinHhmm(settings.qoder_checkin_hhmm || '10:15');
       setCreditsHhmm(settings.qoder_credits_sync_hhmm || '23:40');
+      setCreditsSyncEnabled(settings.qoder_credits_sync_enabled ?? true);
     }
   }, [settings]);
 
-  const saveAppSettings = async (patch: Record<string, unknown>, okMsg: string) => {
-    try {
-      await saveSettings(patch);
-      pushToast('success', okMsg);
-    } catch (err) {
-      pushToast('error', `保存失败：${String(err)}`);
+  /** 右上角统一保存（对齐 BuddySettings）：路径 + 时刻 + 快照开关 + 签到行为，一次提交 */
+  const save = async () => {
+    // qoder-settings 未加载成功时禁止保存：否则签到开关静默跳过 settingsSet，误报「已保存」
+    if (settingsErr) {
+      pushToast('error', 'qoder-settings 加载失败，签到开关暂不可保存；请点「重新检测」重试');
+      return;
     }
-  };
-
-  const saveQoderSettings = async (next: QoderSettings) => {
-    const prev = qoderSettings;
-    setQoderSettings(next); // 乐观更新，失败回滚
+    if (!isValidHHMM(checkinHhmm)) {
+      pushToast('error', `签到时刻格式无效：${checkinHhmm}（应为 HH:MM）`);
+      return;
+    }
+    if (!isValidHHMM(creditsHhmm)) {
+      pushToast('error', `快照时刻格式无效：${creditsHhmm}（应为 HH:MM）`);
+      return;
+    }
+    setSaving(true);
     try {
-      await api.qoder.settingsSet(next);
-      pushToast('success', '已保存');
+      await withMinDelay(
+        Promise.all([
+          saveSettings({
+            qoder_ide_path: idePath.trim() || null,
+            qoderwork_path: workPath.trim() || null,
+            qoder_checkin_hhmm: checkinHhmm.trim(),
+            qoder_credits_sync_hhmm: creditsHhmm.trim(),
+            qoder_credits_sync_enabled: creditsSyncEnabled,
+          }),
+          qoderSettings ? api.qoder.settingsSet(qoderSettings) : Promise.resolve(),
+        ]),
+        800,
+      );
+      pushToast('success', '配置已保存');
+      await refresh();
     } catch (err) {
-      setQoderSettings(prev);
       pushToast('error', `保存失败：${String(err)}`);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -94,23 +130,6 @@ export default function QoderSettings() {
     }
   };
 
-  // I20：「存时刻」原直接落库无校验，非法值（如 25:99）会静默入库且调度器无法解析
-  const saveCheckinHhmm = async () => {
-    if (!isValidHHMM(checkinHhmm)) {
-      pushToast('error', `签到时刻格式无效：${checkinHhmm}（应为 HH:MM）`);
-      return;
-    }
-    await saveAppSettings({ qoder_checkin_hhmm: checkinHhmm.trim() }, '签到时刻已保存');
-  };
-
-  const saveCreditsHhmm = async () => {
-    if (!isValidHHMM(creditsHhmm)) {
-      pushToast('error', `快照时刻格式无效：${creditsHhmm}（应为 HH:MM）`);
-      return;
-    }
-    await saveAppSettings({ qoder_credits_sync_hhmm: creditsHhmm.trim() }, '快照时刻已保存');
-  };
-
   const unregisterTask = async () => {
     try {
       await api.qoder.checkinTaskUnregister();
@@ -121,15 +140,32 @@ export default function QoderSettings() {
     }
   };
 
+  /** 自动检测：取本次环境检测结果填入输入框（对齐 Buddy「自动检测」交互），随右上角「保存配置」生效 */
+  const detectPath = (target: 'ide' | 'work') => {
+    const exe = target === 'ide' ? env?.ide_exe : env?.qoderwork_exe;
+    if (exe) {
+      if (target === 'ide') setIdePath(exe);
+      else setWorkPath(exe);
+      pushToast('info', `已定位：${exe}`);
+    } else {
+      pushToast('warn', '未检测到客户端，请人工填写 exe 路径');
+    }
+  };
+
   return (
     <div className="animate-fade-in">
       <PageHeader
         title="Qoder · 环境配置"
-        desc="客户端路径 · 调度 · 自动签到 · 合规提示"
+        desc="通用配置 · 任务配置"
         actions={
-          <button className="btn-outline" disabled={refreshing} onClick={() => void refresh()}>
-            <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 重新检测
-          </button>
+          <>
+            <button className="btn-outline" disabled={refreshing} onClick={() => void refresh()}>
+              <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 重新检测
+            </button>
+            <button className="btn-outline" disabled={saving} onClick={() => void save()}>
+              {saving ? <Spinner /> : <Save size={15} />} 保存配置
+            </button>
+          </>
         }
       />
 
@@ -138,195 +174,172 @@ export default function QoderSettings() {
         <ShieldAlert size={15} className="mt-0.5 shrink-0" />
         <span>
           合规提示：平台条款对「同一设备 / 手机号 / 支付宝账号」多维去重并限制技术手段自动化参与。
-          本功能定位为辅助个人账号的日常领取：单账号默认、多账号需显式开启、
+          本功能定位为辅助个人账号的日常领取：多账号并发签到、
           设备指纹按「每账号稳定绑定」注入（入池生成一次永不轮换，真实捕获值优先透传，
           不做随机轮换）、请求间隔抖动、失败退避。请自行评估并承担条款风险。
         </span>
       </div>
 
-      {/* 双列布局（对齐 BuddySettings：左列环境+路径，右列调度+签到） */}
+      {/* 双列布局（对齐 BuddySettings：左列 通用配置（应用环境+签到行为），右列 任务配置） */}
       <div className="grid items-start gap-4 lg:grid-cols-2">
-      {/* 左列：环境检测 + 客户端路径 */}
-      <div className="space-y-4">
-      <div className="card p-4">
-        <div className="mb-3 text-sm font-medium">环境检测</div>
-        <div className="grid gap-3 lg:grid-cols-3">
-          <div className="rounded-lg border border-slate-100 p-3 text-sm dark:border-zinc-800">
-            <div className="flex items-center gap-2 font-medium">
-              Qoder CN IDE
-              {env?.ide_installed ? <Badge tone="green">已安装</Badge> : <Badge tone="slate">未检测到</Badge>}
-              {env?.ide_running && <Badge tone="blue">运行中</Badge>}
+        {/* 左列：通用配置（应用环境 + 签到行为） */}
+        <div className="space-y-4">
+          <div className="card p-4">
+            <div className="mb-3 flex items-center gap-2">
+              <SlidersHorizontal size={16} className="text-violet-500" />
+              <h2 className="font-medium">通用配置</h2>
+              <span className="text-xs text-slate-400">路径与时刻随右上角「保存配置」生效</span>
             </div>
-            <div className="mt-1 truncate text-xs text-slate-400" title={env?.ide_exe ?? undefined}>
-              {env?.ide_exe || '%LOCALAPPDATA%\\Programs\\Qoder CN\\Qoder CN.exe'}
-            </div>
-          </div>
-          <div className="rounded-lg border border-slate-100 p-3 text-sm dark:border-zinc-800">
-            <div className="flex items-center gap-2 font-medium">
-              QoderWork CN
-              {env?.qoderwork_installed ? <Badge tone="green">已安装</Badge> : <Badge tone="slate">未检测到</Badge>}
-              {env?.qoderwork_running && <Badge tone="blue">运行中</Badge>}
-            </div>
-            <div className="mt-1 truncate text-xs text-slate-400" title={env?.qoderwork_exe ?? undefined}>
-              {env?.qoderwork_exe || '%LOCALAPPDATA%\\Qoder CN\\Qoder CN Launcher\\Qoder CN Launcher.exe'}
-            </div>
-          </div>
-          <div className="rounded-lg border border-slate-100 p-3 text-sm dark:border-zinc-800">
-            <div className="flex items-center gap-2 font-medium">
-              Qoder CN CLI
-              {env?.cli_dir_exists ? <Badge tone="green">已就绪</Badge> : <Badge tone="slate">未安装</Badge>}
-            </div>
-            <div className="mt-1 truncate text-xs text-slate-400">{env?.cli_dir ? `${env.cli_dir}\\.qoder-cn` : '~/.qoder-cn'}</div>
-          </div>
-        </div>
-      </div>
 
-      {/* 客户端路径 */}
-      <div className="card p-4">
-        <div className="mb-3 text-sm font-medium">客户端路径（自动识别失败时人工指定）</div>
-        <label className="block text-sm">
-          <span className="mb-1 block text-xs text-slate-500">
-            Qoder CN IDE exe 路径（M3 切换功能使用）
-          </span>
-          <div className="flex gap-2">
-            <input
-              className="input w-full font-mono text-xs"
-              value={idePath}
-              onChange={(e) => setIdePath(e.target.value)}
-              placeholder="C:\Users\...\AppData\Local\Programs\Qoder CN\Qoder CN.exe"
-            />
-            <button
-              className="btn-outline shrink-0"
-              onClick={() => void saveAppSettings({ qoder_ide_path: idePath.trim() || null }, 'IDE 路径已保存')}
-            >
-              保存
-            </button>
-          </div>
-        </label>
-        <label className="mt-3 block text-sm">
-          <span className="mb-1 block text-xs text-slate-500">
-            QoderWork CN exe 路径
-          </span>
-          <div className="flex gap-2">
-            <input
-              className="input w-full font-mono text-xs"
-              value={workPath}
-              onChange={(e) => setWorkPath(e.target.value)}
-              placeholder="C:\Users\...\AppData\Local\Qoder CN\Qoder CN Launcher\Qoder CN Launcher.exe"
-            />
-            <button
-              className="btn-outline shrink-0"
-              onClick={() => void saveAppSettings({ qoderwork_path: workPath.trim() || null }, 'QoderWork 路径已保存')}
-            >
-              保存
-            </button>
-          </div>
-        </label>
-      </div>
-
-      </div>
-
-      {/* 右列：调度 + 签到行为 */}
-      <div className="space-y-4">
-      <div className="card p-4">
-        <div className="mb-3 flex items-center gap-2">
-          <CalendarClock size={16} className="text-violet-500" />
-          <span className="text-sm font-medium">调度（应用内调度器 + Windows 计划任务双轨）</span>
-        </div>
-        <div className="grid gap-4 lg:grid-cols-2">
-          <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium">每日签到</span>
-              {taskTimes.length > 0 ? <Badge tone="green">已注册 {taskTimes.join(' / ')}</Badge> : <Badge tone="slate">计划任务未注册</Badge>}
+            {/* 应用环境（原「客户端路径」改名：自动检测预填 + 人工可改，随「保存配置」生效） */}
+            <h3 className="mb-2 font-medium">应用环境</h3>
+            <div className="space-y-3">
+              <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+                <div className="mb-2 flex items-center justify-between font-medium text-slate-500">
+                  Qoder CN IDE exe 路径
+                  <Badge tone={env?.ide_exe ? 'green' : 'amber'}>{env?.ide_exe ? '已检测到' : '未检测到'}</Badge>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    className="input flex-1 font-mono text-xs"
+                    value={idePath}
+                    onChange={(e) => setIdePath(e.target.value)}
+                    placeholder={env?.ide_exe ?? 'C:\\Users\\...\\AppData\\Local\\Programs\\Qoder CN\\Qoder CN.exe'}
+                  />
+                  <button className="btn-outline shrink-0 !px-2 !py-1" onClick={() => detectPath('ide')}>
+                    <Search size={13} /> 自动检测
+                  </button>
+                </div>
+                <p className="mt-1.5 text-slate-400">M3 切换功能使用 · 留空 = 自动检测 · 随右上角「保存配置」生效</p>
+              </div>
+              <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+                <div className="mb-2 flex items-center justify-between font-medium text-slate-500">
+                  QoderWork CN exe 路径
+                  <Badge tone={env?.qoderwork_exe ? 'green' : 'amber'}>{env?.qoderwork_exe ? '已检测到' : '未检测到'}</Badge>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    className="input flex-1 font-mono text-xs"
+                    value={workPath}
+                    onChange={(e) => setWorkPath(e.target.value)}
+                    placeholder={env?.qoderwork_exe ?? 'C:\\Users\\...\\AppData\\Local\\Qoder CN\\Qoder CN Launcher\\Qoder CN Launcher.exe'}
+                  />
+                  <button className="btn-outline shrink-0 !px-2 !py-1" onClick={() => detectPath('work')}>
+                    <Search size={13} /> 自动检测
+                  </button>
+                </div>
+                <p className="mt-1.5 text-slate-400">Launcher 拉起与已安装检测使用 · 留空 = 自动检测 · 随右上角「保存配置」生效</p>
+              </div>
             </div>
-            <div className="mt-2 flex items-center gap-2">
-              <input
-                className="input w-24 text-center font-mono"
-                value={checkinHhmm}
-                onChange={(e) => setCheckinHhmm(e.target.value)}
-                placeholder="10:15"
-              />
-              <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => void saveCheckinHhmm()}>
-                存时刻
-              </button>
-              <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => void registerTask()}>
-                注册计划任务
-              </button>
-              {taskTimes.length > 0 && (
-                <button className="btn-ghost !px-3 !py-1 text-xs text-rose-500" onClick={() => void unregisterTask()}>
-                  注销
-                </button>
-              )}
-            </div>
-            <p className="mt-2 text-xs text-slate-400">
-              默认 10:15：同时覆盖「0 点签到」与「10:00 登录奖励」双活动；应用开着时调度器自动补跑。
-            </p>
-          </div>
-          <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium">积分快照</span>
-              <label className="flex items-center gap-1.5 text-xs">
+            {/* 签到行为（并入通用配置卡内部分节） */}
+            <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+            <h3 className="mb-2 font-medium">签到行为</h3>
+            <div className="grid gap-3">
+              <label
+                className={`flex items-start gap-2 rounded-lg border p-3 ${
+                  settingsErr
+                    ? 'border-amber-200 bg-amber-50/50 opacity-70 dark:border-amber-500/30 dark:bg-amber-500/5'
+                    : 'border-slate-100 dark:border-zinc-800'
+                }`}
+              >
                 <input
                   type="checkbox"
-                  checked={settings?.qoder_credits_sync_enabled ?? true}
-                  onChange={(e) => void saveAppSettings({ qoder_credits_sync_enabled: e.target.checked }, e.target.checked ? '快照已开启' : '快照已关闭')}
+                  className="mt-0.5"
+                  disabled={settingsErr}
+                  checked={qoderSettings?.auto_checkin ?? true}
+                  onChange={(e) =>
+                    setQoderSettings((s) => (s ? { ...s, auto_checkin: e.target.checked } : s))
+                  }
                 />
-                启用
+                <span className="text-sm">
+                  自动签到（默认开）
+                  <span className="block text-xs text-slate-400">
+                    启动补签 + 应用内调度器 qoder-checkin 启用判定；多账号并发签到，
+                    每账号绑定一份稳定设备指纹（账号页可查看），不同账号以不同设备身份请求，互不影响
+                  </span>
+                  {settingsErr && (
+                    <span className="mt-1 block text-xs text-amber-600 dark:text-amber-400">
+                      qoder-settings 加载失败，当前显示为默认值且不可修改；请点右上角「重新检测」重试
+                    </span>
+                  )}
+                </span>
               </label>
             </div>
-            <div className="mt-2 flex items-center gap-2">
-              <input
-                className="input w-24 text-center font-mono"
-                value={creditsHhmm}
-                onChange={(e) => setCreditsHhmm(e.target.value)}
-                placeholder="23:40"
-              />
-              <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => void saveCreditsHhmm()}>
-                存时刻
-              </button>
-            </div>
-            <p className="mt-2 text-xs text-slate-400">
-              每日拉取全部账号余额写入快照（积分看板趋势数据源）；无账号时空转不计失败。
-            </p>
           </div>
         </div>
-      </div>
 
-      {/* 自动签到开关（qoder_settings） */}
-      <div className="card p-4">
-        <div className="mb-3 text-sm font-medium">签到行为</div>
-        <div className="grid gap-3 lg:grid-cols-2">
-          <label className="flex items-start gap-2 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-            <input
-              type="checkbox"
-              className="mt-0.5"
-              checked={qoderSettings?.auto_checkin ?? true}
-              onChange={(e) => qoderSettings && void saveQoderSettings({ ...qoderSettings, auto_checkin: e.target.checked })}
-            />
-            <span className="text-sm">
-              自动签到（默认开）
-              <span className="block text-xs text-slate-400">启动补签 + 应用内调度器 qoder-checkin 启用判定</span>
-            </span>
-          </label>
-          <label className="flex items-start gap-2 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-            <input
-              type="checkbox"
-              className="mt-0.5"
-              checked={qoderSettings?.multi_account_enabled ?? false}
-              onChange={(e) => qoderSettings && void saveQoderSettings({ ...qoderSettings, multi_account_enabled: e.target.checked })}
-            />
-            <span className="text-sm">
-              多账号签到（默认关，显式开启）
-              <span className="block text-xs text-slate-400">
-                关闭时每轮仅处理首个账号；开启即代表已知晓并接受平台条款风险。
-                每账号绑定一份稳定设备指纹（账号页可查看），签到/积分请求自动注入，
-                不同账号以不同设备身份并发，互不影响
-              </span>
-            </span>
-          </label>
+        {/* 右列：任务配置（原「调度」卡改名，对齐 BuddySettings TaskConfigCard 分节样式） */}
+        <div className="card p-4">
+          <div className="mb-3 flex items-center gap-2">
+            <ListChecks size={16} className="text-violet-500" />
+            <h2 className="font-medium">任务配置</h2>
+            <span className="text-xs text-slate-400">应用内调度器 + Windows 计划任务双轨</span>
+          </div>
+
+          {/* 每日签到（对齐 Buddy「Windows 计划任务」盒子样式） */}
+          <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+            <div className="mb-2 text-xs text-slate-400">
+              每日签到：应用内调度器到点自动执行（默认 10:15，同时覆盖「0 点签到」与「10:00 登录奖励」双活动），
+              应用启动时自动补跑当日已过时刻；下方 Windows 计划任务作为兜底，应用未启动时直接运行。
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-medium">Windows 计划任务（兜底）</div>
+                <div className="text-xs text-slate-400">
+                  {taskTimes.length > 0 ? `已注册：${taskTimes.join('、')}` : '未注册'}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  type="time"
+                  className="input h-9 !w-28 text-sm"
+                  value={checkinHhmm}
+                  onChange={(e) => setCheckinHhmm(e.target.value || '10:15')}
+                />
+                {taskTimes.length > 0 ? (
+                  <button className="btn-ghost !px-3 !py-1 text-xs text-rose-500" onClick={() => void unregisterTask()}>
+                    注销
+                  </button>
+                ) : (
+                  <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => void registerTask()}>
+                    注册
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+          {/* 积分快照（对齐 Buddy「数据同步」分节样式） */}
+          <div className="flex items-center justify-between">
+            <h3 className="font-medium">积分快照</h3>
+            <span className="text-xs text-slate-400">开关与时刻随右上角「保存配置」生效</span>
+          </div>
+          <p className="mb-3 mt-1 text-xs text-slate-400">
+            每日拉取全部账号余额写入快照（积分看板趋势数据源）；无账号时空转不计失败。应用关闭期间不执行。
+          </p>
+          <div className="flex flex-wrap items-center gap-4 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <input
+                type="checkbox"
+                checked={creditsSyncEnabled}
+                onChange={(e) => setCreditsSyncEnabled(e.target.checked)}
+              />
+              启用
+            </label>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-medium text-slate-500">每日执行时刻</span>
+              <input
+                type="time"
+                className="input h-9 !w-28 text-sm"
+                value={creditsHhmm}
+                onChange={(e) => setCreditsHhmm(e.target.value || '23:40')}
+              />
+              <span className="text-xs text-slate-400">默认 23:40</span>
+            </div>
+          </div>
         </div>
-      </div>
-      </div>
       </div>
     </div>
   );

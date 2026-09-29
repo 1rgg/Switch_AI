@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { CheckCircle2, Gift, PlayCircle, XCircle } from 'lucide-react';
+import { CheckCircle2, Gift, PlayCircle, RefreshCw, XCircle } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -82,9 +82,11 @@ export default function QoderCheckin() {
   const [doneInfo, setDoneInfo] = useState<{ ok: number; already: number; failed: number } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [checkinMap, setCheckinMap] = useState<Map<string, QoderCheckinRecord[]>>(new Map());
+  const [refreshing, setRefreshing] = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
 
   const refresh = useCallback(async () => {
+    setRefreshing(true);
     try {
       const [accs, recs] = await Promise.all([
         api.qoder.accountsList().catch(() => [] as QoderAccountView[]),
@@ -103,6 +105,8 @@ export default function QoderCheckin() {
       setCheckinMap(m);
     } catch (err) {
       pushToast('error', `读取签到数据失败：${String(err)}`);
+    } finally {
+      setRefreshing(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -166,9 +170,11 @@ export default function QoderCheckin() {
 
   const todayEarnedOf = (uid: string): number | null => {
     const recs = checkinMap.get(uid) ?? [];
-    const sum = recs.reduce((s, r) => s + (r.status === 'success' && r.reward != null ? r.reward : 0), 0);
+    // reward 口径 = 真实入账：fail 记录保留的部分入账计入；
+    // already 幂等回放会重复返回当日已领 reward，须排除防重复计数
+    const sum = recs.reduce((s, r) => s + (r.status !== 'already' && r.reward != null ? r.reward : 0), 0);
     if (sum > 0) return Math.round(sum * 100) / 100;
-    return recs.find((r) => r.reward != null)?.reward ?? null;
+    return recs.find((r) => r.status !== 'already' && r.reward != null)?.reward ?? null;
   };
   const checkinStatusOf = (uid: string): 'success' | 'already' | 'fail' | 'skip' | null => {
     const live = lines.find((l) => l.user_id === uid);
@@ -291,9 +297,14 @@ export default function QoderCheckin() {
           <span className="text-xs text-slate-400">
             {running ? '签到进行中，逐账号结果见下方实时进度…' : '签到结果将展示在下方实时进度卡'}
           </span>
-          <button className="btn-outline" onClick={() => void startCheckin()} disabled={running}>
-            <PlayCircle size={15} /> {running ? '签到中…' : '开始签到'}
-          </button>
+          <div className="flex items-center gap-2">
+            <button className="btn-outline" onClick={() => void refresh()} disabled={refreshing}>
+              <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
+            </button>
+            <button className="btn-outline" onClick={() => void startCheckin()} disabled={running}>
+              <PlayCircle size={15} /> {running ? '签到中…' : '开始签到'}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -312,16 +323,19 @@ export default function QoderCheckin() {
             ) : null}
           </div>
           <div className="space-y-1">
-            {lines.map((l, i) => {
-              const tone =
-                l.status === 'success'
-                  ? 'text-emerald-600 dark:text-emerald-300'
-                  : l.status === 'already'
-                  ? 'text-sky-600 dark:text-sky-300'
-                  : 'text-rose-600 dark:text-rose-300';
-              const Icon = l.status === 'fail' ? XCircle : CheckCircle2;
-              return (
-                <div key={i} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
+            {/* 过滤稀疏数组空洞：乱序事件按 index 跳写产生 hole，直接 map 会在 hole 上取 status 崩溃 */}
+            {lines
+              .filter((l) => l && l.user_id)
+              .map((l) => {
+                const tone =
+                  l.status === 'success'
+                    ? 'text-emerald-600 dark:text-emerald-300'
+                    : l.status === 'already'
+                    ? 'text-sky-600 dark:text-sky-300'
+                    : 'text-rose-600 dark:text-rose-300';
+                const Icon = l.status === 'fail' ? XCircle : CheckCircle2;
+                return (
+                  <div key={l.index} className="flex items-center gap-2 rounded border border-slate-200 px-3 py-2 text-sm dark:border-zinc-700">
                   <Icon size={14} className={tone} />
                   <span className="w-8 text-right text-xs text-slate-400">{l.index}</span>
                   <span className="flex-1 truncate">{l.name || l.user_id}</span>

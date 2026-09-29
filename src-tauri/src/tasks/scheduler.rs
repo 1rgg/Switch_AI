@@ -322,14 +322,12 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         "wb-renew" => Ok(super::wb_checkin::run_renew_only(st, 24)),
         // F-80 Qoder 每日签到：与 `--task-run qoder-checkin` 同款；抢轮次锁与 UI 路径互斥
         "qoder-checkin" => {
+            // 抢不到轮次锁（UI 路径正在签到）= 幂等跳过而非失败：返 Err 会被调度器记
+            // 当日首败并推送「签到失败」误报通知（签到本身未失败，UI 路径会照常完成）
             let Ok(_round) = crate::tasks::qoder_checkin::try_acquire_qoder_round() else {
-                return Err("跳过：已有 Qoder 签到任务在执行中".into());
+                return Ok(json!({ "ok": true, "skipped": "已有 Qoder 签到任务在执行中，本轮跳过" }));
             };
-            let s = crate::commands::qoder::load_settings(st);
-            let opts = super::qoder_checkin::QoderCheckinOpts {
-                multi_account_enabled: s.multi_account_enabled,
-                ..super::qoder_checkin::QoderCheckinOpts::daily()
-            };
+            let opts = super::qoder_checkin::QoderCheckinOpts::daily();
             Ok(super::qoder_checkin::run_checkin_round(st, &opts, &mut |_| {}))
         }
         // F-80 Qoder 积分快照：与 `--task-run qoder-credits-snapshot` 同款（空池空转）

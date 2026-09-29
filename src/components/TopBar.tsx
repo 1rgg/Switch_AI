@@ -3,7 +3,7 @@ import { ExternalLink, Loader2, Power, PowerOff, ShieldCheck, ShieldAlert, Monit
 import { useAppStore } from '../store';
 import { Badge } from './ui';
 import { api } from '../lib/tauri';
-import type { AppLocate, WorkBuddyEnvCheck, WbCliStatus, QoderEnvCheck } from '../types';
+import type { AppLocate, WorkBuddyEnvCheck, WbCliStatus, QoderCliStatus, QoderEnvCheck } from '../types';
 
 /** API 网关启停（Trae/Buddy 顶栏共用）：直接调 api_server_start/stop 并同步 store */
 function useApiGatewayToggle() {
@@ -330,6 +330,8 @@ function QoderTopBar() {
   const startProxy = useAppStore((s) => s.startProxy);
   const stopProxy = useAppStore((s) => s.stopProxy);
   const [env, setEnv] = useState<QoderEnvCheck | null>(null);
+  // CLI 状态只读桥（拿 CLI 版本号，徽标 hover 展示，对齐 Trae/Buddy）
+  const [cliStatus, setCliStatus] = useState<QoderCliStatus | null>(null);
   // 打开客户端 pending（ide/work 互斥防连点）
   const [launching, setLaunching] = useState<'ide' | 'work' | null>(null);
 
@@ -338,6 +340,10 @@ function QoderTopBar() {
     api.qoder
       .envCheck()
       .then((e) => alive && setEnv(e))
+      .catch(() => {});
+    api.qoder
+      .cliStatus()
+      .then((s) => alive && setCliStatus(s))
       .catch(() => {});
     return () => {
       alive = false;
@@ -365,7 +371,10 @@ function QoderTopBar() {
     <>
       <div className="flex items-center gap-2">
         {env?.ide_installed ? (
-          <Badge tone="green" title={env.ide_exe ?? 'Qoder CN IDE'}>
+          <Badge
+            tone="green"
+            title={env.ide_version ? `Qoder IDE 当前版本：v${env.ide_version}` : (env.ide_exe ?? 'Qoder CN IDE')}
+          >
             <MonitorCheck size={13} /> Qoder IDE已安装
           </Badge>
         ) : (
@@ -374,7 +383,14 @@ function QoderTopBar() {
           </Badge>
         )}
         {env?.qoderwork_installed ? (
-          <Badge tone="green" title={env.qoderwork_exe ?? 'QoderWork CN（Launcher）'}>
+          <Badge
+            tone="green"
+            title={
+              env.qoderwork_version
+                ? `QoderWork 当前版本：v${env.qoderwork_version}`
+                : (env.qoderwork_exe ?? 'QoderWork CN（Launcher）')
+            }
+          >
             <MonitorCheck size={13} /> QoderWork已安装
           </Badge>
         ) : (
@@ -383,7 +399,7 @@ function QoderTopBar() {
           </Badge>
         )}
         {env?.cli_dir_exists ? (
-          <Badge tone="green" title="~/.qoder-cn 已配置（CLI 可用）">
+          <Badge tone="green" title={cliStatus?.version ? `Qoder CLI 当前版本：v${cliStatus.version}` : '~/.qoder-cn 已配置（CLI 可用）'}>
             <MonitorCheck size={13} /> CLI已就绪
           </Badge>
         ) : (
@@ -409,7 +425,7 @@ function QoderTopBar() {
       </div>
       <div className="flex items-center gap-2">
         <button onClick={() => void launchApp('ide')} className="btn-outline" disabled={launching != null}>
-          {launching === 'ide' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开IDE
+          {launching === 'ide' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开Qoder IDE
         </button>
         <button onClick={() => void launchApp('work')} className="btn-outline" disabled={launching != null}>
           {launching === 'work' ? <Loader2 size={15} className="animate-spin" /> : <ExternalLink size={15} />} 打开QoderWork

@@ -337,6 +337,7 @@ fn main() {
             commands::qoder::qoder_open_ide,
             commands::qoder::qoder_open_work,
             commands::qoder::qoder_oauth_login,
+            commands::qoder::qoder_oauth_cancel,
             commands::qoder::qoder_settings_get,
             commands::qoder::qoder_settings_set,
             commands::qoder::qoder_accounts_list,

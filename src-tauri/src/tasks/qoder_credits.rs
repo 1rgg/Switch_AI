@@ -79,11 +79,14 @@ fn deep_balance_dig(v: &Value, depth: usize) -> Option<f64> {
     }
 }
 
-/// quota 子对象 → remaining（宽容：remaining/total 键序取值）
-fn quota_remaining(q: Option<&Value>) -> Option<f64> {
-    let q = q?;
-    num_or_none(q.get("remaining"))
-        .or_else(|| num_or_none(q.get("total")).map(|t| t - num_or_none(q.get("used")).unwrap_or(0.0)))
+/// quota 子对象 → (remaining, used)（宽容：remaining / total-used 键序取值）。
+/// used = 订阅周期内已消耗，积分看板 v2「订阅版本的资源」进度数据源（原实现丢弃）。
+fn quota_pair(q: Option<&Value>) -> (Option<f64>, Option<f64>) {
+    let Some(q) = q else { return (None, None) };
+    let used = num_or_none(q.get("used"));
+    let remaining = num_or_none(q.get("remaining"))
+        .or_else(|| num_or_none(q.get("total")).map(|t| t - used.unwrap_or(0.0)));
+    (remaining, used)
 }
 
 /// 毫秒时间戳 → YYYY-MM-DD（到期日历展示）
@@ -93,16 +96,32 @@ fn ms_to_date(ms: i64) -> String {
         .unwrap_or_default()
 }
 
-/// usage 响应 → (plan, addon, total, packages)。
+/// usage 解析产出（R-7 主结构 + 宽容兜底）。
+/// used（userQuota/addOnQuota.used，订阅周期内已消耗）与 plan_expires_at
+/// （qoderUsage.expiresAt → 订阅周期到期日）为积分看板 v2 新增捕获字段。
+#[derive(Default, Debug, PartialEq)]
+struct UsageParsed {
+    plan: Option<f64>,
+    plan_used: Option<f64>,
+    addon: Option<f64>,
+    addon_used: Option<f64>,
+    total: Option<f64>,
+    /// 订阅周期到期日（YYYY-MM-DD；空 = 响应缺失）
+    plan_expires_at: String,
+    packages: Vec<Value>,
+}
+
+/// usage 响应 → UsageParsed。
 /// 主路径：R-7 抓包结构（qoderUsage.userQuota / addOnQuota）；
 /// 兜底：候选键 + 递归深挖（结构变更时不静默返回 0，而是全 None → 显式失败）。
-fn parse_usage(b: &Value) -> (Option<f64>, Option<f64>, Option<f64>, Vec<Value>) {
+fn parse_usage(b: &Value) -> UsageParsed {
     let q = b.get("qoderUsage");
-    let plan = quota_remaining(q.and_then(|v| v.get("userQuota")));
-    let addon = quota_remaining(q.and_then(|v| v.get("addOnQuota")));
+    let (plan, plan_used) = quota_pair(q.and_then(|v| v.get("userQuota")));
+    let (addon, addon_used) = quota_pair(q.and_then(|v| v.get("addOnQuota")));
     let expires_at_ms = q
         .and_then(|v| v.get("expiresAt"))
         .and_then(Value::as_i64);
+    let plan_expires_at = expires_at_ms.map(ms_to_date).unwrap_or_default();
     let total = match (plan, addon) {
         (Some(p), Some(a)) => Some(p + a),
         (Some(p), None) | (None, Some(p)) => Some(p),
@@ -117,7 +136,7 @@ fn parse_usage(b: &Value) -> (Option<f64>, Option<f64>, Option<f64>, Vec<Value>)
     if let Some(a) = addon {
         packages.push(json!({
             "amount": a,
-            "expire_at": expires_at_ms.map(ms_to_date).unwrap_or_default(),
+            "expire_at": plan_expires_at,
             "source": "addon",
         }));
     }
@@ -138,7 +157,7 @@ fn parse_usage(b: &Value) -> (Option<f64>, Option<f64>, Option<f64>, Vec<Value>)
             }
         }
     }
-    (plan, addon, total, packages)
+    UsageParsed { plan, plan_used, addon, addon_used, total, plan_expires_at, packages }
 }
 
 /// 当前余额（签到奖励差值兜底数据源）：plan + addon remaining 之和；失败 None。
@@ -148,12 +167,10 @@ pub fn fetch_usage_balance(agent: &ureq::Agent, headers: &[(String, String)]) ->
     if status != 200 {
         return None;
     }
-    let (plan, addon, total, _) = parse_usage(&body?);
-    total.or_else(|| match (plan, addon) {
-        (Some(p), Some(a)) => Some(p + a),
-        (Some(p), None) | (None, Some(p)) => Some(p),
-        _ => None,
-    })
+    let parsed = parse_usage(&body?);
+    // total 为 None 时 plan/addon 必为 (None, None)（任一为 Some 则 total 必为 Some），
+    // 旧版 or_else 兜底恒返回 None，属死代码
+    parsed.total
 }
 
 /// 单账号积分查询（token 直调 usage 通道）。creds 由调用方解析（需要 AppState 读 token store）。
@@ -170,8 +187,11 @@ fn fetch_account(agent: &ureq::Agent, acct: &Value, creds: &qoder_common::QoderC
         "name": name,
         "ok": false,
         "plan_credits": Value::Null,
+        "plan_used": Value::Null,
         "addon_credits": Value::Null,
+        "addon_used": Value::Null,
         "total": Value::Null,
+        "plan_expires_at": "",
         "packages": [],
         "source": "fetch_failed",
         "fetched_at": fs_utils::now_iso(),
@@ -192,17 +212,20 @@ fn fetch_account(agent: &ureq::Agent, acct: &Value, creds: &qoder_common::QoderC
         row["message"] = json!("usage 响应非 JSON");
         return row;
     };
-    let (plan, addon, total, packages) = parse_usage(&b);
-    if plan.is_none() && addon.is_none() && total.is_none() {
+    let p = parse_usage(&b);
+    if p.plan.is_none() && p.addon.is_none() && p.total.is_none() {
         // 结构未识别：显式失败（§九-2 不静默），不阻塞其他账号
         row["message"] = json!("usage 结构未识别（接口可能已变更）");
         return row;
     }
     row["ok"] = json!(true);
-    row["plan_credits"] = json!(plan);
-    row["addon_credits"] = json!(addon);
-    row["total"] = json!(total);
-    row["packages"] = json!(packages);
+    row["plan_credits"] = json!(p.plan);
+    row["plan_used"] = json!(p.plan_used);
+    row["addon_credits"] = json!(p.addon);
+    row["addon_used"] = json!(p.addon_used);
+    row["total"] = json!(p.total);
+    row["plan_expires_at"] = json!(p.plan_expires_at);
+    row["packages"] = json!(p.packages);
     // source 徽标：PAT 通道（access_token 已换为作业令牌，kind 恒为 pat）/ 客户端 token（dt- 等）
     row["source"] = json!(if creds.kind == "pat" || creds.access_token.starts_with("pt-") { "pat" } else { "client_token" });
     row
@@ -229,6 +252,20 @@ fn filter_cache_by_user(mut cache: Value, user_id: &str) -> Value {
         cache["total_balance"] = json!(total);
     }
     cache
+}
+
+/// 当日签到奖励合计（qoder_checkin_results success 事件 reward 列；无签到数据为 0）。
+/// 消耗快照差分的充值修正项：签到入账会让余额上升，不修正会把消耗低估成负差。
+fn checkin_recharge_today(store: &std::sync::Arc<crate::store::Store>, today: &str) -> f64 {
+    crate::store::docs::qoder_checkin_results_load(store)
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|r| r.get("date").and_then(Value::as_str) == Some(today))
+        .filter(|r| r.get("status").and_then(Value::as_str) == Some("success"))
+        .filter_map(|r| r.get("reward").and_then(Value::as_f64))
+        .sum()
 }
 
 /// 积分查询主入口（commands 与调度共用）。
@@ -339,13 +376,38 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
         let _ = crate::store::docs::qoder_pool_save(&db, &pool);
     }
     // 快照落库（同日覆盖 + 365 天裁剪；失败不阻塞返回）。
-    // 仅全量查询落快照/写缓存：单账号 rows 会覆盖全量快照并污染缓存（过滤失效）
-    if user_id.is_none() {
+    // 仅「全量查询且全部成功」落快照：单账号 rows 会覆盖全量快照并污染缓存（过滤失效）；
+    // 部分失败时 total_balance 偏低，落快照会污染差分基准且同日覆盖抹掉当日正确快照
+    if user_id.is_none() && ok_count == rows.len() {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        // 当日获得（签到奖励合计）与当日消耗（快照差分推导，口径对齐 Buddy usage_fallback）：
+        // consumed = 前一快照日余额 − 当日余额 + 当日签到奖励；负值（套餐重置/资源包到账）记 0；
+        // 首个快照无前日基准记 null。无签到奖励日 earned 记 null（趋势线留空不画 0）。
+        let earned = checkin_recharge_today(&db, &today);
+        let prev_snap = crate::store::docs::qoder_credits_history_load(&db)
+            .iter()
+            .filter(|s| s.get("date").and_then(Value::as_str).is_some_and(|d| d < today.as_str()))
+            .max_by(|a, b| {
+                let ka = a.get("date").and_then(Value::as_str).unwrap_or("");
+                let kb = b.get("date").and_then(Value::as_str).unwrap_or("");
+                ka.cmp(kb)
+            })
+            .cloned();
+        let prev_total = prev_snap.as_ref().and_then(|s| s.get("total_balance").and_then(Value::as_f64));
+        let prev_n = prev_snap.as_ref().and_then(|s| s.get("accounts").and_then(Value::as_array).map(|a| a.len()));
+        // 账号数与上一快照不一致（期间增删账号）：差分口径不可比，consumed 记 null
+        // （增账号差分会被钳 0、删账号余额下降会被误计为消耗）
+        let consumed = if prev_n.is_some_and(|n| n != rows.len()) {
+            None
+        } else {
+            prev_total.map(|prev| (prev - total_balance + earned).max(0.0))
+        };
         let snap = json!({
             "date": today,
             "ts": now_ms,
             "total_balance": total_balance,
+            "consumed": consumed,
+            "earned": if earned > 0.0 { json!(earned) } else { Value::Null },
             "accounts": rows.iter()
                 .map(|r| json!({"user_id": r["user_id"], "total": r["total"]}))
                 .collect::<Vec<_>>(),
@@ -389,29 +451,58 @@ mod tests {
     #[test]
     fn parse_usage_handles_captured_r7_structure() {
         let b: Value = serde_json::from_str(CAPTURED_SAMPLE).unwrap();
-        let (plan, addon, total, packages) = parse_usage(&b);
-        assert_eq!(plan, Some(300.0));
-        assert_eq!(addon, Some(100.0));
-        assert_eq!(total, Some(400.0));
-        assert_eq!(packages.len(), 1);
-        assert_eq!(packages[0]["source"], json!("addon"));
-        assert_eq!(packages[0]["expire_at"], json!("2026-10-11"));
+        let p = parse_usage(&b);
+        assert_eq!(p.plan, Some(300.0));
+        assert_eq!(p.plan_used, Some(0.0));
+        assert_eq!(p.addon, Some(100.0));
+        assert_eq!(p.addon_used, Some(0.0));
+        assert_eq!(p.total, Some(400.0));
+        assert_eq!(p.plan_expires_at, "2026-10-11");
+        assert_eq!(p.packages.len(), 1);
+        assert_eq!(p.packages[0]["source"], json!("addon"));
+        assert_eq!(p.packages[0]["expire_at"], json!("2026-10-11"));
     }
 
     #[test]
     fn parse_usage_without_addon_quota() {
         // claim 前 addOnQuota 缺省：plan 300 / addon None / total 300
         let b = json!({"displayMode":"qoder","qoderUsage":{"userQuota":{"total":300,"used":0,"remaining":300}}});
-        let (plan, addon, total, _) = parse_usage(&b);
-        assert_eq!(plan, Some(300.0));
-        assert_eq!(addon, None);
-        assert_eq!(total, Some(300.0));
+        let p = parse_usage(&b);
+        assert_eq!(p.plan, Some(300.0));
+        assert_eq!(p.plan_used, Some(0.0));
+        assert_eq!(p.addon, None);
+        assert_eq!(p.addon_used, None);
+        assert_eq!(p.total, Some(300.0));
+    }
+
+    #[test]
+    fn parse_usage_captures_used_for_progress() {
+        // 订阅周期内已消耗（used）必须捕获：看板「订阅版本的资源」进度 = used / (remaining+used)
+        let b = json!({"qoderUsage":{
+            "userQuota":{"total":300,"used":120,"remaining":180},
+            "addOnQuota":{"total":100,"used":40,"remaining":60}
+        }});
+        let p = parse_usage(&b);
+        assert_eq!(p.plan, Some(180.0));
+        assert_eq!(p.plan_used, Some(120.0));
+        assert_eq!(p.addon, Some(60.0));
+        assert_eq!(p.addon_used, Some(40.0));
+        assert_eq!(p.total, Some(240.0));
+    }
+
+    #[test]
+    fn parse_usage_missing_remaining_derives_from_total_minus_used() {
+        // 宽容兜底：remaining 缺失时 total-used 推导（对齐原 quota_remaining 口径）
+        let b = json!({"qoderUsage":{"userQuota":{"total":300,"used":50}}});
+        let p = parse_usage(&b);
+        assert_eq!(p.plan, Some(250.0));
+        assert_eq!(p.plan_used, Some(50.0));
     }
 
     #[test]
     fn parse_usage_unrecognized_returns_all_none() {
-        let (plan, addon, total, packages) = parse_usage(&json!({"foo": "bar"}));
-        assert!(plan.is_none() && addon.is_none() && total.is_none() && packages.is_empty());
+        let p = parse_usage(&json!({"foo": "bar"}));
+        assert!(p.plan.is_none() && p.addon.is_none() && p.total.is_none() && p.packages.is_empty());
     }
 
     #[test]
