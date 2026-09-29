@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { CalendarClock, ShieldAlert } from 'lucide-react';
+import { CalendarClock, RefreshCw, ShieldAlert } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -25,8 +25,10 @@ export default function QoderSettings() {
   const [workPath, setWorkPath] = useState('');
   const [checkinHhmm, setCheckinHhmm] = useState('10:15');
   const [creditsHhmm, setCreditsHhmm] = useState('23:40');
+  const [refreshing, setRefreshing] = useState(false);
 
   const refresh = useCallback(async () => {
+    setRefreshing(true);
     try {
       const [qs, ts, e] = await Promise.all([
         api.qoder.settingsGet().catch(() => null),
@@ -38,6 +40,8 @@ export default function QoderSettings() {
       setEnv(e);
     } catch (err) {
       pushToast('error', `读取设置失败：${String(err)}`);
+    } finally {
+      setRefreshing(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -119,7 +123,15 @@ export default function QoderSettings() {
 
   return (
     <div className="animate-fade-in">
-      <PageHeader title="Qoder · 环境配置" desc="客户端路径 · 调度 · 自动签到 · 合规提示" />
+      <PageHeader
+        title="Qoder · 环境配置"
+        desc="客户端路径 · 调度 · 自动签到 · 合规提示"
+        actions={
+          <button className="btn-outline" disabled={refreshing} onClick={() => void refresh()}>
+            <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 重新检测
+          </button>
+        }
+      />
 
       {/* 合规提示（固定展示） */}
       <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
@@ -132,7 +144,10 @@ export default function QoderSettings() {
         </span>
       </div>
 
-      {/* 环境检测（对齐 BuddySettings 环境检测面板） */}
+      {/* 双列布局（对齐 BuddySettings：左列环境+路径，右列调度+签到） */}
+      <div className="grid items-start gap-4 lg:grid-cols-2">
+      {/* 左列：环境检测 + 客户端路径 */}
+      <div className="space-y-4">
       <div className="card p-4">
         <div className="mb-3 text-sm font-medium">环境检测</div>
         <div className="grid gap-3 lg:grid-cols-3">
@@ -167,7 +182,7 @@ export default function QoderSettings() {
       </div>
 
       {/* 客户端路径 */}
-      <div className="mt-4 card p-4">
+      <div className="card p-4">
         <div className="mb-3 text-sm font-medium">客户端路径（自动识别失败时人工指定）</div>
         <label className="block text-sm">
           <span className="mb-1 block text-xs text-slate-500">
@@ -209,8 +224,11 @@ export default function QoderSettings() {
         </label>
       </div>
 
-      {/* 调度（app settings） */}
-      <div className="mt-4 card p-4">
+      </div>
+
+      {/* 右列：调度 + 签到行为 */}
+      <div className="space-y-4">
+      <div className="card p-4">
         <div className="mb-3 flex items-center gap-2">
           <CalendarClock size={16} className="text-violet-500" />
           <span className="text-sm font-medium">调度（应用内调度器 + Windows 计划任务双轨）</span>
@@ -275,7 +293,7 @@ export default function QoderSettings() {
       </div>
 
       {/* 自动签到开关（qoder_settings） */}
-      <div className="mt-4 card p-4">
+      <div className="card p-4">
         <div className="mb-3 text-sm font-medium">签到行为</div>
         <div className="grid gap-3 lg:grid-cols-2">
           <label className="flex items-start gap-2 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
@@ -307,6 +325,8 @@ export default function QoderSettings() {
             </span>
           </label>
         </div>
+      </div>
+      </div>
       </div>
     </div>
   );

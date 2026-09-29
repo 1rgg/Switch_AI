@@ -17,6 +17,7 @@ mod common;
 mod credits;
 mod data_io;
 mod env_reset;
+mod groups;
 mod ide_store;
 mod oauth;
 
@@ -27,5 +28,6 @@ pub use common::*;
 pub use credits::*;
 pub use data_io::*;
 pub use env_reset::*;
+pub use groups::*;
 pub use ide_store::*;
 pub use oauth::*;

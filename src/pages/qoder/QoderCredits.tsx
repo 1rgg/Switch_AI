@@ -53,7 +53,15 @@ export default function QoderCredits() {
 
   return (
     <div className="animate-fade-in">
-      <PageHeader title="Qoder · 积分看板" desc="余额 / 积分包 / 趋势 · 官方 PAT 通道优先" />
+      <PageHeader
+        title="Qoder · 积分看板"
+        desc="余额 / 积分包 / 趋势 · 官方 PAT 通道优先"
+        actions={
+          <button className="btn-outline" disabled={refreshing} onClick={() => void refresh(true)}>
+            <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 强制刷新
+          </button>
+        }
+      />
 
       {credits?.stale && (
         <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
@@ -76,28 +84,23 @@ export default function QoderCredits() {
 
       {/* 各账号明细 */}
       <div className="mt-4 card p-4">
-        <div className="mb-3 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Coins size={16} className="text-violet-500" />
-            <span className="text-sm font-medium">账号明细</span>
-            {credits?.cached && !credits?.stale && <Badge tone="slate">缓存</Badge>}
-            {credits?.accounts.map((a) =>
-              a.source === 'pat' ? <Badge key={a.user_id} tone="green">PAT 通道</Badge> : a.source === 'client_token' ? <Badge key={a.user_id} tone="blue">客户端凭证</Badge> : null,
-            )}
-          </div>
-          <button className="btn-outline !px-3 !py-1 text-xs" disabled={refreshing} onClick={() => void refresh(true)}>
-            <RefreshCw size={13} className={refreshing ? 'animate-spin' : ''} /> 强制刷新
-          </button>
+        <div className="mb-3 flex items-center gap-2">
+          <Coins size={16} className="text-violet-500" />
+          <span className="text-sm font-medium">账号明细</span>
+          {credits?.cached && !credits?.stale && <Badge tone="slate">缓存</Badge>}
+          {credits?.accounts.map((a) =>
+            a.source === 'pat' ? <Badge key={a.user_id} tone="green">PAT 通道</Badge> : a.source === 'client_token' ? <Badge key={a.user_id} tone="blue">客户端凭证</Badge> : null,
+          )}
         </div>
         <div className="rounded-lg border border-slate-200 dark:border-zinc-700">
           <table className="w-full text-sm">
-            <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-zinc-900">
+            <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
               <tr>
-                <th className="px-3 py-1.5 text-left">账号</th>
-                <th className="px-3 py-1.5 text-right">Plan</th>
-                <th className="px-3 py-1.5 text-right">Add-on</th>
-                <th className="px-3 py-1.5 text-right">合计</th>
-                <th className="px-3 py-1.5 text-left">积分包 / 到期</th>
+                <th className="px-4 py-2 text-left">账号</th>
+                <th className="px-4 py-2 text-right">Plan</th>
+                <th className="px-4 py-2 text-right">Add-on</th>
+                <th className="px-4 py-2 text-right">合计</th>
+                <th className="px-4 py-2 text-left">积分包 / 到期</th>
               </tr>
             </thead>
             <tbody>
@@ -111,15 +114,15 @@ export default function QoderCredits() {
                 </tr>
               ) : (
                 credits.accounts.map((a) => (
-                  <tr key={a.user_id} className="border-t border-slate-100 dark:border-zinc-800">
-                    <td className="px-3 py-1.5">
+                  <tr key={a.user_id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
+                    <td className="px-4 py-3">
                       <div className="font-medium">{a.name}</div>
                       <div className="text-xs text-slate-400">{a.ok ? '' : a.message || '查询失败'}</div>
                     </td>
-                    <td className="px-3 py-1.5 text-right tabular-nums text-xs">{a.plan_credits ?? '—'}</td>
-                    <td className="px-3 py-1.5 text-right tabular-nums text-xs">{a.addon_credits ?? '—'}</td>
-                    <td className="px-3 py-1.5 text-right tabular-nums text-xs font-medium">{a.total ?? '—'}</td>
-                    <td className="px-3 py-1.5 text-xs text-slate-500">
+                    <td className="px-4 py-3 text-right tabular-nums text-xs">{a.plan_credits ?? '—'}</td>
+                    <td className="px-4 py-3 text-right tabular-nums text-xs">{a.addon_credits ?? '—'}</td>
+                    <td className="px-4 py-3 text-right tabular-nums text-xs font-medium">{a.total ?? '—'}</td>
+                    <td className="px-4 py-3 text-xs text-slate-500">
                       {a.packages.length === 0 ? (
                         <span className="text-slate-300 dark:text-zinc-600">—</span>
                       ) : (

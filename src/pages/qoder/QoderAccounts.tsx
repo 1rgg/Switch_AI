@@ -7,6 +7,9 @@ import {
   Download,
   ExternalLink,
   Fingerprint,
+  FolderCog,
+  HelpCircle,
+  History,
   KeyRound,
   Loader2,
   LogIn,
@@ -18,13 +21,18 @@ import {
   Trash2,
   Upload,
   UserPlus,
+  Users,
 } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import SwitchProgressPanel from '../../components/SwitchProgressPanel';
-import { Badge, Modal } from '../../components/ui';
+import { Badge, EmptyState, Modal } from '../../components/ui';
 import { api, type ProfileDoneEvent } from '../../lib/tauri';
+import { GroupSelect } from '../accounts/GroupSelect';
+import { GroupsModal } from '../accounts/GroupsModal';
+import { QoderHelpModal } from './HelpModal';
 import { useAppStore } from '../../store';
 import type {
+  GroupView,
   ProfileInfo,
   QoderAccountView,
   QoderCliStatus,
@@ -98,6 +106,12 @@ export default function QoderAccounts() {
   const switchingTo = useAppStore((s) => s.switchingTo);
   const [accounts, setAccounts] = useState<QoderAccountView[]>([]);
   const [loading, setLoading] = useState(true);
+  // 帮助弹框（对齐 BuddyAccounts leftExtra 帮助入口）
+  const [helpOpen, setHelpOpen] = useState(false);
+  // 账号分组（强加 Buddy 分组体系：chips 过滤 + GroupSelect 列 + 分组管理弹窗）
+  const [qoderGroups, setQoderGroups] = useState<GroupView[]>([]);
+  const [groupOpen, setGroupOpen] = useState(false);
+  const [filter, setFilter] = useState('all');
   // PAT 导入弹框
   const [showImport, setShowImport] = useState(false);
   const [patName, setPatName] = useState('');
@@ -188,8 +202,22 @@ export default function QoderAccounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 分组列表局部刷新（对齐 BuddyAccounts reloadGroups：不整表刷新）
+  const reloadGroups = useCallback(() => {
+    api.qoder.groups.list().then(setQoderGroups).catch(() => setQoderGroups([]));
+  }, []);
+
+  // 分组过滤（对齐 BuddyAccounts：全部 / 未分组 / 指定分组）
+  const filtered =
+    filter === 'all'
+      ? accounts
+      : filter === 'ungrouped'
+        ? accounts.filter((a) => !a.group_id)
+        : accounts.filter((a) => a.group_id === filter);
+
   useEffect(() => {
     void refresh();
+    reloadGroups();
     // CLI 状态只读桥（M4）：拉取失败静默置空，不打扰主列表
     api.qoder.cliStatus().then(setCliStatus).catch(() => setCliStatus(null));
     let disposed = false;
@@ -473,55 +501,57 @@ export default function QoderAccounts() {
 
   return (
     <div className="animate-fade-in">
-      <PageHeader title="Qoder · 账号管理" desc="全家桶账号池 · PAT / OAuth / IDE 存储三通道 · 快照切换（M3） · CLI 状态桥（M4）" />
-
-      {/* 切换进度面板（对齐 Trae/Buddy/Doubao 页，复用全局 switch-progress NDJSON 管线） */}
-      <SwitchProgressPanel />
-
-      <div className="card p-4">
-        <div className="mb-3 flex items-center justify-between">
-          <span className="text-sm font-medium">账号池（{accounts.length}）</span>
-          <div className="flex gap-2">
+      <PageHeader
+        title="Qoder · 账号管理"
+        desc="全家桶账号池 · PAT / OAuth / IDE 存储三通道 · 快照切换 · CLI 状态桥"
+        leftExtra={
+          <button
+            onClick={() => setHelpOpen(true)}
+            title="使用帮助"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-sky-100 text-sky-600 shadow-sm transition hover:bg-sky-200 hover:shadow dark:bg-sky-500/15 dark:text-sky-300 dark:hover:bg-sky-500/25"
+          >
+            <HelpCircle size={17} />
+          </button>
+        }
+        actions={
+          <>
+            <button onClick={() => void refresh()} className="btn-outline" disabled={loading}>
+              <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
+            </button>
             <button
-              className="btn-outline !px-3 !py-1 text-xs"
+              className="btn-outline"
               disabled={scanningIde || oauthRunning}
               onClick={() => void scanIde()}
               title="解密 IDE 本地存储（Local State → state.vscdb secret://）发现并导入当前登录账号"
             >
-              {scanningIde ? <Loader2 size={13} className="animate-spin" /> : <ScanSearch size={13} />} 扫描 IDE 登录态
+              {scanningIde ? <Loader2 size={15} className="animate-spin" /> : <ScanSearch size={15} />} 扫描 IDE 登录态
             </button>
             <button
-              className="btn-outline !px-3 !py-1 text-xs"
+              className="btn-outline"
               disabled={oauthRunning}
               onClick={() => void startOauth()}
               title="模拟客户端设备流：浏览器授权后自动获取 dt- 凭证入池"
             >
-              {oauthRunning ? <Loader2 size={13} className="animate-spin" /> : <KeyRound size={13} />} OAuth 登录
+              {oauthRunning ? <Loader2 size={15} className="animate-spin" /> : <KeyRound size={15} />} OAuth登录
             </button>
-            <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => setShowImport(true)}>
-              <UserPlus size={13} /> 导入 PAT
-            </button>
-            <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => {
-              setShowSnapshots(true);
-              void refreshSnapshots();
-            }}>
-              <Archive size={13} /> 快照管理
+            <button className="btn-outline" onClick={() => setShowImport(true)}>
+              <UserPlus size={15} /> 导入 PAT
             </button>
             <button
-              className="btn-outline !px-3 !py-1 text-xs"
+              className="btn-outline"
               disabled={accounts.length === 0 || exportBusy}
               onClick={() => setExportOpen(true)}
               title="导出账号池为 JSON（可选是否附带凭证副本）"
             >
-              <Download size={13} /> 导出账号
+              <Download size={15} /> 导出账号
             </button>
             <button
-              className="btn-outline !px-3 !py-1 text-xs"
+              className="btn-outline"
               disabled={importingBackup}
               onClick={() => importFileRef.current?.click()}
               title="导入账号池 JSON（uid 幂等合并，设备指纹仅在本地为空时补入）"
             >
-              {importingBackup ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />} 导入账号
+              {importingBackup ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />} 导入账号
             </button>
             <input
               ref={importFileRef}
@@ -535,37 +565,93 @@ export default function QoderAccounts() {
               }}
             />
             <button
-              className="btn-outline !px-3 !py-1 text-xs !text-rose-600 hover:!border-rose-300"
+              className="btn-outline"
+              onClick={() => {
+                setShowSnapshots(true);
+                void refreshSnapshots();
+              }}
+            >
+              <History size={15} /> 快照管理
+            </button>
+            <button
+              className="btn-outline !text-rose-600 hover:!border-rose-300"
               disabled={resetLoading || resetBusy}
               onClick={() => void openEnvReset()}
               title="清除本机 Qoder CN 认证残留（vscdb / storage.json / 机器标识 / CLI 登录态等 8 项）"
             >
-              {resetLoading ? <Loader2 size={13} className="animate-spin" /> : <ShieldAlert size={13} />} 环境重置
+              {resetLoading ? <Loader2 size={15} className="animate-spin" /> : <ShieldAlert size={15} />} 环境重置
             </button>
-          </div>
-        </div>
+            <button onClick={() => setGroupOpen(true)} className="btn-outline" title="管理账号分组">
+              <FolderCog size={15} /> 分组管理
+            </button>
+          </>
+        }
+      />
 
-        <div className="rounded-lg border border-slate-200 dark:border-zinc-700">
-          <table className="w-full text-sm">
-            <thead className="bg-slate-50 text-xs text-slate-500 dark:bg-zinc-900">
-              <tr>
-                <th className="px-3 py-1.5 text-left">账号</th>
-                <th className="px-3 py-1.5 text-left">套餐</th>
-                <th className="px-3 py-1.5 text-left">凭证来源</th>
-                <th className="px-3 py-1.5 text-left">凭证状态</th>
-                <th className="px-3 py-1.5 text-left">设备指纹</th>
-                <th className="px-3 py-1.5 text-right">积分余额</th>
-                <th className="px-3 py-1.5 text-right">操作</th>
-              </tr>
-            </thead>
+      {/* 切换进度面板（对齐 Trae/Buddy/Doubao 页，复用全局 switch-progress NDJSON 管线） */}
+      <SwitchProgressPanel />
+
+      {/* 分组过滤 chips（对齐 BuddyAccounts：全部/未分组/各分组带 count 与色点） */}
+      {accounts.length > 0 && (
+        <div className="mb-3 mt-5 flex flex-wrap items-center gap-2 text-sm">
+          <button
+            onClick={() => setFilter('all')}
+            className={`chip border ${filter === 'all' ? 'border-brand-500 text-brand-600' : 'border-slate-300 text-slate-500'}`}
+          >
+            全部 ({accounts.length})
+          </button>
+          <button
+            onClick={() => setFilter('ungrouped')}
+            className={`chip border ${filter === 'ungrouped' ? 'border-brand-500 text-brand-600' : 'border-slate-300 text-slate-500'}`}
+          >
+            未分组 ({accounts.filter((a) => !a.group_id).length})
+          </button>
+          {qoderGroups.map((g) => (
+            <button
+              key={g.id}
+              onClick={() => setFilter(g.id)}
+              className={`chip border ${filter === g.id ? 'border-brand-500 text-brand-600' : 'border-slate-300 text-slate-500'}`}
+              style={{ borderColor: filter === g.id ? g.color : undefined }}
+            >
+              <span className="inline-block h-2 w-2 rounded-full" style={{ background: g.color }} />
+              {g.name} ({g.count})
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* 账号池列表（对齐 BuddyAccounts：无账号 EmptyState，有账号全宽卡片表格） */}
+      {accounts.length === 0 ? (
+        <div className="mt-5">
+          <EmptyState
+            icon={<Users size={26} />}
+            title="暂无 Qoder 账号"
+            hint="三种方式入池：导入 PAT（qoder.com.cn → Integrations 创建）/ OAuth 设备流登录 / 扫描 IDE 登录态（本机已登录 Qoder CN IDE 时一键导入）。"
+          />
+        </div>
+      ) : (
+      <div className="mt-5 card overflow-x-auto">
+        <table className="w-full min-w-[980px] text-sm">
+            <thead className="bg-slate-50 text-xs uppercase text-slate-500 dark:bg-zinc-900">
+                <tr>
+                  <th className="px-4 py-2 text-left">账号</th>
+                  <th className="px-4 py-2 text-left">分组</th>
+                  <th className="px-4 py-2 text-left">套餐</th>
+                  <th className="px-4 py-2 text-left">凭证来源</th>
+                  <th className="px-4 py-2 text-left">凭证状态</th>
+                  <th className="px-4 py-2 text-left">设备指纹</th>
+                  <th className="px-4 py-2 text-right">积分余额</th>
+                  <th className="px-4 py-2 text-right">操作</th>
+                </tr>
+              </thead>
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={7} className="px-3 py-4 text-center text-xs text-slate-400">加载中…</td>
+                  <td colSpan={8} className="px-3 py-4 text-center text-xs text-slate-400">加载中…</td>
                 </tr>
               ) : accounts.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-3 py-6 text-center text-xs text-slate-400">
+                  <td colSpan={8} className="px-3 py-6 text-center text-xs text-slate-400">
                     暂无账号。可通过右上角三种方式入池：
                     <br />
                     <span className="text-slate-300 dark:text-zinc-600">
@@ -574,45 +660,57 @@ export default function QoderAccounts() {
                   </td>
                 </tr>
               ) : (
-                accounts.map((a) => (
-                  <tr key={a.id} className="border-t border-slate-100 dark:border-zinc-800">
-                    <td className="px-3 py-1.5">
+                filtered.map((a) => (
+                  <tr key={a.id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
+                    <td className="px-4 py-3">
                       <div className="font-medium">{a.nickname || a.id}</div>
                       <div className="text-xs text-slate-400">{[a.uid, a.note].filter(Boolean).join(' · ') || a.id}</div>
                     </td>
-                    <td className="px-3 py-1.5 text-xs text-slate-500">
+                    <td className="px-4 py-3">
+                      <GroupSelect
+                        value={a.group_id || null}
+                        groups={qoderGroups}
+                        onChange={(gid) => {
+                          void api.qoder.accountMove(a.id, gid).then(() => {
+                            setAccounts((prev) => prev.map((x) => (x.id === a.id ? { ...x, group_id: gid ?? '' } : x)));
+                            reloadGroups();
+                          }).catch((err) => pushToast('error', `分组调整失败：${String(err)}`));
+                        }}
+                      />
+                    </td>
+                    <td className="px-4 py-3 text-xs text-slate-500">
                       {a.plan ? <span className="font-medium text-sky-600 dark:text-sky-400">{a.plan}</span> : <span className="text-slate-300 dark:text-zinc-600">—</span>}
                     </td>
-                    <td className="px-3 py-1.5">
+                    <td className="px-4 py-3">
                       <Badge tone={a.credential_source === 'pat' ? 'green' : 'slate'}>
                         {a.credential_source || '—'}
                       </Badge>
                     </td>
-                    <td className="px-3 py-1.5"><TokenBadge a={a} /></td>
-                    <td className="px-3 py-1.5"><FingerprintBadge a={a} onOpen={setFpViewing} /></td>
-                    <td className="px-3 py-1.5 text-right tabular-nums text-xs">
+                    <td className="px-4 py-3"><TokenBadge a={a} /></td>
+                    <td className="px-4 py-3"><FingerprintBadge a={a} onOpen={setFpViewing} /></td>
+                    <td className="px-4 py-3 text-right tabular-nums text-xs">
                       {a.credits_balance != null ? a.credits_balance.toLocaleString() : '-'}
                     </td>
-                    <td className="px-3 py-1.5 text-right">
+                    <td className="px-4 py-3 text-right">
                       <div className="flex justify-end gap-1">
                         <button
-                          className="btn-ghost h-7 w-7 !p-0 text-emerald-600"
+                          className="btn-ghost !p-2 text-emerald-600"
                           title="切换到此账号（备份当前 IDE 登录态 → 恢复该账号快照并注入绑定指纹）"
                           disabled={busy}
                           onClick={() => void switchTo(a.id, 'Qoder')}
                         >
-                          {switchingTo === a.id ? <Loader2 size={13} className="animate-spin" /> : <LogIn size={13} />}
+                          {switchingTo === a.id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
                         </button>
                         <button
-                          className="btn-ghost h-7 w-7 !p-0"
+                          className="btn-ghost !p-2"
                           title="备份当前 IDE 登录态到该账号槽位"
                           disabled={snapBusy != null || busy}
                           onClick={() => void backupSnapshot(a)}
                         >
-                          {snapBusy === a.id ? <Loader2 size={13} className="animate-spin" /> : <DatabaseBackup size={13} />}
+                          {snapBusy === a.id ? <Loader2 size={14} className="animate-spin" /> : <DatabaseBackup size={14} />}
                         </button>
                         <button
-                          className="btn-ghost h-7 w-7 !p-0"
+                          className="btn-ghost !p-2"
                           title="编辑名称/备注"
                           onClick={() => {
                             setEditing(a);
@@ -620,14 +718,14 @@ export default function QoderAccounts() {
                             setEditNote(a.note);
                           }}
                         >
-                          <Pencil size={13} />
+                          <Pencil size={14} />
                         </button>
                         <button
-                          className="btn-ghost h-7 w-7 !p-0 text-rose-500"
+                          className="btn-ghost !p-2 text-rose-500"
                           title="移除账号"
                           onClick={() => removeAccount(a)}
                         >
-                          <Trash2 size={13} />
+                          <Trash2 size={14} />
                         </button>
                       </div>
                     </td>
@@ -637,10 +735,11 @@ export default function QoderAccounts() {
             </tbody>
           </table>
         </div>
+      )}
 
-        {/* M4 CLI 状态桥：~/.qoder-cn/.qoder-app-status.json 白名单只读透传（无凭证，绝不写回） */}
-        {cliStatus?.available ? (
-          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
+      {/* M4 CLI 状态桥：~/.qoder-cn/.qoder-app-status.json 白名单只读透传（无凭证，绝不写回） */}
+      {cliStatus?.available ? (
+        <div className="mt-4 flex flex-wrap items-center gap-2 text-xs text-slate-400">
             <Terminal size={13} className="text-slate-500" />
             <Badge tone={cliStatus.logged_in ? 'green' : 'slate'}>
               {cliStatus.logged_in ? `CLI 已登录${cliStatus.name ? ` · ${cliStatus.name}` : ''}` : 'CLI 未登录'}
@@ -650,9 +749,9 @@ export default function QoderAccounts() {
             {cliStatus.snapshot_at && (
               <span>状态快照 {cliStatus.snapshot_at.replace('T', ' ').slice(0, 19)} UTC</span>
             )}
-          </div>
-        ) : (
-          <div className="mt-3 flex items-center gap-2 text-xs text-slate-500">
+        </div>
+      ) : (
+          <div className="mt-4 flex items-center gap-2 text-xs text-slate-500">
             <Terminal size={13} />
             <span>{cliStatus?.reason || '未检测到 Qoder CLI'}</span>
           </div>
@@ -664,7 +763,6 @@ export default function QoderAccounts() {
           快照切换：恢复目标账号登录态快照并自动注入其绑定设备指纹（§5.10），支持多账号并存。
           凭证由调度器每 6 小时兜底刷新（M4）；CLI 登录态（~/.qoder-cn）仅只读展示，无独立凭证通道（R-3）。
         </p>
-      </div>
 
       {/* OAuth 进度弹框 */}
       <Modal
@@ -674,7 +772,7 @@ export default function QoderAccounts() {
         }}
         title="Qoder OAuth 登录"
         footer={
-          <button className="btn-ghost" disabled={oauthRunning} onClick={() => setShowOauth(false)}>
+          <button className="btn-outline" disabled={oauthRunning} onClick={() => setShowOauth(false)}>
             {oauthRunning ? '授权进行中…' : '关闭'}
           </button>
         }
@@ -712,13 +810,13 @@ export default function QoderAccounts() {
         footer={
           <div className="flex w-full items-center justify-between">
             <button
-              className="btn-ghost inline-flex items-center text-xs"
+              className="btn-outline inline-flex items-center text-xs"
               disabled={snapBusy != null}
               onClick={() => void refreshSnapshots()}
             >
               <RefreshCw size={12} className="mr-1" /> 刷新
             </button>
-            <button className="btn-ghost" disabled={snapBusy != null} onClick={() => setShowSnapshots(false)}>
+            <button className="btn-outline" disabled={snapBusy != null} onClick={() => setShowSnapshots(false)}>
               {snapBusy ? '操作进行中…' : '关闭'}
             </button>
           </div>
@@ -846,7 +944,7 @@ export default function QoderAccounts() {
         title="导入 Qoder PAT"
         footer={
           <>
-            <button className="btn-ghost" onClick={() => setShowImport(false)}>取消</button>
+            <button className="btn-outline" onClick={() => setShowImport(false)}>取消</button>
             <button className="btn-primary" disabled={importing} onClick={() => void importPat()}>
               {importing ? '导入中…' : '导入'}
             </button>
@@ -892,7 +990,7 @@ export default function QoderAccounts() {
         onClose={() => setFpViewing(null)}
         title={`设备指纹 · ${fpViewing?.nickname || fpViewing?.id || ''}`}
         footer={
-          <button className="btn-ghost" onClick={() => setFpViewing(null)}>关闭</button>
+          <button className="btn-outline" onClick={() => setFpViewing(null)}>关闭</button>
         }
       >
         {fpViewing && (
@@ -938,7 +1036,7 @@ export default function QoderAccounts() {
         title="编辑账号"
         footer={
           <>
-            <button className="btn-ghost" onClick={() => setEditing(null)}>取消</button>
+            <button className="btn-outline" onClick={() => setEditing(null)}>取消</button>
             <button className="btn-primary" disabled={editBusy} onClick={() => void saveEdit()}>
               {editBusy ? '保存中…' : '保存'}
             </button>
@@ -966,7 +1064,7 @@ export default function QoderAccounts() {
         title="导出 Qoder 账号池"
         footer={
           <>
-            <button className="btn-ghost" disabled={exportBusy} onClick={() => setExportOpen(false)}>
+            <button className="btn-outline" disabled={exportBusy} onClick={() => setExportOpen(false)}>
               取消
             </button>
             <button className="btn-primary" disabled={exportBusy} onClick={() => confirmExport()}>
@@ -1040,12 +1138,12 @@ export default function QoderAccounts() {
         title="Qoder 环境重置"
         footer={
           resetResults ? (
-            <button className="btn-ghost" disabled={resetBusy} onClick={() => setResetOpen(false)}>
+            <button className="btn-outline" disabled={resetBusy} onClick={() => setResetOpen(false)}>
               关闭
             </button>
           ) : resetConfirming ? (
             <>
-              <button className="btn-ghost" disabled={resetBusy} onClick={() => setResetConfirming(false)}>
+              <button className="btn-outline" disabled={resetBusy} onClick={() => setResetConfirming(false)}>
                 再想想
               </button>
               <button
@@ -1058,7 +1156,7 @@ export default function QoderAccounts() {
             </>
           ) : (
             <>
-              <button className="btn-ghost" disabled={resetBusy} onClick={() => setResetOpen(false)}>
+              <button className="btn-outline" disabled={resetBusy} onClick={() => setResetOpen(false)}>
                 取消
               </button>
               <button
@@ -1132,6 +1230,35 @@ export default function QoderAccounts() {
           )}
         </div>
       </Modal>
+
+      {/* 分组管理弹窗（对齐 BuddyAccounts：复用 GroupsModal，强加 Buddy 分组体系） */}
+      <GroupsModal
+        open={groupOpen}
+        onClose={() => setGroupOpen(false)}
+        groups={qoderGroups}
+        onCreate={async (name, color) => {
+          await api.qoder.groups.create(name, color);
+          reloadGroups();
+        }}
+        onRename={async (id, name) => {
+          await api.qoder.groups.update(id, { name });
+          reloadGroups();
+        }}
+        onRecolor={async (id, color) => {
+          await api.qoder.groups.update(id, { color });
+          reloadGroups();
+        }}
+        onDelete={async (id) => {
+          await api.qoder.groups.remove(id);
+          // 组内账号本地同步回落「未分组」（后端 with_pool_mut 已置空，前端对齐）
+          setAccounts((prev) => prev.map((x) => (x.group_id === id ? { ...x, group_id: '' } : x)));
+          if (filter === id) setFilter('all');
+          reloadGroups();
+        }}
+      />
+
+      {/* 帮助弹窗（对齐 BuddyAccounts 页头帮助入口） */}
+      <QoderHelpModal open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
   );
 }

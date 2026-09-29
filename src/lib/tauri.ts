@@ -416,6 +416,22 @@ export const api = {
     accountSave: (userId: string, name?: string, note?: string) =>
       invoke('qoder_account_save', { userId, name: name ?? null, note: note ?? null }),
     accountRemove: (userId: string) => invoke('qoder_account_remove', { userId }),
+    /** 移动账号到分组（groupId=null 回落「未分组」；对齐 Buddy 账号分组） */
+    accountMove: (userId: string, groupId: string | null) =>
+      invoke('qoder_account_move', { userId, groupId: groupId ?? null }),
+    groups: {
+      list: () => invoke<GroupView[]>('qoder_groups_list'),
+      create: (name: string, color: string) =>
+        invoke<string>('qoder_groups_create', { name, color }),
+      update: (id: string, patch: { name?: string; color?: string; order?: number }) =>
+        invoke('qoder_groups_update', {
+          id,
+          name: patch.name ?? null,
+          color: patch.color ?? null,
+          order: patch.order ?? null,
+        }),
+      remove: (id: string) => invoke('qoder_groups_remove', { id }),
+    },
     /** PAT 手工导入（M1 最可靠凭证通道；qoder.com.cn/account/integrations 自建，pt- 前缀）。pat 后端必填 */
     accountImportPat: (name: string | undefined, pat: string) =>
       invoke<QoderAccountView>('qoder_account_import_pat', { name: name ?? null, pat }),
