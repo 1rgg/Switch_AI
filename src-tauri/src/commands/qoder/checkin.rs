@@ -275,12 +275,16 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
         );
         fs_utils::app_log(&state2.data_dir, &msg);
         let failed = done["failed"].as_i64().unwrap_or(0);
-        if failed > 0 {
+        // empty_campaigns（活动未开始/不可用）非用户可操作失败：重试也无解，仅记日志
+        // 不推送打扰（审查 L；done.failed_empty_campaigns 由 run_checkin_round 单列）
+        let failed_actionable =
+            failed - done["failed_empty_campaigns"].as_i64().unwrap_or(0);
+        if failed_actionable > 0 {
             crate::commands::workbuddy::push_notify(
                 Some(&app2),
                 &state2.data_dir,
                 "Qoder 签到提醒",
-                &format!("启动补签有 {failed} 个账号失败，请在 Qoder 签到页查看"),
+                &format!("启动补签有 {failed_actionable} 个账号失败，请在 Qoder 签到页查看"),
                 crate::notify::NotifyEvent::TaskFail,
             );
         }

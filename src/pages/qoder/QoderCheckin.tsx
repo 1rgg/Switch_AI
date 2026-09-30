@@ -126,10 +126,6 @@ export default function QoderCheckin() {
         setRunning(false);
         void refresh();
         pushToast(parsed.failed > 0 ? 'warn' : 'success', `Qoder 签到完成：成功 ${parsed.ok}，已签 ${parsed.already}，失败 ${parsed.failed}`);
-      } else if ('index' in parsed && parsed.index === 0 && parsed.status === 'skip') {
-        // 合规提示事件（index=0）：多账号未显式开启时的跳过说明；
-        // index===0 守卫防 per 账号 skip 行（index>0）被误吞进 notice 不上屏
-        setNotice(parsed.message ?? null);
       } else if ('index' in parsed && parsed.index != null && parsed.index > 0) {
         const line = parsed as QoderAccountLine;
         const reward = scalarNum(line.reward);

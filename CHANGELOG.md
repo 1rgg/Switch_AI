@@ -4,6 +4,30 @@
 
 ---
 
+## [未发布] · Qoder 模块全面审查修复批
+
+> 范围：Qoder 模块（29 命令 + 6 后台任务 + 6 前端页）整体审查后的全量修复；功能行为不变，correctness 与健壮性加固。
+
+### 修复
+
+- **[P1] 并发刷新丢 token（高危）**：签到/积分/定时兜底/401 自愈多通道并发触发同一账号 `ensure_fresh` 时，两线程可能同时用旧凭证换新 token，后落库者覆盖先落库者（被覆盖方被迫重登）。现加三层防护：① 每账号刷新互斥锁（`refresh_lock_for`，持锁重读即二次检查，他人已刷新直接复用不再发网络请求）；② `save_token_store` 落库前重新 load DB 最新表做仅目标行替换的行级合并（把跨进程 last-writer-wins 覆盖窗口从 vault 全程收窄到数毫秒）；③ 双写版本闸门保持。
+- **[P2] 签到失败无重试**：调度器/CLI 的 `qoder-checkin` 此前无论成败恒返 Ok，暂态失败错过调度器 30 分钟冷却重试；现在 done.failed>0 时返 Err 交既有冷却机制自愈（scheduler.rs 与 tasks/mod.rs 双路同步）。
+- **[P2] jobToken 探测顺序**：PAT→作业令牌换取此前先试两个未证实通道（/api/v1/jobToken/exchange）再试抓包实证的 `/api/v1/me/jobToken`，有效通道每次多耗两次无效请求；已调整为已证实通道优先。
+- **[P2] 积分缓存污染**：`qoder_credits_fetch` 全量查询部分失败时仍写 10min 缓存，失败账号的空行污染缓存命中路径；现在仅全部成功落缓存（对齐快照落库门禁）。
+- **[P3] 签到与 OAuth 加固一批**：OAuth poll 成功响应增加 nonce 回验（响应不属于本会话即拒绝，防会话混淆）；claim URL 的 campaign_id 路径段白名单（只放行 `[A-Za-z0-9_-]`，防服务端异常 id 改变请求路径语义）；凭证已过期且无刷新令牌的账号前置拦截（不再发必败请求）；`expires_at` 域钳制 (0, now+10y]（防脏数据整数溢出/千年到期展示）。
+- **[P3] claim 间隔抖动随机化**：1~3s 抖动原为时间戳取模（可预测、同毫秒序列相同），改为 SystemTime 纳秒 + 地址熵播种的 xorshift64*（零新依赖）。
+- **[P3] 顺带修正**：refresh_token 过期时刻随设备流/refresh 响应解析落库（`refresh_expires_at_ms`）；`remove_token` 改为 DB 落库成功后才清 vault（防「库里还在、密钥已删」悬挂态）；usage `total-used` 推导余额钳 0（防负余额展示）；启动补签推送排除 empty_campaigns 类不可操作失败（done 事件新增 `failed_empty_campaigns` 单列计数）；`qoder_accounts_list` 改 async（内部磁盘 IO+RNG 不卡 UI 线程）；Qoder 分组创建重名校验；到期日测试断言不依赖本地时区；前端删除后端从不发射的 index=0 skip 死分支；jt- 前缀凭证导入同时写入 pat 字段（确保 24h 到期后 PAT 重换通道生效）。
+
+### 文档
+
+- AGENT.md §5 命令契约表新增 Qoder 段（29 命令一览）+ §5.4 Qoder 约定小节（凭证三前缀/存储红线/并发三层防护/设备指纹/调度三任务）+ §6 事件表补 `qoder-checkin-progress`/`qoder-oauth-progress`/`qoder-oauth-done` + §7 数据文件补 qoder_* 表与 profiles_qoder 目录。
+
+### 测试
+
+- cargo 单测全绿（新增 nonce 回验、refresh_expires_at 解析回归）；`tsc --noEmit` 全绿。
+
+---
+
 ## [3.6.4] · 2026-09-28 · API 网关流式断连检测 + 后台动作终态防护 + Issue #41/#44~#46 修复批
 
 > 范围：自 [3.6.3]（commit 8665e4c）以来的全部变更。

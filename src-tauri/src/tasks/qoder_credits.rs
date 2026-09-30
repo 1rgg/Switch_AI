@@ -84,8 +84,10 @@ fn deep_balance_dig(v: &Value, depth: usize) -> Option<f64> {
 fn quota_pair(q: Option<&Value>) -> (Option<f64>, Option<f64>) {
     let Some(q) = q else { return (None, None) };
     let used = num_or_none(q.get("used"));
+    // total-used 推导路径钳 0（审查 L-负余额）：服务端 used>total 的脏数据会让
+    // 推导 remaining 为负，余额看板出现「负积分」误导用户
     let remaining = num_or_none(q.get("remaining"))
-        .or_else(|| num_or_none(q.get("total")).map(|t| t - used.unwrap_or(0.0)));
+        .or_else(|| num_or_none(q.get("total")).map(|t| (t - used.unwrap_or(0.0)).max(0.0)));
     (remaining, used)
 }
 
@@ -420,7 +422,11 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
         "total_balance": total_balance,
         "fetched_at_ms": now_ms,
     });
-    if user_id.is_none() {
+    // 缓存写入门禁对齐快照（381 行）：仅「全部成功」落缓存（审查 M-3）。
+    // 原条件 ok_count>0：部分失败的行（fail 明细）进缓存后，TTL 10 分钟内命中路径
+    // 返回污染结果（失败账号余额显示为 null/旧值且 cached=true 掩盖暂态错误）；
+    // 部分失败不写缓存，下次查询自然重拉（暂态失败自愈）
+    if user_id.is_none() && ok_count == rows.len() {
         let _ = db.kv_set("qoder_credits_cache", &out);
     }
     Ok(out)
@@ -457,10 +463,13 @@ mod tests {
         assert_eq!(p.addon, Some(100.0));
         assert_eq!(p.addon_used, Some(0.0));
         assert_eq!(p.total, Some(400.0));
-        assert_eq!(p.plan_expires_at, "2026-10-11");
+        // 到期日断言用 ms_to_date 同函数推导（审查 L-时区：写死日期在非 UTC+8
+        // 时区的机器上会因本地化转换而翻转失败；此处验证解析链路而非具体日期）
+        let expected_date = ms_to_date(1791673619906);
+        assert_eq!(p.plan_expires_at, expected_date);
         assert_eq!(p.packages.len(), 1);
         assert_eq!(p.packages[0]["source"], json!("addon"));
-        assert_eq!(p.packages[0]["expire_at"], json!("2026-10-11"));
+        assert_eq!(p.packages[0]["expire_at"], json!(expected_date));
     }
 
     #[test]

@@ -92,7 +92,19 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         // Qoder 每日签到（F-80；schtasks 直调 + 应用内调度器共用；10:15 单次覆盖双活动）
         "qoder-checkin" => {
             let opts = qoder_checkin::QoderCheckinOpts::daily();
-            Ok(qoder_checkin::run_checkin_round(state, &opts, &mut print_progress))
+            let done = qoder_checkin::run_checkin_round(state, &opts, &mut print_progress);
+            // 审查 M-1：存在失败账号时返 Err，让调度器既有 30 分钟冷却重试生效
+            //（暂态网络/服务端失败可自行恢复；empty_campaigns 随重试覆盖活动延迟上线场景）
+            let failed = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            if failed > 0 {
+                let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                Err(format!(
+                    "Qoder 签到：{ok} 成功 / {already} 已领 / {failed} 失败（30 分钟后自动重试）"
+                ))
+            } else {
+                Ok(done)
+            }
         }
         // Qoder 积分快照（调度器/CLI 共用；空池自然空转）
         "qoder-credits-snapshot" => qoder_credits::run_snapshot_task(state),

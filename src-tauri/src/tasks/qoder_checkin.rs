@@ -84,10 +84,28 @@ fn num_or_none(v: Option<&Value>) -> Option<f64> {
     }
 }
 
-/// claim 间隔抖动（1~3s，时间源派生；ureq 同步请求下线程 sleep）
+/// claim 间隔抖动（1~3s；审查 L-jitter：原时间戳取模可预测且同毫秒调用序列相同，
+/// 改为 SystemTime 纳秒 + 栈地址熵播种的 xorshift64*，跨次调用链式推进——
+/// 风控抖动仅需不可预测性而非密码学强度，不引新依赖）
 fn jitter_sleep() {
-    let now = chrono::Utc::now().timestamp_millis();
-    let ms = 1000 + (now % 2000).unsigned_abs();
+    static STATE: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if *s == 0 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() ^ u64::from(d.subsec_nanos()))
+            .unwrap_or(0x9E37_79B9_7F4A_7C15);
+        // 地址熵：ASLR 下每次进程启动不同；|1 保证非零（xorshift 零态吸收）
+        let addr = std::ptr::from_ref::<std::sync::Mutex<u64>>(&STATE) as u64;
+        *s = (nanos ^ addr.rotate_left(17)) | 1;
+    }
+    let mut x = *s;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *s = x;
+    let ms = 1000 + x.wrapping_mul(0x2545_F491_4F6C_DD1D) % 2000;
     std::thread::sleep(std::time::Duration::from_millis(ms));
 }
 
@@ -231,6 +249,19 @@ fn claim_one(
     if campaign_id.is_empty() {
         return ("fail".into(), "campaign 缺少 campaignId".into(), None);
     }
+    // campaign_id path 段白名单（审查 L-URL 转义：id 来自服务端响应，恶意/异常值
+    // 携带 / ? # 等字符会改变请求路径语义）。项目无 URL 编码依赖，按「只放行
+    // [A-Za-z0-9_-] 否则拒绝该活动」处理——合法 id（UUID/短横线串）不受影响
+    if !campaign_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return (
+            "fail".into(),
+            format!("campaignId 含非法字符，已拒绝（len={}）", campaign_id.len()),
+            None,
+        );
+    }
     // 奖励数额以接口返回为准（campaigns.benefit.amount 优先；claim 响应 benefit.amount 兜底——
     // R-9 抓包实测：claim 成功响应顶层含完整 benefit{kind,amount,validity}）。
     // 显式路径取值（dig 为候选键语义，不按路径下钻）
@@ -320,6 +351,12 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
     if note == "pat_rejected" {
         return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
                        "message": "PAT 校验失败（无效或已吊销）：请到 qoder.com.cn/account/integrations 重新创建并导入" });
+    }
+    // 前置拦截（审查 L）：凭证已过期且无刷新令牌（expired_needs_relogin）时，本轮
+    // 请求与 401 自愈都注定失败——直接 fail 跳过，省一次必败网络请求
+    if note == "expired_needs_relogin" {
+        return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
+                       "message": "凭证已过期且无刷新令牌，需重新登录或重新导入 PAT" });
     }
     if refreshed {
         qoder_common::sync_pool_expiry(state, &aid, &creds);
@@ -503,7 +540,21 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
     let ok = events.iter().filter(|e| e["status"] == "success").count();
     let already = events.iter().filter(|e| e["status"] == "already").count();
     let failed = events.len() - ok - already;
-    let done = json!({"type": "done", "ok": ok, "already": already, "failed": failed});
+    // empty_campaigns 单列（审查 L-empty_campaigns）：活动未开始/不可用属非用户可操作
+    // 失败，启动补签推送按 failed - failed_empty_campaigns 判定，避免无效打扰
+    let failed_empty_campaigns = events
+        .iter()
+        .filter(|e| {
+            e["status"] == "fail"
+                && e.get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.starts_with("empty_campaigns"))
+        })
+        .count();
+    let done = json!({
+        "type": "done", "ok": ok, "already": already, "failed": failed,
+        "failed_empty_campaigns": failed_empty_campaigns,
+    });
     emit(&done);
     append_results(state, &events);
     done

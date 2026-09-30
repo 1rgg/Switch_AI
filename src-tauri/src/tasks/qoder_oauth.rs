@@ -87,7 +87,16 @@ pub fn poll_once(agent: &ureq::Agent, flow: &DeviceFlow) -> (u16, Option<Value>)
 
 /// 轮询成功响应 → (凭证, uid)。宽容解析：token/accessToken 候选，
 /// expires_in 毫秒级归一（2591999999 ≈ 30d）。
-pub fn parse_poll_success(body: &Value) -> Option<(QoderCreds, String)> {
+/// nonce 回验（审查 L-防会话混淆）：响应 nonce 与本会话 flow.nonce 必须一致——
+/// poll 端点按 nonce 定位授权会话，响应携带其他会话的 token 即为异常（结构变更/
+/// 中间人替换），一律拒绝。同时解析 refresh_token_expires_in 落库（≈360d，审查 L-RT）。
+pub fn parse_poll_success(body: &Value, expected_nonce: &str) -> Option<(QoderCreds, String)> {
+    let resp_nonce = fs_utils::dig(body, &["nonce"])
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if resp_nonce != expected_nonce {
+        return None;
+    }
     let token = fs_utils::dig(body, &["token", "accessToken", "access_token"])
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -107,6 +116,12 @@ pub fn parse_poll_success(body: &Value) -> Option<(QoderCreds, String)> {
             v.as_i64().or_else(|| v.as_str()?.trim().parse::<i64>().ok())
         })
         .map(|e| now_ms + qoder_common::normalize_expires_in(e));
+    let refresh_expires_at_ms = fs_utils::dig(
+        body,
+        &["refresh_token_expires_in", "refreshTokenExpiresIn"],
+    )
+    .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse::<i64>().ok()))
+    .map(|e| now_ms + qoder_common::normalize_expires_in(e));
     let refresh_token = fs_utils::dig(body, &["refresh_token", "refreshToken"])
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -116,6 +131,7 @@ pub fn parse_poll_success(body: &Value) -> Option<(QoderCreds, String)> {
             access_token: token,
             refresh_token,
             expires_at_ms,
+            refresh_expires_at_ms,
             kind: "client".into(),
             uid: uid.clone(),
             ..Default::default()
@@ -159,7 +175,7 @@ mod tests {
             r#"{"id":"01a0e03b-5f90-73b8-958e-443488ccf81e","token":"dt-placeholder","user_id":"01a0dff8-cc47-7b64-bd6d-d9cb2aea6792","code_challenge":"kiGczYiWCRH2Csra26Fx4NlhHp2n2CLT8QhMD678dqQ","code_challenge_method":"S256","nonce":"8872dcb1-d9c6-4453-bfb6-3bcbe9b0500b","expires_at":"2026-10-27T00:19:42Z","refresh_token_id":"01a0e03b-5f8f-7e4c-b112-1de3f25908cd","created_at":"2026-09-27T00:19:42Z","updated_at":"2026-09-27T00:19:42Z","refresh_token":"rt-placeholder","expires_in":2591999999,"refresh_token_expires_in":31103999999,"refresh_token_expires_at":"2027-09-22T00:19:42Z"}"#,
         )
         .unwrap();
-        let (creds, uid) = parse_poll_success(&body).unwrap();
+        let (creds, uid) = parse_poll_success(&body, "8872dcb1-d9c6-4453-bfb6-3bcbe9b0500b").unwrap();
         assert_eq!(creds.access_token, "dt-placeholder");
         assert_eq!(creds.kind, "client");
         assert_eq!(uid, "01a0dff8-cc47-7b64-bd6d-d9cb2aea6792");
@@ -167,12 +183,26 @@ mod tests {
         let now = chrono::Utc::now().timestamp_millis();
         let days = (creds.expires_at_ms.unwrap() - now) as f64 / 86_400_000.0;
         assert!((29.0..=31.0).contains(&days));
+        // refresh_token_expires_in=31103999999 ms ≈360 天（审查 L-RT 持久化）
+        let rt_days = (creds.refresh_expires_at_ms.unwrap() - now) as f64 / 86_400_000.0;
+        assert!((350.0..=370.0).contains(&rt_days));
     }
 
     #[test]
     fn parse_poll_success_rejects_pending_shape() {
         let body: Value =
             serde_json::from_str(r#"{"errorCode":"NotFound","errorMessage":"Not found"}"#).unwrap();
-        assert!(parse_poll_success(&body).is_none());
+        assert!(parse_poll_success(&body, "n").is_none());
+    }
+
+    /// nonce 回验（审查 L）：响应 nonce 与本会话不一致 → 拒绝（防会话混淆）
+    #[test]
+    fn parse_poll_success_rejects_nonce_mismatch() {
+        let body: Value = serde_json::from_str(
+            r#"{"token":"dt-x","user_id":"u1","nonce":"session-a","expires_in":2591999999}"#,
+        )
+        .unwrap();
+        assert!(parse_poll_success(&body, "session-a").is_some());
+        assert!(parse_poll_success(&body, "session-b").is_none(), "nonce 不匹配必须拒绝");
     }
 }

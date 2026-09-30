@@ -80,7 +80,8 @@ fn view_of(a: &QoderAccount, tokens: &Value) -> QoderAccountView {
 
 /// 账号列表（含凭证状态；脱敏：只回 kind 徽标不回 token）。
 /// 列表前惰性回填设备指纹（§5.10：存量账号幂等补齐，已有不覆盖）。
-#[tauri::command]
+/// async（审查 L）：ensure_pool_profiles 含磁盘 IO + RNG，阻塞命令会卡 UI 线程
+#[tauri::command(async)]
 pub fn qoder_accounts_list(state: State<AppState>) -> Result<Vec<QoderAccountView>, String> {
     crate::tasks::qoder_device::ensure_pool_profiles(&state)?;
     let accounts = load_pool(&state);
@@ -146,7 +147,7 @@ pub async fn qoder_account_import_pat(
         return Err("PAT 不能为空".into());
     }
     if !pat.starts_with("pt-") && !pat.starts_with("jt-") {
-        return Err("凭证格式不识别：应为 qoder.com.cn/account/integrations 创建的 PAT（pt- 前缀）".into());
+        return Err("凭证格式不识别：应为 qoder.com.cn/account/integrations 创建的 PAT（pt-）或客户端抓包获取的 job token（jt-）".into());
     }
     let id = account_id_of(&pat);
     // spawn_blocking：fetch_userinfo/fetch_plan 为阻塞 ureq 网络请求（15s 超时），
@@ -207,8 +208,12 @@ pub async fn qoder_account_import_pat(
         }
         Ok(())
     })?;
-    // 凭证入 token store（M1 单源；vault 收敛为 M3 事项，对齐 wb 现状）
+    // 凭证入 token store（M1 单源；vault 收敛为 M3 事项，对齐 wb 现状）。
+    // jt- 前缀（审查 L-jt）：同时写入 pat 字段——ensure_fresh 的 PAT 重换通道以
+    // has_pat（pat 字段非空）触发，仅落 access_token 时 jt- 走不进重换路径，
+    // 24h 过期后直接 refresh_failed 需手工重导
     let creds = QoderCreds {
+        pat: pat.clone(),
         access_token: pat,
         kind: "pat".into(),
         uid: uid.clone(),

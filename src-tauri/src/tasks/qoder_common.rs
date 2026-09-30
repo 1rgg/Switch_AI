@@ -53,6 +53,10 @@ pub struct QoderCreds {
     /// 原始 PAT 供到期重换（PAT 长期有效，绝不入日志/事件）
     #[serde(default)]
     pub pat: String,
+    /// 刷新令牌过期时刻（ms；R-10 设备流 refresh_token_expires_in ≈360d、R-6 jobToken
+    /// ≈48h）。审查 L-RT 过期持久化：落库留档，供后续 RT 生命周期判定消费
+    #[serde(default)]
+    pub refresh_expires_at_ms: Option<i64>,
     /// 设备指纹头来源：真实捕获值（client/mitm/cli）原样保存在 token store；
     /// effective_creds 合并时缺失则注入账号绑定 machine_id（§5.10）
     #[serde(default)]
@@ -74,6 +78,7 @@ impl std::fmt::Debug for QoderCreds {
             .field("nickname", &self.nickname)
             .field("kind", &self.kind)
             .field("pat", &mask(&self.pat))
+            .field("refresh_expires_at_ms", &self.refresh_expires_at_ms)
             .field("machine_id", &self.machine_id)
             .field("machine_token", &mask(&self.machine_token))
             .finish()
@@ -89,6 +94,18 @@ fn i_of(v: Option<&Value>) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str()?.trim().parse::<i64>().ok())
 }
 
+/// expires_at 域钳制（审查 L-溢出）：畸形大值（秒/毫秒单位错、服务端脏数据）会导致
+/// 临期比较整数溢出、到期日历展示为千年后；超界一律视为「无过期信息」（保守走刷新路径）
+fn clamp_expires_at(ms: i64) -> Option<i64> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let max = now + 10 * 365 * 24 * 3_600_000;
+    if ms <= 0 || ms > max {
+        None
+    } else {
+        Some(ms)
+    }
+}
+
 /// 从 token store 记录提取凭证（宽容解析；兼容 accessToken/access_token/token 键名）
 pub fn creds_of(source: &Value) -> QoderCreds {
     let auth = source.get("auth").filter(|v| v.is_object()).unwrap_or(source);
@@ -102,11 +119,17 @@ pub fn creds_of(source: &Value) -> QoderCreds {
         expires_at_ms: i_of(fs_utils::dig(
             auth,
             &["expiresAtMs", "expires_at_ms", "expiresAt", "expires_at"],
-        )),
+        ))
+        .and_then(clamp_expires_at),
         uid: s_of(fs_utils::dig(account, &["uid", "userId", "user_id", "id"])),
         nickname: s_of(fs_utils::dig(account, &["nickname", "name", "displayName"])),
         kind: s_of(fs_utils::dig(auth, &["kind", "token_kind", "credential_source"])),
         pat: s_of(fs_utils::dig(source, &["pat"])),
+        refresh_expires_at_ms: i_of(fs_utils::dig(
+            source,
+            &["refresh_expires_at_ms", "refreshExpiresAtMs", "refresh_expires_at", "refreshExpiresAt"],
+        ))
+        .and_then(clamp_expires_at),
         machine_id: s_of(fs_utils::dig(source, &["machine_id", "machineId", "cosy_machine_id"])),
         machine_token: s_of(fs_utils::dig(source, &["machine_token", "machineToken", "cosy_machine_token"])),
     }
@@ -118,6 +141,23 @@ pub fn creds_of(source: &Value) -> QoderCreds {
 /// 并发写会互相覆盖丢更新（last-writer-wins 抹掉彼此的新 token）。进程内全局锁
 /// 串行化表级读改写；仅持锁做本地 IO，不覆盖网络请求路径（无死锁面）。
 static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 每账号刷新互斥（审查 H-1）：签到/积分/定时兜底/401 自愈多通道并发触发同一账号
+/// `ensure_fresh` 时，两个线程可能同时拿旧 refresh_token/PAT 换新 token——后落库者
+/// 覆盖先落库者，被覆盖方刚拿到的令牌即刻失效（严重时 refresh_token 一并丢，被迫重登）。
+/// 以账号 id 为键的进程内锁串行化「读凭证→网络刷新→落库」全程；持锁后重读 token store
+/// 天然构成二次检查：他人已刷新落库则直接命中新凭证（fresh/复用），不再重复发网络请求。
+/// 锁序约定：refresh 锁 → TOKEN_STORE_LOCK（save_token_store 单向获取，无环）。
+fn refresh_lock_for(acct_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    static LOCKS: std::sync::Mutex<Option<HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =
+        std::sync::Mutex::new(None);
+    let mut g = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(HashMap::new)
+        .entry(acct_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+        .clone()
+}
 
 /// 敏感字段键名（审查 P0-1 凭证收敛）：rec 中这些字段一律占位（空串）存 DB，
 /// 明文进 vault（Stronghold + DPAPI，与 Trae/WB 同一 vault，ns="qoder"）。
@@ -260,17 +300,20 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
     if !store.is_object() {
         store = serde_json::json!({});
     }
-    let obj = store.as_object_mut().unwrap();
-    match obj.get("version") {
-        Some(v) if v.as_i64() != Some(1) => {
-            return Err("token_store 版本不识别，拒绝写入".to_string());
+    let target = {
+        let obj = store.as_object_mut().unwrap();
+        match obj.get("version") {
+            Some(v) if v.as_i64() != Some(1) => {
+                return Err("token_store 版本不识别，拒绝写入".to_string());
+            }
+            _ => {}
         }
-        _ => {}
-    }
-    obj.insert("version".into(), serde_json::json!(1));
-    let tokens = obj.entry("tokens").or_insert_with(|| serde_json::json!({}));
-    if let Some(t) = tokens.as_object_mut() {
-        let mut rec = t.get(id).cloned().unwrap_or(serde_json::json!({}));
+        obj.insert("version".into(), serde_json::json!(1));
+        let tokens = obj.entry("tokens").or_insert_with(|| serde_json::json!({}));
+        let mut rec = tokens
+            .as_object_mut()
+            .and_then(|t| t.get(id).cloned())
+            .unwrap_or(serde_json::json!({}));
         if let Some(rm) = rec.as_object_mut() {
             let val = serde_json::to_value(creds).map_err(|e| e.to_string())?;
             for (k, v) in val.as_object().into_iter().flatten() {
@@ -281,25 +324,55 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
             }
             rm.insert("updated_at".into(), serde_json::json!(fs_utils::now_iso()));
         }
-        t.insert(id.to_string(), rec);
-    }
+        if let Some(t) = store.get_mut("tokens").and_then(Value::as_object_mut) {
+            t.insert(id.to_string(), rec);
+        }
+        store
+            .get("tokens")
+            .and_then(|t| t.get(id))
+            .cloned()
+            .ok_or_else(|| "token_store 内部错误：目标行缺失".to_string())?
+    };
+    // 敏感字段收敛进 vault（慢 IO）——期间其他进程可能已写库；故落库不使用上面的
+    // 读时快照整表替换，而是重新 load DB 最新表做「仅目标行替换」的行级合并，
+    // 把进程间 last-writer-wins 的覆盖窗口从「vault 全程」收窄到「load→replace 数毫秒」
+    //（审查 H-1 第②步；进程内并发由 TOKEN_STORE_LOCK + 每账号刷新锁防护）。
     let vault_result = secure_store_for_save(&state.data_dir, &mut store).map(|_| ());
-    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store)?;
+    let mut fresh = crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
+    if !fresh.is_object() {
+        fresh = serde_json::json!({});
+    }
+    {
+        let obj = fresh.as_object_mut().unwrap();
+        match obj.get("version") {
+            Some(v) if v.as_i64() != Some(1) => {
+                return Err("token_store 版本不识别，拒绝写入".to_string());
+            }
+            _ => {}
+        }
+        obj.insert("version".into(), serde_json::json!(1));
+        if let Some(t) = obj.entry("tokens").or_insert_with(|| serde_json::json!({})).as_object_mut() {
+            t.insert(id.to_string(), target);
+        }
+    }
+    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &fresh)?;
     vault_result.map_err(|e| {
         format!("Qoder 凭据加密存储失败（已仅保存占位信息，重新登录可恢复）: {e}")
     })
 }
 
-/// 删除 token store 记录（账号移除时同步清理 vault 凭证）
+/// 删除 token store 记录（账号移除时同步清理 vault 凭证）。
+/// 顺序（审查 L）：DB 落库成功后才清 vault——save 失败时保留 vault 凭证并返 Err，
+/// 避免「库里还在、密钥已删」的悬挂态（重导同账号可复用既有凭证恢复）。
 pub fn remove_token(state: &AppState, id: &str) -> Result<(), String> {
     let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut store = load_token_store(state);
     if let Some(t) = store.get_mut("tokens").and_then(Value::as_object_mut) {
         t.remove(id);
     }
-    let r = crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store);
+    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store)?;
     crate::vault::ns_remove(&state.data_dir, "qoder", id);
-    r
+    Ok(())
 }
 
 // ── 统一请求头（§5.2：Cosy 头必带）─────────────────────────────────────────
@@ -380,6 +453,13 @@ pub fn refresh_token_once(agent: &ureq::Agent, creds: &QoderCreds) -> Option<Qod
     if let Some(e) = i_of(fs_utils::dig(&body, &["expiresIn", "expires_in"])) {
         out.expires_at_ms = Some(now_ms + normalize_expires_in(e));
     }
+    // 刷新令牌过期时刻随行解析（R-6 实测 refresh_token_expires_in≈48h ms；审查 L-RT）
+    if let Some(e) = i_of(fs_utils::dig(
+        &body,
+        &["refresh_token_expires_in", "refreshTokenExpiresIn"],
+    )) {
+        out.refresh_expires_at_ms = Some(now_ms + normalize_expires_in(e));
+    }
     Some(out)
 }
 
@@ -458,10 +538,10 @@ pub(crate) fn normalize_expires_in(e: i64) -> i64 {
     }
 }
 
-/// PAT → 作业令牌。多端点/多形态尝试（按优先级）：
-/// ① `POST /api/v1/jobToken/exchange` body `{"pat": ...}`（设计文档附录 A，社区逆向）
-/// ② `POST /api/v1/jobToken/exchange` 空 body（Bearer 鉴权）
-/// ③ `POST /api/v1/me/jobToken` body `{"clientId": ...}`（R-6 抓包：客户端真实路径）
+/// PAT → 作业令牌。多端点尝试（审查 M-2：已证实通道优先，未证实兜底在后）：
+/// ① `POST /api/v1/me/jobToken` body `{"clientId": ...}`（R-6 抓包：客户端真实路径）
+/// ② `POST /api/v1/jobToken/exchange` body `{"pat": ...}`（设计文档附录 A，社区逆向，未证实）
+/// ③ `POST /api/v1/jobToken/exchange` 空 body（Bearer 鉴权，未证实）
 /// 成功返回以作业令牌为 access_token 的 Creds（pat 字段保存原始 PAT 供到期重换）。
 /// data_dir 用于状态码落日志（脱敏：只记端点与 HTTP 状态，不含 token）——全部失败时
 /// 便于定位是 401（PAT 不被接受）还是 404（端点不存在）。
@@ -472,16 +552,16 @@ pub fn exchange_job_token(
 ) -> Option<QoderCreds> {
     let attempts: [(&str, Value, &str); 3] = [
         (
+            "/api/v1/me/jobToken",
+            serde_json::json!({ "clientId": job_client_id(pat) }),
+            "me/jobToken",
+        ),
+        (
             "/api/v1/jobToken/exchange",
             serde_json::json!({ "pat": pat }),
             "exchange+pat",
         ),
         ("/api/v1/jobToken/exchange", serde_json::json!({}), "exchange"),
-        (
-            "/api/v1/me/jobToken",
-            serde_json::json!({ "clientId": job_client_id(pat) }),
-            "me/jobToken",
-        ),
     ];
     let mut last_status: u16 = 0;
     for (path, body, tag) in attempts {
@@ -547,6 +627,10 @@ pub fn ensure_fresh(
     acct_id: &str,
     lazy_hours: i64,
 ) -> (QoderCreds, bool, &'static str) {
+    // H-1 第①步：同一账号并发刷新串行化；持锁后 effective_creds 重读即最新状态——
+    // 他人已刷新落库的新令牌直接命中 fresh/复用路径（二次检查），不再重复发起网络刷新
+    let lock = refresh_lock_for(acct_id);
+    let _refresh_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let creds = effective_creds(state, acct_id);
     if creds.access_token.is_empty() {
         return (creds, false, "no_credential");

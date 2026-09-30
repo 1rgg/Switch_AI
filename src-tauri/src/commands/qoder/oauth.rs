@@ -124,8 +124,10 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>) -> Result<(), S
                             emit_done(&app2, &state2.data_dir, false, "", "", "授权响应非 JSON，请重试");
                             return;
                         };
-                        let Some((creds, uid)) = qoder_oauth::parse_poll_success(&b) else {
-                            emit_done(&app2, &state2.data_dir, false, "", "", "授权响应缺少令牌字段（接口结构可能已变更）");
+                        // nonce 回验（审查 L）：响应必须属于本次会话，防 poll 响应
+                        // 被替换为其他会话的授权结果
+                        let Some((creds, uid)) = qoder_oauth::parse_poll_success(&b, &flow.nonce) else {
+                            emit_done(&app2, &state2.data_dir, false, "", "", "授权响应校验失败（nonce 不匹配或缺少令牌字段），请重试");
                             return;
                         };
                         match import_device_creds(&state2, creds, &uid) {

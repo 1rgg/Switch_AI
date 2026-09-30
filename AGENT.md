@@ -190,6 +190,21 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_ui_click_capture()` / `workbuddy_ui_click_checkin()` | UI 坐标点击签到兜底（F-18，批次4）：ctypes user32 驱动鼠标（零新依赖）；仅手动触发、默认关闭（settings.ui_click_enabled）；取点 3 秒倒计时记录坐标，执行单次单击不循环 |
 | WB 配置 | `wb_route_config_get()` / `wb_route_config_set(config)` / `wb_template_map_get()` / `wb_template_map_set(map)` | 四段模型路由与审核模板映射两个手工配置文件的程序化读写：读 data/ 新路径回退旧根；set 结构校验与读取方反序列化严格对齐（aliases/rules/suffixes 为 object，模板表为 {templates:[{from,to}]} 形态），写 data/ 新路径并逐出读缓存（网关热路径即时生效） |
 | Buddy 双应用 | `open_workbuddy_app()` / `open_codebuddy_app()` / `codebuddy_env_check()` | 启动 WorkBuddy / CodeBuddy 桌面客户端（app_locate 探测，未装返回明确错误，不注入代理）；CodeBuddy 环境探测 `{installed,running,exe,version,uid,nickname}`（CodeBuddy CN 桌面与 WorkBuddy 共享 auth 文件 `%LOCALAPPDATA%\CodeBuddyExtension\...\workbuddy-desktop.info`，uid 同源 → 账号页「CodeBuddy在线」徽标）；`-TargetApp CodeBuddy`（authfile 布局）切换/保存快照落 profiles_codebuddy |
+| Qoder | `qoder_env_check()` / `qoder_open_ide()` / `qoder_open_work()` | Qoder IDE 环境探测 / 启动 IDE / 启动 Qoder Work（app_locate 四级探测，`target_app=Qoder`） |
+| Qoder | `qoder_oauth_login()` / `qoder_oauth_cancel()` | PKCE 设备流登录（R-10 抓包固化）：nonce+verifier 生成 → 系统浏览器开 `qoder.cn/device/selectAccounts?challenge=...` → 轮询 `GET /api/v1/deviceToken/poll`（pending=404，≤180s/1s）→ **响应 nonce 回验**（防会话混淆）→ 自动入池落库；事件 qoder-oauth-progress / qoder-oauth-done |
+| Qoder | `qoder_settings_get()` / `qoder_settings_set(patch)` | kv("qoder_settings")：auto_checkin（启动补签）/ checkin_hhmm / credits_sync_hhmm / credits_sync_enabled / lazy_refresh_hours |
+| Qoder | `qoder_accounts_list` → `QoderAccountView[]` | 账号池 ∪ token store 合并视图（脱敏：只回凭证 kind 徽标不回 token）；列表前惰性回填每账号设备指纹（§5.4）；async |
+| Qoder | `qoder_account_save/remove/move` | 改名备注 / 移除（同步清 token store + vault，DB 落库成功才清 vault）/ 分组移动 |
+| Qoder | `qoder_account_import_pat(name?, pat)` | PAT/作业令牌手工导入（幂等：同 token 稳定同 id `qd-<sha256前12>`）；`pt-`/`jt-` 前缀均写入 access_token+pat 双字段（确保 ensure_fresh PAT 重换通道覆盖）；userinfo/plan 回填失败容错 |
+| Qoder | `qoder_ide_scan()` / `qoder_cli_status()` | 本机 Qoder 客户端账号发现 / CLI 切号桥状态 |
+| Qoder | `qoder_checkin_start(opts)` → NDJSON `qoder-checkin-progress` | Rust 直调 `tasks/qoder_checkin.rs::run_checkin_round`（sash 双活动 claim，幂等回放归类已签；claim 间隔 1~3s 随机抖动；401 刷新一次重试；campaign_id 路径段白名单；done 事件含 `failed_empty_campaigns` 单列计数） |
+| Qoder | `qoder_checkin_results(days?)` | 签到日志（qoder_checkin_results 表 90 天滚动，逐条 UPSERT 按 pk=date\|user_id\|time_ms 去重） |
+| Qoder | `qoder_checkin_task_register(times[]) / _status / _unregister` | schtasks 每日签到任务（主 exe `--task-run qoder-checkin`；应用内调度器同款默认 10:15 单次覆盖双活动） |
+| Qoder | `qoder_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/qoder_credits.rs`：usage 三通道取数（R-7 主结构 userQuota/addOnQuota + 宽容兜底全 None 显式失败）；缓存 10min（仅全部成功落缓存）；401 自愈刷新一次；成功回写池余额；全量且全部成功才落每日快照（含当日消耗差分） |
+| Qoder | `qoder_credits_history_list()` | 积分每日快照时序读取（qoder_credits_history 表 365 天，同日覆盖） |
+| Qoder | `qoder_groups_list / create / update / remove` | 分组管理（kv("qoder_groups")，结构与 Trae/Buddy 一致；create 重名校验；删除时组内账号回落未分组） |
+| Qoder | `qoder_accounts_export(includeCredentials?) / _import(payload)` | 账号库导入导出（kind 标记 `aiwork-qoder-pool`；凭证是否随行由用户勾选，含凭证导出前端强确认） |
+| Qoder | `qoder_env_reset_items()` / `qoder_env_reset(items)` | Qoder 环境残留清理清单 + 程序化清理（执行前关闭 Qoder 客户端，单项失败不中断） |
 
 ### 5.1 双应用与双 uid 体系（F-08，trae_apps.rs）
 
@@ -216,6 +231,16 @@ ai-work-assistant/
 - **统一目录（`unified_catalog.rs`）**：`api_unified_models` 与 `GET /v1/models` 共用；Trae 模型元数据四层兜底——L1 人工覆盖（`trae_model_meta.json`，编辑弹框 upsert/clear）→ L2 官网同步 → L3 默认 128K / 倍率参考（含 2026-09-13 审查补充的 5 个官网同步缺失倍率）→ L4 系列/思考档位/图片支持推断。倍率口径冲突时只补缺失条目、不改既有值。
 - **custom 路由（`custom_route.rs` / `custom_models.rs`）**：请求模型名 canonical（trim+lowercase）命中 enabled 自定义模型即直转其 `chat/completions`（`chat_url` 归一 base 含 `/v1` 与否两种形态），Bearer 用条目 API Key；响应侧复用既有协议输出层。
 
+### 5.4 Qoder 约定（F-80）
+
+- **凭证三前缀**：`pt-`（PAT，官方认可）→ 经 `POST /api/v1/me/jobToken`（R-6 抓包真实路径，探测顺序首位）换 24h 作业令牌再调业务端点；`jt-`（作业令牌）；`dt-`（设备流 token，≈30d，配 refresh_token ≈360d）。`ensure_fresh` 惰性刷新：PAT 通道（is_pat ∥ pat 字段非空）临期用原始 PAT 重换；客户端通道走 `deviceToken/refresh`；401 自愈传 `lazy_hours=i64::MAX` 恒刷一次（禁二次刷新）。
+- **凭证存储（红线）**：敏感字段（access_token/refresh_token/pat/machine_token）只进 vault（ns="qoder"，Stronghold+DPAPI），DB `qoder_tokens` 表一律占位空串；QoderCreds Debug 手写脱敏。全程零 token 输出到日志/事件/UI。
+- **并发防护（三层）**：① `TOKEN_STORE_LOCK` 表级读改写互斥；② **每账号刷新锁**（`refresh_lock_for`）串行化同账号 ensure_fresh 全程，持锁重读即二次检查（防并发刷新互相覆盖丢 token）；③ save_token_store 落库前重新 load DB 最新表做**仅目标行替换**的行级合并（收窄跨进程 last-writer-wins 窗口）。锁序：refresh 锁 → TOKEN_STORE_LOCK。
+- **设备指纹（设计文档 §5.10 多账号并发）**：每账号入池即生成稳定 `QoderDeviceProfile`（一次生成永不轮换）；MITM/抓包真实捕获值优先透传，缺失时 `effective_creds` 注入账号绑定 machine_id + 现场随机 machine_token（随机值不落库）。注入唯一出口 = `effective_creds` / ensure_fresh 合并层。
+- **expires_at 域钳制**：store 读入的过期时间超 (0, now+10y) 一律视为无过期信息（防脏数据溢出/千年展示）；`refresh_expires_at_ms` 随设备流/refresh 响应解析落库留档。
+- **调度三任务**：每日签到（默认 10:15，覆盖 0 点签到 + 10:00 登录奖励；失败返 Err → 调度器 30min 冷却重试；启动补签 60s 延迟 + 轮次锁互斥，empty_campaigns 不推送打扰）/ 积分快照（qoder_credits_sync_hhmm）/ 凭证 6h 兜底刷新（lazy 7h 窗口，暂态失败返 Err 重试，永久失败落日志提示人工）。轮次锁 `QODER_ROUND_LOCK`：调度器/启动补签/UI 三路互斥，抢不到锁幂等跳过。
+- **切换器**：`target_app="Qoder"`（authfile 布局），快照落 `data/profiles_qoder`。
+
 ## 6. Tauri 事件（Rust → 前端）
 
 | 事件 | payload |
@@ -232,6 +257,9 @@ ai-work-assistant/
 | `wb-checkin-progress` | `{"type":"start",total,mode?}` / `{"type":"account",index,user_id,name,status,message}` / `{"type":"growth",index,user_id,name,status,travel?,lottery?,tasks?,energy?,streak?}` / `{"type":"done",ok,already,failed,mode?}` / `{"type":"exit",ok}`（WorkBuddy 签到/成长中心独立管线：`mode:"growth"` 标记成长事件，与 Trae checkin-progress 互不串扰） |
 | `wb-oauth-progress` | `{stage:'init'|'browser'|'polling'|'success'|'error', message, auth_url?}`（OAuth 扫码流程进度；auth_url 仅 browser 阶段携带） |
 | `wb-oauth-done` | `{ok, id?, nickname?, message}`（扫码结果；成功已入池，凭证不出 Rust） |
+| `qoder-checkin-progress` | `{"type":"start",total}` / `{"type":"account",index,user_id,name,status,message,reward?}` / `{"type":"done",ok,already,failed,failed_empty_campaigns}`（Qoder 签到管线，与 wb-checkin-progress 前端组件同构；`failed_empty_campaigns` 为活动未开始/不可用类失败计数，启动补签推送按 `failed - failed_empty_campaigns` 判定） |
+| `qoder-oauth-progress` | `{stage:'init'\|'browser'\|'polling'\|'success'\|'error', message, auth_url?}`（Qoder 设备流登录进度；auth_url 仅 browser 阶段携带） |
+| `qoder-oauth-done` | `{ok, id?, nickname?, message}`（设备流结果；成功已入池，凭证不出 Rust） |
 
 ## 7. 数据文件
 
@@ -250,9 +278,12 @@ ai-work-assistant/
 │   │   │                         #   workbuddy_settings / credits 三缓存 / wb_cli_rotate_state / doubao_* 等 29 键
 │   │   ├── 行文档实体表           # accounts / device_map / groups(+group_members) / remaining_credits /
 │   │   │                         #   account_cooldowns / pay_status / api_keys / custom_models /
-│   │   │                         #   doubao_accounts / wb_accounts / wb_tokens / api_usage —— (pk, data JSON)
+│   │   │                         #   doubao_accounts / wb_accounts / wb_tokens / api_usage /
+│   │   │                         #   qoder_accounts(池) / qoder_tokens(凭证 store，敏感字段占位) —— (pk, data JSON)
 │   │   └── 列化流水表             # credits_history / credits_daily / checkin_results(90天) / wb_checkin_results /
-│   │                             #   doubao_health_events / wb_credits_history(365天) / usage_history_*(365天) / sticky_bindings
+│   │                             #   doubao_health_events / wb_credits_history(365天) / usage_history_*(365天) / sticky_bindings /
+│   │                             #   qoder_checkin_results(90天) / qoder_credits_history(365天)
+│   │   kv 增量（Qoder）          # qoder_settings / qoder_groups / qoder_credits_cache(10min TTL)
 │   ├── backup/                   # 首启迁移时移入的旧 JSON（含 migration_manifest.json / corrupt/）
 │   ├── workbuddy_chats/          # WorkBuddy 会话三件套备份（<uid>/projects/ + 双 db + chat_backup_meta.json）
 │   ├── codebuddy_chats/          # CodeBuddy 会话三件套备份（F-74，同上结构，源 ~/.codebuddy）
@@ -265,7 +296,8 @@ ai-work-assistant/
 │   ├── profiles_trae/            # Trae CN 快照槽
 │   ├── profiles_doubao/          # 豆包快照槽（chromium 布局 + snapshot_meta.json + .bak 单代回滚）
 │   ├── profiles_workbuddy/       # WorkBuddy 快照槽（auth/ + storage/ + meta.json）
-│   └── profiles_codebuddy/       # CodeBuddy 快照槽（authfile 布局 + L3 vscdb 登录真源）
+│   ├── profiles_codebuddy/       # CodeBuddy 快照槽（authfile 布局 + L3 vscdb 登录真源）
+│   ├── profiles_qoder/           # Qoder 快照槽（authfile 布局，target_app="Qoder"）
 └── logs/                         # proxy / checkin / switcher / api / proxy-requests / app.log 日志
 ```
 

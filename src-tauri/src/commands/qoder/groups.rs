@@ -46,6 +46,14 @@ pub fn qoder_groups_list(state: State<AppState>) -> Vec<crate::commands::account
 #[tauri::command]
 pub fn qoder_groups_create(state: State<AppState>, name: String, color: String) -> Result<String, String> {
     let mut defs = load_defs(&state);
+    // 重名校验（审查 L）：同名分组会让前端按名匹配/展示产生歧义
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("分组名不能为空".into());
+    }
+    if defs.iter().any(|g| g.name == name) {
+        return Err(format!("分组「{name}」已存在"));
+    }
     let id = format!("qoderg_{}", chrono::Local::now().timestamp_millis());
     let order = (defs.len() as i32) + 1;
     defs.push(crate::models::Group {

@@ -328,7 +328,17 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                 return Ok(json!({ "ok": true, "skipped": "已有 Qoder 签到任务在执行中，本轮跳过" }));
             };
             let opts = super::qoder_checkin::QoderCheckinOpts::daily();
-            Ok(super::qoder_checkin::run_checkin_round(st, &opts, &mut |_| {}))
+            let done = super::qoder_checkin::run_checkin_round(st, &opts, &mut |_| {});
+            // 审查 M-1：存在失败账号时返 Err，交调度器 30 分钟冷却重试（暂态失败自愈）
+            let failed = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            if failed > 0 {
+                let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                return Err(format!(
+                    "Qoder 签到：{ok} 成功 / {already} 已领 / {failed} 失败（30 分钟后自动重试）"
+                ));
+            }
+            Ok(done)
         }
         // F-80 Qoder 积分快照：与 `--task-run qoder-credits-snapshot` 同款（空池空转）
         "qoder-credits-snapshot" => super::qoder_credits::run_snapshot_task(st),
