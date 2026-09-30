@@ -553,7 +553,7 @@ pub fn workbuddy_refresh_token(
     let resp = agent
         .post("https://www.codebuddy.cn/v2/plugin/auth/token/refresh")
         .set("Authorization", "Bearer")
-        .set("User-Agent", "WorkBuddy")
+        .set("User-Agent", crate::tasks::wb_common::WB_DESKTOP_UA)
         .set("X-Refresh-Token", &refresh)
         .set("X-Auth-Refresh-Source", "workbuddy")
         .set("Content-Type", "application/json")
