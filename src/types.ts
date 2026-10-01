@@ -467,6 +467,8 @@ export interface DispatchPolicy {
 /** 网关设置（kv api_gateway_settings；gateway_settings_get/set） */
 export interface GatewaySettings {
   port: number;
+  /** 监听地址：默认 127.0.0.1 仅本机可访问；局域网访问设 0.0.0.0（须同时启用 API Key） */
+  host: string;
   default_model: string;
   updated_at: number;
 }
@@ -1277,9 +1279,10 @@ export interface QoderResetResult {
   detail: string;
 }
 
-/** OAuth 设备流进度事件（qoder-oauth-progress，对齐 WbOauthProgress） */
+/** OAuth 设备流进度事件（qoder-oauth-progress，对齐 WbOauthProgress）：
+ *  后端仅发 init/browser/polling 三个 stage，终态（成功/失败）走 qoder-oauth-done 事件 */
 export interface QoderOauthProgress {
-  stage: 'init' | 'browser' | 'polling' | 'success' | 'error';
+  stage: 'init' | 'browser' | 'polling';
   message: string;
   auth_url?: string | null;
 }

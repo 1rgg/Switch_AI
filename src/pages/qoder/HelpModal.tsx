@@ -48,7 +48,7 @@ export function QoderHelpModal({ open, onClose }: { open: boolean; onClose: () =
             <Globe size={15} className="text-amber-500" /> OAuth 设备流登录
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            点击「OAuth登录」，应用自动发起设备流授权（device flow），在弹框内打开验证链接并输入设备码完成登录。成功后凭证（dt-
+            点击「OAuth登录」，应用自动打开浏览器授权页，在浏览器中完成 Qoder 账号授权（登录并确认）后凭证自动回填入池，无需输入设备码。成功后凭证（dt-
             前缀）自动入池，约 30 天自动续期，无需手动维护。
           </p>
         </section>
@@ -116,7 +116,10 @@ export function QoderHelpModal({ open, onClose }: { open: boolean; onClose: () =
             <ArrowUpDown size={15} className="text-amber-500" /> 导出 / 导入账号池
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            「导出账号」将账号池打包为 JSON 文件；「导入账号」读取后按 uid 幂等合并（已存在的账号跳过），适合跨设备迁移或多机同步。
+            「导出账号」将账号池打包为 JSON 文件；「导入账号」读取后按 uid 幂等合并——已存在的账号原位更新：仅补全空缺字段，绝不覆盖已有数据。适合跨设备迁移或多机同步。
+          </p>
+          <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
+            ⚠ 勾选「附带凭证副本」的导出文件包含明文凭证，等同密码，请妥善保管，切勿通过不可信渠道传输。
           </p>
         </section>
 

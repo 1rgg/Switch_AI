@@ -207,6 +207,9 @@ fn fetch_account(agent: &ureq::Agent, acct: &Value, creds: &qoder_common::QoderC
     let url = format!("{}/sash/api/v2/me/usage", qoder_common::OPEN_API_BASE);
     let (status, body, _raw) = qoder_common::get_json(agent, &url, &headers);
     if status != 200 {
+        // P3：结构化状态码随行——401 自愈判定不再依赖 message 文本匹配（message
+        // 仅人类可读描述）；前端按需读取，多出字段无副作用
+        row["http_status"] = json!(status);
         row["message"] = json!(format!("usage 不可用（HTTP {status}）"));
         return row;
     }
@@ -314,9 +317,14 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
             // 401 自愈：令牌失效时强制刷新一次并重试（lazy_hours=MAX 恒走刷新；
             // PAT 通道 is_pat||has_pat 恒覆盖有备份的凭证）。刷新失败/令牌未变则
             // 保留原失败行，不二次重试（对齐 F-09 禁二次刷新）。
-            if row.get("ok").and_then(Value::as_bool) != Some(true)
-                && row.get("message").and_then(Value::as_str).is_some_and(|m| m.contains("401"))
-            {
+            // P3：判定改用结构化 http_status（fetch_account 错误行携带），
+            // message.contains("401") 文本匹配保留兜底（容异常路径无字段）
+            let is_401 = row.get("http_status").and_then(Value::as_i64) == Some(401)
+                || row
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.contains("401"));
+            if row.get("ok").and_then(Value::as_bool) != Some(true) && is_401 {
                 let (new_creds, refreshed, _) = qoder_common::ensure_fresh(state, &agent, aid, i64::MAX);
                 if refreshed && new_creds.access_token != creds.access_token {
                     // 401 自愈成功：回写池过期时间/登录态（原自愈路径只刷新不回写，

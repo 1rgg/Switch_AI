@@ -566,6 +566,14 @@ pub fn resolve_target(
                                 .unwrap_or(0);
                             DispatchError::ModelCooling(secs)
                         }
+                        // Qoder 模型级冷却同构映射（审查修复）：单源排队冷却显式 429
+                        (TargetPool::Qoder, FallbackReason::ModelCooldown) => {
+                            let secs = super::qoder_route::model_cooling_remaining_secs(
+                                &sources.qoder.clone().unwrap_or_default(),
+                            )
+                            .unwrap_or(0) as i64;
+                            DispatchError::ModelCooling(secs)
+                        }
                         (p, _) => DispatchError::NoHealthy(p),
                     });
                 }
@@ -698,7 +706,16 @@ fn pool_health(
             Ok(())
         }
         TargetPool::Qoder => {
-            // Qoder 无模型级冷却机制（v1）：仅账号级健康预检
+            // 模型级冷却预检（审查修复，与 Buddy 同构）：排队/超限类错误后窗口
+            // 内快速回退——多源交由后续池，单源在 resolve_target 显式 429
+            if super::qoder_route::model_cooling_remaining_secs(
+                &sources.qoder.clone().unwrap_or_default(),
+            )
+            .is_some()
+            {
+                return Err(FallbackReason::ModelCooldown);
+            }
+            // 账号级健康预检
             if !state.qoder_pool.has_selectable_in(allowed) {
                 return Err(FallbackReason::NoHealthyAccount);
             }

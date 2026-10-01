@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ListChecks, RefreshCw, Save, Search, ShieldAlert, SlidersHorizontal } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge, Spinner } from '../../components/ui';
@@ -37,6 +37,8 @@ export default function QoderSettings() {
   const [qoderGateway, setQoderGateway] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
+  // 计划任务注册/卸载互斥（防连点重复提交）
+  const [taskBusy, setTaskBusy] = useState(false);
 
   /** qoder-settings 加载（签到开关数据源）：失败置错误态——null 时 checkbox 恒显默认 true
    *  且点击 no-op、保存会静默跳过 settingsSet 仍报「已保存」，必须显式拦截 */
@@ -81,14 +83,41 @@ export default function QoderSettings() {
     void refresh();
   }, [refresh]);
 
+  // 全局 settings 任何刷新（保存后 refresh / 其他页面触发）都会触发本 effect；
+  // 仅当输入框当前值仍等于上次同步的已保存值（用户未本地编辑）时才应用新 settings，
+  // 避免覆盖输入框中未保存的修改
+  const lastSynced = useRef({
+    idePath: '',
+    workPath: '',
+    checkinHhmm: '10:15',
+    creditsHhmm: '23:40',
+    creditsSyncEnabled: true,
+  });
+
   useEffect(() => {
-    if (settings) {
-      setIdePath(settings.qoder_ide_path ?? '');
-      setWorkPath(settings.qoderwork_path ?? '');
-      setCheckinHhmm(settings.qoder_checkin_hhmm || '10:15');
-      setCreditsHhmm(settings.qoder_credits_sync_hhmm || '23:40');
-      setCreditsSyncEnabled(settings.qoder_credits_sync_enabled ?? true);
-    }
+    if (!settings) return;
+    const s = lastSynced.current;
+    const untouched =
+      idePath === s.idePath &&
+      workPath === s.workPath &&
+      checkinHhmm === s.checkinHhmm &&
+      creditsHhmm === s.creditsHhmm &&
+      creditsSyncEnabled === s.creditsSyncEnabled;
+    if (!untouched) return;
+    const next = {
+      idePath: settings.qoder_ide_path ?? '',
+      workPath: settings.qoderwork_path ?? '',
+      checkinHhmm: settings.qoder_checkin_hhmm || '10:15',
+      creditsHhmm: settings.qoder_credits_sync_hhmm || '23:40',
+      creditsSyncEnabled: settings.qoder_credits_sync_enabled ?? true,
+    };
+    setIdePath(next.idePath);
+    setWorkPath(next.workPath);
+    setCheckinHhmm(next.checkinHhmm);
+    setCreditsHhmm(next.creditsHhmm);
+    setCreditsSyncEnabled(next.creditsSyncEnabled);
+    lastSynced.current = next;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings]);
 
   /** 右上角统一保存（对齐 BuddySettings）：路径 + 时刻 + 快照开关 + 签到行为，一次提交 */
@@ -137,6 +166,15 @@ export default function QoderSettings() {
         800,
       );
       pushToast('success', '配置已保存');
+      // 同步基线（审查 F1）：lastSynced 更新为本次保存的值（trim 口径与保存一致），
+      // 否则后续全局 settings 刷新会因「输入框 ≠ 上次同步值」误判为用户已编辑而永不应用
+      lastSynced.current = {
+        idePath: idePath.trim(),
+        workPath: workPath.trim(),
+        checkinHhmm: checkinHhmm.trim(),
+        creditsHhmm: creditsHhmm.trim(),
+        creditsSyncEnabled,
+      };
       await refresh();
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
@@ -146,26 +184,35 @@ export default function QoderSettings() {
   };
 
   const registerTask = async () => {
+    if (taskBusy) return;
     if (!isValidHHMM(checkinHhmm)) {
       pushToast('error', `签到时刻格式无效：${checkinHhmm}（应为 HH:MM）`);
       return;
     }
+    setTaskBusy(true);
     try {
       await api.qoder.checkinTaskRegister([checkinHhmm.trim()]);
       setTaskTimes(await api.qoder.checkinTaskStatus());
-      pushToast('success', `Windows 计划任务已注册：每日 ${checkinHhmm}`);
+      // 双轨提示：计划任务按输入框当前值注册即生效；应用内调度器仍以「保存配置」提交的值为准
+      pushToast('info', `计划任务已按 ${checkinHhmm.trim()} 注册；应用内定时需点击「保存配置」后生效`);
     } catch (err) {
       pushToast('error', `注册失败：${String(err)}`);
+    } finally {
+      setTaskBusy(false);
     }
   };
 
   const unregisterTask = async () => {
+    if (taskBusy) return;
+    setTaskBusy(true);
     try {
       await api.qoder.checkinTaskUnregister();
       setTaskTimes(await api.qoder.checkinTaskStatus());
       pushToast('success', 'Windows 计划任务已卸载');
     } catch (err) {
       pushToast('error', `卸载失败：${String(err)}`);
+    } finally {
+      setTaskBusy(false);
     }
   };
 
@@ -359,12 +406,20 @@ export default function QoderSettings() {
                   onChange={(e) => setCheckinHhmm(e.target.value || '10:15')}
                 />
                 {taskTimes.length > 0 ? (
-                  <button className="btn-ghost !px-3 !py-1 text-xs text-rose-500" onClick={() => void unregisterTask()}>
-                    卸载
+                  <button
+                    className="btn-ghost !px-3 !py-1 text-xs text-rose-500"
+                    disabled={taskBusy}
+                    onClick={() => void unregisterTask()}
+                  >
+                    {taskBusy ? <Spinner /> : null} 卸载
                   </button>
                 ) : (
-                  <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => void registerTask()}>
-                    注册
+                  <button
+                    className="btn-outline !px-3 !py-1 text-xs"
+                    disabled={taskBusy}
+                    onClick={() => void registerTask()}
+                  >
+                    {taskBusy ? <Spinner /> : null} 注册
                   </button>
                 )}
               </div>

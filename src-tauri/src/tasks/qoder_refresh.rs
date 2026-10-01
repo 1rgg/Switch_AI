@@ -42,10 +42,12 @@ pub fn run_task(state: &AppState) -> Result<Value, String> {
             "refreshed" => refreshed += 1,
             // 暂态失败（网络/服务端）：返 Err 交调度器 30 分钟冷却重试，可能自行恢复
             "refresh_failed" => failed += 1,
-            // 永久失败（PAT 被拒 / 凭证过期需重登）：重试无解。返 Ok 停止 30 分钟无效
-            // 重试循环（原实现计失败会全天 48 次 tick 全部失败 + 当日首败误报通知）；
-            // 落日志提示用户人工处理（用户重登后下个 6h tick 自然恢复）
-            "pat_rejected" | "expired_needs_relogin" => {
+            // 永久失败（PAT 被拒 / 凭证过期需重登 / refresh_token 被服务端 4xx 永久拒绝
+            // ——P1 分类后 auth_dead 已在 ensure_fresh 内回写池 needs_relogin）：
+            // 重试无解。返 Ok 停止 30 分钟无效重试循环（原实现计失败会全天 48 次 tick
+            // 全部失败 + 当日首败误报通知）；落日志提示用户人工处理（用户重登后下个
+            // 6h tick 自然恢复）
+            "pat_rejected" | "expired_needs_relogin" | "auth_dead" => {
                 permanent += 1;
                 crate::fs_utils::app_log(
                     &state.data_dir,

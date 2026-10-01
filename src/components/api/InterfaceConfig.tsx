@@ -38,6 +38,7 @@ export default function InterfaceConfig() {
   const toast = useAppStore((s) => s.pushToast);
   const [gw, setGw] = useState<GatewaySettings | null>(null);
   const [port, setPort] = useState(7864);
+  const [host, setHost] = useState('127.0.0.1');
   const [model, setModel] = useState('glm-5.3');
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [modelsLoaded, setModelsLoaded] = useState(false);
@@ -60,6 +61,7 @@ export default function InterfaceConfig() {
       .then((s) => {
         setGw(s);
         setPort(s.port);
+        setHost(s.host || '127.0.0.1');
         setModel(s.default_model);
       })
       .catch(() => {
@@ -98,12 +100,14 @@ export default function InterfaceConfig() {
       const next = await withMinDelay(
         api.apiServer.gatewaySettingsSet({
           port: p,
+          host: host.trim(),
           default_model: model.trim(),
           updated_at: gw?.updated_at ?? 0,
         }),
       );
       setGw(next);
       setPort(next.port);
+      setHost(next.host || '127.0.0.1');
       setModel(next.default_model);
       toast('success', '网关设置已保存；端口改动将在下次启动 API 服务后生效');
     } catch (e) {
@@ -196,6 +200,11 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
       ? models
       : [{ id: model, display: model, rate: null, efforts: [], max_mode: false, context_length: null, max_tokens: null, supports_image: null, manual: false, sources: [] }, ...models];
 
+  // 网关 host 环回判定（按已保存设置）：环回（127.0.0.1/localhost/::1）时局域网接入
+  // 仅展示「仅本机可访问」提示；非环回才列出各网卡 IP（审查 G1：原写死 0.0.0.0 与实际不符）
+  const gwHost = gw?.host || '127.0.0.1';
+  const gwLoopback = gwHost === '127.0.0.1' || gwHost === 'localhost' || gwHost === '::1';
+
   // ---- 白名单派生数据 ----
   const catalogByCanonical = new Map(models.map((m) => [canonical(m.id), m]));
   const wlEnabled = whitelist.length > 0;
@@ -231,6 +240,21 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
               onChange={(e) => setPort(parseInt(e.target.value) || 0)}
             />
             <p className="mt-1 text-xs text-slate-400">改动将在下次启动 API 服务后生效</p>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
+              监听地址
+            </label>
+            <input
+              type="text"
+              className="input font-mono"
+              value={host}
+              onChange={(e) => setHost(e.target.value)}
+              placeholder="127.0.0.1"
+            />
+            <p className="mt-1 text-xs text-slate-400">
+              默认仅本机 127.0.0.1 可访问；如需局域网设备访问可设为 0.0.0.0，此时必须启用 API Key
+            </p>
           </div>
           <div>
             <label className="mb-1 block text-xs font-medium text-slate-500 dark:text-zinc-400">
@@ -331,25 +355,30 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
             </div>
             <div>
               <span className="text-slate-400">局域网接入：</span>
-              {lanIps.length ? (
-                lanIps.map((e) => (
-                  <code
-                    key={e.ip}
-                    className="block break-all text-[11px]"
-                    title={`网卡：${e.name}`}
-                  >
-                    http://{e.ip}:{gw?.port ?? 7864}/v1（{e.name}）
-                  </code>
-                ))
+              {gwLoopback ? (
+                <code className="text-[11px]">
+                  当前仅本机可访问（监听 {gwHost}）；如需局域网访问请修改上方监听地址为 0.0.0.0 并启用 API Key
+                </code>
               ) : (
-                <code className="text-[11px]">未检测到局域网地址（已排除回环/虚拟网卡）</code>
+                <>
+                  <code className="block text-[11px]">
+                    当前监听 {gwHost}，局域网内设备可通过下列地址访问；出于安全要求已强制启用 API Key 鉴权
+                  </code>
+                  {lanIps.length ? (
+                    lanIps.map((e) => (
+                      <code
+                        key={e.ip}
+                        className="block break-all text-[11px]"
+                        title={`网卡：${e.name}`}
+                      >
+                        http://{e.ip}:{gw?.port ?? 7864}/v1（{e.name}）
+                      </code>
+                    ))
+                  ) : (
+                    <code className="text-[11px]">未检测到局域网地址（已排除回环/虚拟网卡）</code>
+                  )}
+                </>
               )}
-            </div>
-            <div>
-              <span className="text-slate-400">安全提示：</span>
-              <code className="text-[11px]">
-                网关监听 0.0.0.0，局域网内设备可访问；未启用任何 API Key 时匿名放行，建议创建并启用 Key
-              </code>
             </div>
             <div>
               <span className="text-slate-400">API Key：</span>

@@ -172,45 +172,54 @@ pub fn qoder_env_reset_items() -> Vec<QoderResetItem> {
 
 /// 环境重置执行：关闭 Qoder CN → 按勾选项逐项清理（单项失败不中断）。
 #[tauri::command(async)]
-pub fn qoder_env_reset(
+pub async fn qoder_env_reset(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     items: Vec<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
     if items.is_empty() {
         return Err("未选择任何清理项".into());
     }
-    let mut results: Vec<serde_json::Value> = vec![];
+    // spawn_blocking（对照 credits.rs/oauth.rs 做法）：graceful_kill_app 的
+    // tasklist/taskkill 轮询（最坏 3×400ms×N 项）与 force_rmtree 大目录删除均为
+    // 重 IO，async 命令体内直接执行会占用 async worker 线程；state 需提前
+    // clone/move 进闭包（State 非移动安全），items/app 一并移交，结果 await 回传
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut results: Vec<serde_json::Value> = vec![];
 
-    // 关闭 Qoder CN（防数据目录占用与清理后回写）
-    let _ = crate::commands::process::graceful_kill_app("Qoder CN");
+        // 关闭 Qoder CN（防数据目录占用与清理后回写）
+        let _ = crate::commands::process::graceful_kill_app("Qoder CN");
 
-    // 按勾选项执行（单项失败不中断其余项）
-    for id in &items {
-        match run_reset_item(id, &items) {
-            Ok(detail) => results.push(serde_json::json!({ "id": id, "ok": true, "detail": detail })),
-            Err(e) => results.push(serde_json::json!({ "id": id, "ok": false, "detail": e })),
+        // 按勾选项执行（单项失败不中断其余项）
+        for id in &items {
+            match run_reset_item(id, &items) {
+                Ok(detail) => results.push(serde_json::json!({ "id": id, "ok": true, "detail": detail })),
+                Err(e) => results.push(serde_json::json!({ "id": id, "ok": false, "detail": e })),
+            }
         }
-    }
-    let ok_n = results
-        .iter()
-        .filter(|r| r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
-        .count();
-    let fail_n = results.len() - ok_n;
-    fs_utils::app_log(
-        &state.data_dir,
-        &format!("qoder: 环境重置完成（{ok_n}/{} 项成功）", items.len()),
-    );
-    if fail_n > 0 {
-        crate::commands::workbuddy::push_notify(
-            Some(&app),
+        let ok_n = results
+            .iter()
+            .filter(|r| r.get("ok").and_then(|v| v.as_bool()).unwrap_or(false))
+            .count();
+        let fail_n = results.len() - ok_n;
+        fs_utils::app_log(
             &state.data_dir,
-            "Qoder 环境重置",
-            &format!("清理完成，{fail_n} 项失败，请查看详情"),
-            crate::notify::NotifyEvent::Other,
+            &format!("qoder: 环境重置完成（{ok_n}/{} 项成功）", items.len()),
         );
-    }
-    Ok(results)
+        if fail_n > 0 {
+            crate::commands::workbuddy::push_notify(
+                Some(&app),
+                &state.data_dir,
+                "Qoder 环境重置",
+                &format!("清理完成，{fail_n} 项失败，请查看详情"),
+                crate::notify::NotifyEvent::Other,
+            );
+        }
+        Ok(results)
+    })
+    .await
+    .map_err(|e| format!("环境重置任务失败: {e}"))?
 }
 
 #[cfg(test)]

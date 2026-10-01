@@ -9,8 +9,9 @@
 //!    凭证（PAT 换 24h 作业令牌 / 刷新链路在回调闭包内走全防护）→
 //!    `make_qoder_request`（COSY 19 头签名）；
 //! 4. 分级重试：HTTP 层走 `retry_plan`（429/5xx/502 同号退避、401/403 换号）；
-//!    **排队（业务码 10605）不冷却不换号**——按上游建议时长同号退避重试
-//!    （≤3 次，超限放回调度轮换，防止占死并发槽）；其余流内错误按
+//!    **排队（业务码 10605）同号退避优先**——首个进入排队的请求按上游建议
+//!    时长同号退避重试（≤3 次，超限放回调度轮换，防止占死并发槽）；并发场景
+//!    下若该模型已记录冷却则直接 break 换号（快速失败）；其余流内错误按
 //!    ErrMeta 分类映射 ErrKind 后换号；
 //! 5. 流式：首字超时 10s（`open_qoder_stream`）→ QoderTranslate 翻译为标准
 //!    OpenAI chunk → `wb_sse::stream_forward_ex`（keep-alive 15s + 断连三层
@@ -19,13 +20,15 @@
 //!
 //! 与 wb_route 的差异（v1 精简项）：无会话粘性绑定（上游 session 由请求体
 //! session_seed 派生，粘性收益不同构）、无竞速对冲、无模板清洗、无工具代执行、
-//! 无模型级冷却、无 401 刷新重试（凭证新鲜度由 identity 回调按次解析兜住）。
+//! 无 401 刷新重试（凭证新鲜度由 identity 回调按次解析兜住）。模型级冷却已
+//! 补齐（审查修复）：排队/超限类错误记录 model → 冷却截止，dispatch 预检
+//! 快速回退、执行路径跳过同号退避（见下方「模型级冷却」节）。
 //!
 //! 客户端断连：与 wb_route 同款三层检测（轮换/重试入口 tx.is_closed、停滞期
 //! next_event_polling 轮询、活跃流逐事件顶部检测）。
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -51,6 +54,113 @@ const QUEUE_BACKOFF_MAX_SECS: u64 = 30;
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
 fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+// ==================== 模型级冷却（审查修复，镜像 wb_route::model_cooldowns） ====================
+
+/// Qoder 模型级冷却表：model → 冷却截止时刻。排队/超限类错误（ErrMeta 分类
+/// Queued）是模型级现象（换账号同样排队），与账号无关，故进程级静态表语义
+/// 等价；挂 ApiSharedState 需改 server.rs（他人负责），静态 OnceLock 最小改动。
+/// 备忘（审查 G6）：键为裸 model 名、无区域前缀，v1 恒 CN 区解析无歧义；
+/// 接线 Global 区时需加区域前缀（如 "global:{model}"）。表不做主动回收，
+/// 残留条目随冷却窗口（≤30s，QUEUE_BACKOFF_MAX_SECS 钳制）自然过期，重启即清零。
+static QODER_MODEL_COOLDOWNS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+fn cooldown_map() -> &'static Mutex<HashMap<String, Instant>> {
+    QODER_MODEL_COOLDOWNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 记录模型级冷却：按本次排队退避时长（已钳制）设定截止时刻。冷却窗口内
+/// 后续请求由 dispatch 健康预检快速回退（多源）/显式 429（单源），执行路径
+/// 跳过同号退避，不再每请求空转 5s×3~30s×3。
+/// 备忘（审查 G6）：键为裸 model 名、无区域前缀（v1 恒 CN 区）；接线 Global
+/// 区时需加区域前缀，见 QODER_MODEL_COOLDOWNS 定义处备忘。
+fn note_model_cooldown(model: &str, secs: u64) {
+    cooldown_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(model.to_string(), Instant::now() + Duration::from_secs(secs));
+}
+
+/// 模型冷却剩余秒数；None = 无冷却（过期残留条目同 wb 版语义按无冷却处理）
+pub fn model_cooling_remaining_secs(model: &str) -> Option<u64> {
+    let map = cooldown_map().lock().unwrap_or_else(|e| e.into_inner());
+    let until = map.get(model)?;
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        None
+    } else {
+        Some(left.as_secs())
+    }
+}
+
+/// 请求成功后清除该模型冷却（同 wb_route::clear_model_failure 语义）
+fn clear_model_cooldown(model: &str) {
+    cooldown_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(model);
+}
+
+/// 排队/退避分段等待（审查修复）：长 sleep 切成 ≤500ms 片段逐段睡，每段后
+/// 检查流通道是否关闭——客户端已断连即提前退出，不再空等数十秒排队/退避
+/// 时长；返回 false = 已断连。非流式路径无下行通道可查（handler 返回
+/// Response 前无断连通知机制），保持整段 sleep
+fn sleep_interruptible(
+    total: Duration,
+    tx: Option<&tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>>,
+) -> bool {
+    let mut left = total;
+    while !left.is_zero() {
+        let step = left.min(Duration::from_millis(500));
+        std::thread::sleep(step);
+        left = left.saturating_sub(step);
+        if let Some(t) = tx {
+            if t.is_closed() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// resolve 命中条目是否 Global 专属（审查修复：v1 恒 CN 网关执行，Global
+/// 专属条目调度 resolve 双区兜底判活、执行必死，需在执行入口明确拒绝）。
+///
+/// qoder_upstream 未暴露分区分目录/兜底表的查询接口（他人文件不可改），判定
+/// 基于两路**确定性证据**，不依赖旧实现「resolve(Global) 结果与命中条目 Value
+/// 全等 ⟹ 两区同名条目声明必有差异」的脆弱值假设（同名同值场景会误判）：
+/// ① list() 并集按 id 去重、Global 侧先注册：标注 "cn" ⟺ Global 侧（远程目录
+///    + 静态兜底表）完全无此 id → CN resolve 的命中必来自 CN 侧 → 必非专属；
+/// ② 标注 "global" 时借 resolve 双区优先序差异取第二证据：resolve(Global) 序
+///    = [Global 目录, CN 目录, CN 兜底, Global 兜底]，resolve(Cn) 序 = [CN 目录,
+///    Global 目录, Global 兜底, CN 兜底]。两路命中**不同**条目时可逐源证明
+///    CN 侧必有此 id（CN 远程目录或 CN 兜底表至少其一声明）→ 必非专属；
+/// ③ 两路命中全等：既有 pub 接口无法区分「仅 Global 独持」与「两区同名同值」
+///    （后者仅可能来自远程目录动态刷新；静态兜底表两区同名条目倍率/档位全
+///    不同）。按 v1 恒 CN 执行的 fail-closed 策略判 Global 专属：Global 侧
+///    声明了此 id 而 CN 侧无任何确定性可得证据，放行只会把请求送进 CN 网关
+///    收上游诡异报错，拒绝则走明确的 404 提示通道。
+fn entry_is_global_only(model: &str, entry: &Value) -> bool {
+    let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty() {
+        return false; // name/upstreamKey 命中且无 id 的边缘：保守放行
+    }
+    let Some(listed) = qoder_upstream::list()
+        .into_iter()
+        .find(|m| m.get("id").and_then(Value::as_str) == Some(id))
+    else {
+        return false; // list 无此 id（按 name/upstreamKey 命中）：保守放行
+    };
+    if listed.get("region").and_then(Value::as_str) == Some("cn") {
+        return false; // 证据①：Global 侧确定无此 id
+    }
+    match qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Global) {
+        // 证据②：两路命中不同 ⟹ CN 侧至少一源声明此 id（逐源可证，见上）
+        Some(g) if g != *entry => false,
+        // 全等：CN 侧确定性可得证据缺失，按 fail-closed 策略判专属（见③）
+        _ => true,
+    }
 }
 
 /// 字符边界安全截断（自抄 wb_route::safe_slice，私有不可复用）：
@@ -156,6 +266,20 @@ fn run_qoder_stream(
         send_stream_error(tx, proto, 404, &msg);
         return;
     };
+    // 区域边界执行入口检查（审查修复）：resolve 双区兜底可能命中 Global 专属
+    // 条目——调度判活但 CN 网关执行必死，此处明确拒绝（404 可解析通道）而非
+    // 透传上游诡异报错
+    if entry_is_global_only(model, &entry) {
+        let msg = format!(
+            "upstream 404 error: model {model} only available in Qoder Global region, not yet supported"
+        );
+        state.logger.log_request(
+            "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
+            start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
+        );
+        send_stream_error(tx, proto, 404, &msg);
+        return;
+    }
     let model_key = entry
         .get("upstreamKey")
         .and_then(Value::as_str)
@@ -311,16 +435,26 @@ fn run_qoder_stream(
                             // 流内错误分类以 ErrMeta 为准（translate 写入，含排队/额度信号）
                             match meta.as_ref().map(|m| m.kind) {
                                 Some(UpstreamKind::Queued) => {
-                                    // 排队：不冷却不换号，按上游建议同号退避重试
+                                    // 排队：同号退避重试为主；若该模型已被并发
+                                    // 请求记入冷却，则下方直接 break 换号（快速失败）
                                     if !sent_any && queue_same < QUEUE_RETRY_LIMIT {
-                                        queue_same += 1;
                                         let secs = meta
                                             .as_ref()
                                             .and_then(|m| m.queue.as_ref())
                                             .and_then(|q| q.retry_after_secs)
                                             .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
                                             .clamp(1, QUEUE_BACKOFF_MAX_SECS);
-                                        std::thread::sleep(Duration::from_secs(secs));
+                                        // 审查修复：模型级冷却——排队是模型级现象，
+                                        // 记录窗口供 dispatch 预检快速回退；已在冷却
+                                        // 中（并发请求刚记录过）则跳过同号退避空转
+                                        if model_cooling_remaining_secs(model).is_some() {
+                                            break;
+                                        }
+                                        note_model_cooldown(model, secs);
+                                        queue_same += 1;
+                                        if !sleep_interruptible(Duration::from_secs(secs), Some(tx)) {
+                                            return; // 客户端断连：提前退出
+                                        }
                                         continue;
                                     }
                                     break; // 超限：放回调度轮换
@@ -362,6 +496,7 @@ fn run_qoder_stream(
                                 );
                                 return;
                             }
+                            clear_model_cooldown(model); // 审查修复：成功即清模型级冷却
                             state.qoder_pool.note_success(&picked.uid);
                             state.logger.log_request(
                                 "qoder", "POST", "/v1/chat/completions", model, true, 200,
@@ -377,28 +512,40 @@ fn run_qoder_stream(
                     match retry_plan(status, &resp_body, same_attempt, retry_after) {
                         RetryAction::RetrySame { delay_ms } => {
                             same_attempt += 1;
-                            std::thread::sleep(Duration::from_millis(delay_ms.min(60_000)));
-                            if tx.is_closed() {
+                            // 审查修复：分段 sleep + 断连感知（原整段 sleep 最长 60s，
+                            // 断连后仍空等；原 sleep 后的 is_closed 检查一并合并）
+                            if !sleep_interruptible(
+                                Duration::from_millis(delay_ms.min(60_000)),
+                                Some(tx),
+                            ) {
                                 return;
                             }
                             continue;
                         }
                         RetryAction::SwitchKey => {
                             // Qoder 业务错误常在 403/200 信封里：按 upstream 分类；
-                            // 排队（10605）不冷却不换号 → 同号退避重试
+                            // 排队（10605）同号退避优先——模型已在冷却中则
+                            // break 换号（快速失败，见下方冷却检查）
                             let classified =
                                 qoder_upstream::classify_upstream_error(status, &resp_body);
                             if classified.kind == UpstreamKind::Queued
                                 && queue_same < QUEUE_RETRY_LIMIT
                             {
-                                queue_same += 1;
                                 let secs = classified
                                     .queue
                                     .as_ref()
                                     .and_then(|q| q.retry_after_secs)
                                     .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
                                     .clamp(1, QUEUE_BACKOFF_MAX_SECS);
-                                std::thread::sleep(Duration::from_secs(secs));
+                                // 审查修复：模型级冷却（同流内 Queued 分支）
+                                if model_cooling_remaining_secs(model).is_some() {
+                                    break;
+                                }
+                                note_model_cooldown(model, secs);
+                                queue_same += 1;
+                                if !sleep_interruptible(Duration::from_secs(secs), Some(tx)) {
+                                    return; // 客户端断连：提前退出
+                                }
                                 continue;
                             }
                             let kind = classified.kind.to_err_kind();
@@ -461,8 +608,17 @@ pub async fn qoder_aggregate_chat(
 
         // 区域边界（v1）：恒 CN 区解析，同 run_qoder_stream 注释（Global 区未接线）
         let Some(entry) = qoder_upstream::resolve(&model, qoder_upstream::QoderRegion::Cn) else {
-            return Err(format!("model {model} not in Qoder catalog"));
+            // 审查修复：走 "upstream {status} error:" 可解析通道——非流式错误
+            // 解析按前缀提取状态码，裸消息此前落 503，与流式 404 语义不一致
+            return Err(format!("upstream 404 error: model {model} not in Qoder catalog"));
         };
+        // 区域边界执行入口检查（审查修复）：同 run_qoder_stream，Global 专属
+        // 条目调度判活但 CN 网关执行必死，明确拒绝而非透传上游诡异报错
+        if entry_is_global_only(&model, &entry) {
+            return Err(format!(
+                "upstream 404 error: model {model} only available in Qoder Global region, not yet supported"
+            ));
+        }
         let model_key = entry
             .get("upstreamKey")
             .and_then(Value::as_str)
@@ -574,6 +730,7 @@ pub async fn qoder_aggregate_chat(
                                 state.record_usage_qoder(
                                     &model, &picked.uid, &key_id, true, stream, duration_ms, pt, ct,
                                 );
+                                clear_model_cooldown(&model); // 审查修复：成功即清模型级冷却
                                 state.qoder_pool.note_success(&picked.uid);
                                 state.logger.log_request(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
@@ -589,15 +746,22 @@ pub async fn qoder_aggregate_chat(
                                     .clone();
                                 match meta.as_ref().map(|m| m.kind) {
                                     Some(UpstreamKind::Queued) => {
-                                        // 排队：不冷却不换号，同号退避重试
+                                        // 排队：同号退避重试为主；模型已在冷却中
+                                        // 则 break 换号（快速失败，见下方冷却检查）
                                         if queue_same < QUEUE_RETRY_LIMIT {
-                                            queue_same += 1;
                                             let secs = meta
                                                 .as_ref()
                                                 .and_then(|m| m.queue.as_ref())
                                                 .and_then(|q| q.retry_after_secs)
                                                 .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
                                                 .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                            // 审查修复：模型级冷却（同流式分支）；
+                                            // 非流式无下行通道，保持整段 sleep
+                                            if model_cooling_remaining_secs(&model).is_some() {
+                                                break;
+                                            }
+                                            note_model_cooldown(&model, secs);
+                                            queue_same += 1;
                                             std::thread::sleep(Duration::from_secs(secs));
                                             continue;
                                         }
@@ -650,13 +814,19 @@ pub async fn qoder_aggregate_chat(
                                 if classified.kind == UpstreamKind::Queued
                                     && queue_same < QUEUE_RETRY_LIMIT
                                 {
-                                    queue_same += 1;
                                     let secs = classified
                                         .queue
                                         .as_ref()
                                         .and_then(|q| q.retry_after_secs)
                                         .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
                                         .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                    // 审查修复：模型级冷却（同流式分支）；非流式
+                                    // 无下行通道，保持整段 sleep
+                                    if model_cooling_remaining_secs(&model).is_some() {
+                                        break;
+                                    }
+                                    note_model_cooldown(&model, secs);
+                                    queue_same += 1;
                                     std::thread::sleep(Duration::from_secs(secs));
                                     continue;
                                 }
@@ -808,4 +978,87 @@ fn internal_error_response() -> Response {
         .status(StatusCode::INTERNAL_SERVER_ERROR)
         .body(Body::from("{\"error\":{\"message\":\"internal error\"}}"))
         .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 远程目录测试条目（adopt_remote 接受的最小合法信封载荷）
+    fn remote_entry(key: &str, display: &str, factor: f64) -> Value {
+        json!({
+            "key": key,
+            "display_name": display,
+            "enable": true,
+            "is_vl": false,
+            "is_reasoning": true,
+            "price_factor": factor,
+            "max_input_tokens": 128000,
+            "source": "remote",
+        })
+    }
+
+    /// G4 确定性判定 remote 态：注入独有前缀（TwaG4）的双区远程目录，
+    /// 顺序覆盖 entry_is_global_only 的全部分支。
+    /// adopt_remote 写进程级共享目录且远程非空时会替换静态兜底——必须
+    /// 持 catalog_test_guard 独占并在退出（含 panic）时自动复位回落兜底，
+    /// 否则会污染并行运行的其他目录测试（如 qoder_upstream 的 list 去重）。
+    #[test]
+    fn entry_is_global_only_remote_states() {
+        let _catalog = qoder_upstream::catalog_test_guard();
+        // ① CN 远程独有：list 标注 "cn"（Global 侧完全无此 id）→ 必非专属
+        qoder_upstream::adopt_remote(
+            qoder_upstream::QoderRegion::Cn,
+            &json!({"statusCodeValue": 200,
+                    "chat": [remote_entry("twa4cn_key", "TwaG4CnOnly", 0.5)]}),
+        )
+        .unwrap();
+        let entry = qoder_upstream::resolve("TwaG4CnOnly", qoder_upstream::QoderRegion::Cn)
+            .expect("CN 远程目录应命中");
+        assert!(!entry_is_global_only("TwaG4CnOnly", &entry));
+
+        // ② Global 远程独有（CN 侧零可得证据）：两路 resolve 同落 Global 条目
+        //    → fail-closed 判专属
+        qoder_upstream::adopt_remote(
+            qoder_upstream::QoderRegion::Global,
+            &json!({"statusCodeValue": 200,
+                    "chat": [remote_entry("twa4g_key", "TwaG4GlobalOnly", 0.7)]}),
+        )
+        .unwrap();
+        let entry =
+            qoder_upstream::resolve("TwaG4GlobalOnly", qoder_upstream::QoderRegion::Cn)
+                .expect("双区兜底应命中 Global 独有条目");
+        assert!(entry_is_global_only("TwaG4GlobalOnly", &entry));
+
+        // ③ 两区同名但声明不同（Global 倍率 0.7 / CN 倍率 0.3）：list 标注被
+        //    Global 吞并为 "global"，但两路 resolve 命中不同条目 → CN 远程
+        //    确定可得 → 非专属（证据②，不再依赖值全等假设的反向推断）
+        qoder_upstream::adopt_remote(
+            qoder_upstream::QoderRegion::Global,
+            &json!({"statusCodeValue": 200,
+                    "chat": [remote_entry("twa4same_key", "TwaG4Same", 0.7)]}),
+        )
+        .unwrap();
+        qoder_upstream::adopt_remote(
+            qoder_upstream::QoderRegion::Cn,
+            &json!({"statusCodeValue": 200,
+                    "chat": [remote_entry("twa4same_key", "TwaG4Same", 0.3)]}),
+        )
+        .unwrap();
+        let entry = qoder_upstream::resolve("TwaG4Same", qoder_upstream::QoderRegion::Cn)
+            .expect("CN 远程目录应命中");
+        assert!(!entry_is_global_only("TwaG4Same", &entry));
+
+        // ④ 两区同名且同值（旧「同名必异」假设被打破的场景）：确定性证据缺失
+        //    → 策略性判专属（fail-closed，行为与旧版一致、依据改为显式策略）
+        qoder_upstream::adopt_remote(
+            qoder_upstream::QoderRegion::Global,
+            &json!({"statusCodeValue": 200,
+                    "chat": [remote_entry("twa4same_key", "TwaG4Same", 0.3)]}),
+        )
+        .unwrap();
+        let entry = qoder_upstream::resolve("TwaG4Same", qoder_upstream::QoderRegion::Cn)
+            .expect("CN 远程目录应命中");
+        assert!(entry_is_global_only("TwaG4Same", &entry));
+    }
 }

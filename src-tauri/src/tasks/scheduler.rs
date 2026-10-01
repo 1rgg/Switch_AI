@@ -333,9 +333,17 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
             };
             let opts = super::qoder_checkin::QoderCheckinOpts::daily();
             let done = super::qoder_checkin::run_checkin_round(st, &opts, &mut |_| {});
-            // 审查 M-1：存在失败账号时返 Err，交调度器 30 分钟冷却重试（暂态失败自愈）
+            // 审查 M-1：存在失败账号时返 Err，交调度器 30 分钟冷却重试（暂态失败自愈）。
+            // P2 重试口径：empty_campaigns（活动未上线/不可用）属非用户可操作失败，
+            // 计入重试只会全天无效重试 + 当日首败误报通知——按 failed - failed_empty_campaigns
+            // > 0 判定（对照 qoder_checkin::run_checkin_round 的设计注释）。done 事件恒携带
+            // 该字段；旧结构缺字段时 as_i64 为 None → 0，退回原口径，安全兼容
             let failed = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
-            if failed > 0 {
+            let failed_empty = done
+                .get("failed_empty_campaigns")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if failed - failed_empty > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 return Err(format!(

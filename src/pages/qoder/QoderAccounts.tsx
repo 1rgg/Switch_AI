@@ -146,9 +146,15 @@ export default function QoderAccounts() {
   const [exportWithCreds, setExportWithCreds] = useState(false);
   // 含凭证导出的二次确认弹框（审查 P0-2；禁 window.confirm，红线）
   const [credExportConfirm, setCredExportConfirm] = useState(false);
+  // 含凭证导出密码（审查 P1-1：凭证 AES-256-GCM 加密导出，非空 + 两次一致才放行）
+  const [exportPwd, setExportPwd] = useState('');
+  const [exportPwd2, setExportPwd2] = useState('');
   const [exportBusy, setExportBusy] = useState(false);
+  // 导入账号池弹框：文件 + 可选解密密码（仅加密导出文件需要；旧明文文件免密兼容）
+  const [importPoolOpen, setImportPoolOpen] = useState(false);
+  const [importPoolFile, setImportPoolFile] = useState<File | null>(null);
+  const [importPoolPwd, setImportPoolPwd] = useState('');
   const [importingBackup, setImportingBackup] = useState(false);
-  const importFileRef = useRef<HTMLInputElement>(null);
   // 环境重置（M4，对照 BuddyAccounts F-14）：8 项勾选预览 → 二次确认 → 执行结果
   const [resetOpen, setResetOpen] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
@@ -266,6 +272,20 @@ export default function QoderAccounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refresh, refreshSnapshots]);
 
+  // OAuth 完成看门狗（对齐 BuddyAccounts wb-oauth 同款兜底）：后端轮询最长 180s，
+  // 看门狗 310s 留足事件送达余量；done 事件异常缺失（桥挂死/事件丢失/后台线程 panic）
+  // 时 oauthRunning 永挂，OAuth/IDE 扫描按钮永久禁用。310s 后解除等待并提示；迟到的 done 事件仍会正常提示。
+  useEffect(() => {
+    if (!oauthRunning) return;
+    const timer = setTimeout(() => {
+      setOauthRunning(false);
+      setOauthCanceling(false);
+      pushToast('warn', 'OAuth 登录超过 5 分钟未收到结果事件，已解除等待；结果请以账号列表为准');
+    }, 310_000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [oauthRunning]);
+
   const startOauth = async () => {
     setOauthRunning(true);
     setOauthCanceling(false);
@@ -330,15 +350,20 @@ export default function QoderAccounts() {
     try {
       const v = await api.qoder.accountImportPat(patName.trim() || undefined, patValue.trim());
       pushToast('success', `账号已导入：${v.nickname || v.id}`);
-      setShowImport(false);
-      setPatName('');
-      setPatValue('');
+      closeImport();
       void refresh();
     } catch (err) {
       pushToast('error', `导入失败：${String(err)}`);
     } finally {
       setImporting(false);
     }
+  };
+
+  // 关闭 PAT 导入弹框：PAT 等同密码，关闭时一并清空输入框残留（备注名同步重置）
+  const closeImport = () => {
+    setShowImport(false);
+    setPatName('');
+    setPatValue('');
   };
 
   const saveEdit = async () => {
@@ -429,7 +454,9 @@ export default function QoderAccounts() {
   };
 
   // 导出确认（M4，对照 BuddyAccounts F-46 扩展）：可选是否附带凭证副本。
-  // 含凭证时先弹独立确认弹框（审查 P0-2；禁 window.confirm，红线）
+  // 含凭证时先弹独立确认弹框（审查 P0-2；禁 window.confirm，红线），
+  // 弹框内强制设置导出密码（审查 P1-1：凭证加密导出，明文凭证不再落盘）
+  const exportPwdReady = exportPwd.trim().length > 0 && exportPwd === exportPwd2;
   const confirmExport = () => {
     if (exportWithCreds) {
       setCredExportConfirm(true);
@@ -439,23 +466,35 @@ export default function QoderAccounts() {
   };
 
   const doExport = async () => {
+    // 双保险：含凭证导出必须有合法密码（正常路径由弹框校验保证）
+    if (exportWithCreds && !exportPwdReady) {
+      pushToast('warn', '请先设置导出密码（两次输入需一致）');
+      return;
+    }
     setCredExportConfirm(false);
     setExportBusy(true);
     try {
-      const data = await api.qoder.accountsExport(exportWithCreds);
+      const data = await api.qoder.accountsExport(exportWithCreds, exportWithCreds ? exportPwd || undefined : undefined);
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
+      // 本地日期命名（对齐 QoderCheckin/Dashboard：toISOString 为 UTC，跨日会错一天）
+      const now = new Date();
+      const localDate = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
       a.href = url;
-      a.download = `qoder_accounts_${new Date().toISOString().slice(0, 10)}.json`;
+      a.download = `qoder_accounts_${localDate}.json`;
       a.click();
       // 延迟回收 blob URL：click() 后立即 revoke 可能中断部分浏览器对 blob 的异步读取
       setTimeout(() => URL.revokeObjectURL(url), 1_000);
       pushToast(
         'success',
-        exportWithCreds ? '账号池已导出（含凭证，文件等同密码请妥善保管）' : '账号元数据已导出（凭证不导出）',
+        exportWithCreds
+          ? '账号池已导出（含凭证，已用导出密码加密；导入时需输入同一密码）'
+          : '账号元数据已导出（凭证不导出）',
       );
       setExportOpen(false);
+      setExportPwd('');
+      setExportPwd2('');
     } catch (err) {
       pushToast('error', `导出失败：${String(err)}`);
     } finally {
@@ -463,12 +502,22 @@ export default function QoderAccounts() {
     }
   };
 
-  // 导入账号池（M4）：选择导出文件 → kind 校验入池（uid 幂等原位更新；含凭证回写）
-  const importBackupFile = async (file: File) => {
+  // 关闭导出密码弹框（取消/点遮罩关闭，导出成功路径亦清空）：密码等同敏感凭证，
+  // 关闭即清空输入残留，避免下次导出被预填（审查 F2）
+  const closeCredExport = () => {
+    if (exportBusy) return;
+    setCredExportConfirm(false);
+    setExportPwd('');
+    setExportPwd2('');
+  };
+
+  // 导入账号池（M4）：选择导出文件 → kind 校验入池（uid 幂等原位更新；含凭证回写）。
+  // 密码可选：仅加密导出文件（AIWQENC1 信封）需要；旧明文导出文件免密向后兼容
+  const importBackupFile = async (file: File, password: string) => {
     setImportingBackup(true);
     try {
       const payload = JSON.parse(await file.text()) as Record<string, unknown>;
-      const r = await api.qoder.accountsImport(payload);
+      const r = await api.qoder.accountsImport(payload, password || undefined);
       const parts = [`新增 ${r.added} 个账号`];
       if (r.updated > 0) parts.push(`更新 ${r.updated} 个`);
       pushToast('success', `导入完成：${parts.join('、')}，带凭证 ${r.with_credentials}`);
@@ -479,6 +528,9 @@ export default function QoderAccounts() {
           .join('；');
         pushToast('warn', `${r.rejected.length} 条被拒绝导入：${head}${r.rejected.length > 3 ? '…' : ''}`);
       }
+      setImportPoolOpen(false);
+      setImportPoolFile(null);
+      setImportPoolPwd('');
       await refresh();
     } catch (err) {
       pushToast('error', `导入失败：${String(err)}`);
@@ -579,22 +631,11 @@ export default function QoderAccounts() {
             <button
               className="btn-outline"
               disabled={importingBackup}
-              onClick={() => importFileRef.current?.click()}
-              title="导入账号池 JSON（uid 幂等合并，设备指纹仅在本地为空时补入）"
+              onClick={() => setImportPoolOpen(true)}
+              title="导入账号池 JSON（uid 幂等合并，设备指纹仅在本地为空时补入；加密导出文件需解密密码）"
             >
               {importingBackup ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />} 导入账号
             </button>
-            <input
-              ref={importFileRef}
-              type="file"
-              accept=".json,application/json"
-              className="hidden"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) void importBackupFile(f);
-                e.target.value = '';
-              }}
-            />
             <button
               className="btn-outline !text-rose-600 hover:!border-rose-300"
               disabled={resetLoading || resetBusy}
@@ -685,16 +726,6 @@ export default function QoderAccounts() {
               {loading ? (
                 <tr>
                   <td colSpan={8} className="px-3 py-4 text-center text-xs text-slate-400">加载中…</td>
-                </tr>
-              ) : accounts.length === 0 ? (
-                <tr>
-                  <td colSpan={8} className="px-3 py-6 text-center text-xs text-slate-400">
-                    暂无账号。可通过右上角三种方式入池：
-                    <br />
-                    <span className="text-slate-300 dark:text-zinc-600">
-                      扫描 IDE 登录态（本机已登录时一键导入）/ OAuth 登录 / 导入 PAT（qoder.com.cn → Integrations → 创建）
-                    </span>
-                  </td>
                 </tr>
               ) : (
                 filtered.map((a) => (
@@ -977,11 +1008,11 @@ export default function QoderAccounts() {
       {/* PAT 导入弹框 */}
       <Modal
         open={showImport}
-        onClose={() => setShowImport(false)}
+        onClose={closeImport}
         title="导入 Qoder PAT"
         footer={
           <>
-            <button className="btn-outline" onClick={() => setShowImport(false)}>取消</button>
+            <button className="btn-outline" onClick={closeImport}>取消</button>
             <button className="btn-primary" disabled={importing} onClick={() => void importPat()}>
               {importing ? '导入中…' : '导入'}
             </button>
@@ -1125,7 +1156,10 @@ export default function QoderAccounts() {
           </label>
           <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
             <ShieldAlert size={14} className="mt-0.5 shrink-0" />
-            <span>含凭证的导出文件等同密码，请妥善保管，切勿通过不可信渠道传输。</span>
+            <span>
+              勾选后须设置导出密码，凭证以 AES-256-GCM 加密写入导出文件；请牢记密码，
+              导入时需输入同一密码。密码与文件均请妥善保管，切勿通过不可信渠道传输。
+            </span>
           </div>
           <p className="text-xs text-slate-400">
             导出格式 kind=aiwork-qoder-pool；导入端按 uid 幂等合并——已有账号仅补全空缺字段，设备指纹仅在本地为空时补入，绝不覆盖。
@@ -1133,36 +1167,121 @@ export default function QoderAccounts() {
         </div>
       </Modal>
 
-      {/* 含凭证导出二次确认弹框（审查 P0-2；禁 window.confirm，红线） */}
+      {/* 含凭证导出二次确认弹框（审查 P0-2；禁 window.confirm，红线）：
+          强制设置导出密码（审查 P1-1），凭证以 AES-256-GCM 加密后才写入导出文件 */}
       <Modal
         open={credExportConfirm}
-        onClose={() => {
-          if (!exportBusy) setCredExportConfirm(false);
-        }}
-        title="确认导出明文凭证"
+        onClose={() => closeCredExport()}
+        title="设置导出密码（加密凭证）"
         footer={
           <>
-            <button className="btn-outline" disabled={exportBusy} onClick={() => setCredExportConfirm(false)}>
+            <button className="btn-outline" disabled={exportBusy} onClick={() => closeCredExport()}>
               取消
             </button>
             <button
-              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
-              disabled={exportBusy}
+              className="btn-primary"
+              disabled={exportBusy || !exportPwdReady}
+              title={!exportPwdReady ? '需设置非空密码且两次输入一致' : '加密并导出'}
               onClick={() => void doExport()}
             >
-              {exportBusy ? '导出中…' : '我已知晓风险，继续导出'}
+              {exportBusy ? '导出中…' : '加密并导出'}
             </button>
           </>
         }
       >
         <div className="space-y-3 text-sm">
-          <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">
+          <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
             <ShieldAlert size={14} className="mt-0.5 shrink-0" />
             <span>
-              导出文件将包含账号的明文凭证（accessToken / refreshToken / PAT），文件等同密码。
-              仅应在可信环境用于账号迁移，导出后请妥善保管，切勿通过不可信渠道传输。
+              导出文件将包含账号凭证（accessToken / refreshToken / PAT），将以 AES-256-GCM
+              加密后写入：不设置密码无法导出。请牢记密码并妥善保管文件，密码丢失将无法导入。
             </span>
           </div>
+          <label className="block text-sm">
+            <span className="mb-1 block text-xs text-slate-500">导出密码（非空）</span>
+            <input
+              className="input w-full font-mono"
+              value={exportPwd}
+              onChange={(e) => setExportPwd(e.target.value)}
+              type="password"
+              placeholder="至少 1 个字符，建议 8 位以上强密码"
+              autoComplete="new-password"
+            />
+          </label>
+          <label className="block text-sm">
+            <span className="mb-1 block text-xs text-slate-500">确认密码（两次输入需一致）</span>
+            <input
+              className="input w-full font-mono"
+              value={exportPwd2}
+              onChange={(e) => setExportPwd2(e.target.value)}
+              type="password"
+              autoComplete="new-password"
+            />
+          </label>
+          {exportPwd2.length > 0 && !exportPwdReady && (
+            <p className="text-xs text-rose-600 dark:text-rose-400">两次输入不一致，请检查后重试</p>
+          )}
+        </div>
+      </Modal>
+
+      {/* 导入账号池弹框：文件选择 + 可选解密密码（审查 P1-1；旧明文导出文件免密兼容） */}
+      <Modal
+        open={importPoolOpen}
+        onClose={() => {
+          if (!importingBackup) setImportPoolOpen(false);
+        }}
+        title="导入 Qoder 账号池"
+        footer={
+          <>
+            <button
+              className="btn-outline"
+              disabled={importingBackup}
+              onClick={() => {
+                setImportPoolOpen(false);
+                setImportPoolFile(null);
+                setImportPoolPwd('');
+              }}
+            >
+              取消
+            </button>
+            <button
+              className="btn-primary"
+              disabled={importingBackup || !importPoolFile}
+              title={!importPoolFile ? '请先选择导出文件' : '按 uid 幂等合并入池'}
+              onClick={() => importPoolFile && void importBackupFile(importPoolFile, importPoolPwd)}
+            >
+              {importingBackup ? '导入中…' : '确认导入'}
+            </button>
+          </>
+        }
+      >
+        <div className="space-y-3">
+          <label className="block text-sm">
+            <span className="mb-1 block text-xs text-slate-500">选择导出文件（JSON）</span>
+            <input
+              type="file"
+              accept=".json,application/json"
+              className="input w-full"
+              onChange={(e) => {
+                setImportPoolFile(e.target.files?.[0] ?? null);
+                e.target.value = '';
+              }}
+            />
+          </label>
+          <label className="block text-sm">
+            <span className="mb-1 block text-xs text-slate-500">解密密码（可选，仅加密导出文件需要）</span>
+            <input
+              className="input w-full font-mono"
+              value={importPoolPwd}
+              onChange={(e) => setImportPoolPwd(e.target.value)}
+              type="password"
+              placeholder="加密导出时设置的密码；旧明文导出文件无需填写"
+              autoComplete="off"
+            />
+          </label>
+          <p className="text-xs text-slate-400">
+            按 uid 幂等合并：已有账号仅补全空缺字段，设备指纹仅在本地为空时补入，绝不覆盖。
+          </p>
         </div>
       </Modal>
 

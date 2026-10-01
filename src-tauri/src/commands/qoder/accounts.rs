@@ -83,7 +83,11 @@ fn view_of(a: &QoderAccount, tokens: &Value) -> QoderAccountView {
 /// async（审查 L）：ensure_pool_profiles 含磁盘 IO + RNG，阻塞命令会卡 UI 线程
 #[tauri::command(async)]
 pub fn qoder_accounts_list(state: State<AppState>) -> Result<Vec<QoderAccountView>, String> {
-    crate::tasks::qoder_device::ensure_pool_profiles(&state)?;
+    // P2 审查修复：指纹回填为增强性操作，失败仅记日志降级继续——
+    // 只读列表不应被回填失败连带拖垮（I14 同款留痕惯例）
+    if let Err(e) = crate::tasks::qoder_device::ensure_pool_profiles(&state) {
+        fs_utils::app_log(&state.data_dir, &format!("Qoder 指纹回填失败（已降级，列表继续）: {e}"));
+    }
     let accounts = load_pool(&state);
     let tokens = qoder_common::load_token_store(&state);
     Ok(accounts.iter().map(|a| view_of(a, &tokens)).collect())
@@ -129,6 +133,9 @@ pub fn qoder_account_remove(state: State<AppState>, user_id: String) -> Result<(
     if let Err(e) = qoder_common::remove_token(&state, &user_id) {
         fs_utils::app_log(&state.data_dir, &format!("Qoder 账号 {user_id} 凭证清理失败: {e}"));
     }
+    // Q3：主动回收该账号的全局刷新锁条目（仅摘表项无 DB 读；并发持有者的 Arc 由
+    // 引用计数自然释放，若与并发刷新竞争，新到的 ensure_fresh 会重建条目，语义不变）
+    qoder_common::refresh_lock_remove(&user_id);
     fs_utils::app_log(&state.data_dir, &format!("Qoder 账号已移除: {user_id}"));
     Ok(())
 }
@@ -186,7 +193,12 @@ pub async fn qoder_account_import_pat(
             if !plan.is_empty() {
                 a.plan = plan.clone();
             }
-            a.credential_source = "pat".into();
+            // P2 审查修复：credential_source 保守更新——本路径按 id（token 摘要）命中，
+            // 同 id 即同 token、凭证本体未变，仅来源字段为空时回填，防同账号多通道
+            // 导入时徽标随「最后导入者」漂移（与 uid/nickname 的保守回填策略一致）
+            if a.credential_source.is_empty() {
+                a.credential_source = "pat".into();
+            }
             a.needs_relogin = false;
             a.relogin_reason = String::new();
             // 指纹回填（幂等：已有稳定绑定不覆盖，§5.10）

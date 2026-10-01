@@ -12,7 +12,8 @@
 //! - Rust 签到直调后凭据全程内存传递（原 Python 脚本方案需写解密临时文件，已移除；
 //!   启动清理逻辑保留，兜底清理旧版本残留的临时凭据文件）。
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::fs_utils;
@@ -35,8 +36,11 @@ pub struct SecretEntry {
     pub refresh_token: String,
 }
 
-/// 全局 vault 句柄缓存：懒加载；持有锁期间完成读写 + 快照落盘，串行化访问
-static VAULT: Mutex<Option<Stronghold>> = Mutex::new(None);
+/// 全局 vault 句柄缓存：按 data_dir 分条懒加载（生产单 data_dir 只有一条缓存，
+/// 与旧「全局单例」行为一致；分条隔离让多 data_dir 场景——如单元测试各用临时目录——
+/// 互不串库）。持有锁期间完成读写 + 快照落盘，串行化访问
+static VAULTS: std::sync::LazyLock<Mutex<HashMap<PathBuf, Option<Stronghold>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // ---------------- DPAPI（Windows 数据保护 API） ----------------
 
@@ -116,46 +120,44 @@ mod dpapi {
     }
 }
 
-/// 生成 32 字节随机主密码：
-/// 熵源 = OS CSPRNG（Windows BCryptGenRandom 系统首选 RNG）。
-/// 旧实现（多轮 RandomState + 高精度时间 + 进程 ID 经 SHA-256 压缩）熵不足且部分可预测，
-/// 审查 P1 要求改用 OS CSPRNG；BCrypt 调用失败时保留旧实现兜底（主密码生成不允许 panic）。
-fn generate_password() -> Vec<u8> {
+/// OS CSPRNG 填充（Windows BCryptGenRandom 进程首选 RNG）；失败直接返回 Err。
+/// 审查 P2-4：**不允许任何弱熵回退路径**——CSPRNG 不可用属系统级故障，
+/// 静默降级到可预测熵（时间/PID 哈希）等于密钥材料可被离线爆破，必须 fail-fast。
+/// 供 vault 主密码生成与 Qoder 加密导出（salt/nonce）共用。
+pub(crate) fn csprng_fill(dest: &mut [u8]) -> Result<(), String> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Security::Cryptography::{
             BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
         };
-        let mut buf = [0u8; 32];
         // 算法句柄传零值（等效 NULL）配合 BCRYPT_USE_SYSTEM_PREFERRED_RNG 使用进程首选 RNG
         let halg: windows_sys::Win32::Security::Cryptography::BCRYPT_ALG_HANDLE =
             unsafe { std::mem::zeroed() };
         // STATUS_SUCCESS == 0
         let status = unsafe {
-            BCryptGenRandom(halg, buf.as_mut_ptr(), buf.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+            BCryptGenRandom(halg, dest.as_mut_ptr(), dest.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
         };
-        if status == 0 {
-            return buf.to_vec();
+        if status != 0 {
+            return Err(format!(
+                "OS CSPRNG 不可用（BCryptGenRandom 失败 status=0x{status:08X}）：拒绝生成密钥材料"
+            ));
         }
-        // BCrypt 失败 → 落到下方旧实现兜底
+        Ok(())
     }
-    use sha2::{Digest, Sha256};
-    use std::hash::{BuildHasher, Hasher};
-    let mut entropy: Vec<u8> = Vec::new();
-    for _ in 0..8 {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u128(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        );
-        entropy.extend(h.finish().to_le_bytes());
+    #[cfg(not(windows))]
+    {
+        let _ = dest;
+        Err("vault 仅支持 Windows（无可用 CSPRNG 封装）".into())
     }
-    entropy.extend(std::process::id().to_le_bytes());
-    let mut hasher = Sha256::new();
-    hasher.update(&entropy);
-    hasher.finalize().to_vec()
+}
+
+/// 生成 32 字节随机主密码：熵源 = OS CSPRNG（BCryptGenRandom）。
+/// 审查 P2-4：失败直接返回 Err 终止 vault 初始化（上层报错），删除旧实现的
+/// 「RandomState + 高精度时间 + 进程 ID 经 SHA-256 压缩」弱熵兜底路径。
+fn generate_password() -> Result<Vec<u8>, String> {
+    let mut buf = [0u8; 32];
+    csprng_fill(&mut buf)?;
+    Ok(buf.to_vec())
 }
 
 /// 读取（或首次生成）DPAPI 保护的主密码
@@ -167,21 +169,24 @@ fn vault_password_at(data_dir: &Path) -> Result<Vec<u8>, String> {
         let blob = std::fs::read(&key_path).map_err(|e| format!("读取 vault 密钥失败: {e}"))?;
         dpapi::unprotect(&blob)
     } else {
-        let pwd = generate_password();
+        let pwd = generate_password()?;
         let blob = dpapi::protect(&pwd)?;
         std::fs::write(&key_path, &blob).map_err(|e| format!("写入 vault 密钥失败: {e}"))?;
         Ok(pwd)
     }
 }
 
-/// 打开（并缓存）vault：首次调用时加载快照或创建新 client
-fn open_at(
+/// 打开（并缓存）data_dir 对应的 vault，然后在持锁状态下执行 `f(sh)`。
+/// 首次调用时加载快照或创建新 client；主密码/快照打开失败保留 None 条目待下次重试。
+fn with_open<T>(
     data_dir: &Path,
-) -> Result<std::sync::MutexGuard<'static, Option<Stronghold>>, String> {
+    f: impl FnOnce(&Stronghold) -> Result<T, String>,
+) -> Result<T, String> {
     // 锁中毒恢复：另一线程在持锁期间 panic 毒化锁时，直接恢复内部数据继续使用，
     // 而不是让「vault 锁已被毒化」错误在所有后续调用上永久传播
-    let mut guard = VAULT.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
+    let mut guard = VAULTS.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = guard.entry(data_dir.to_path_buf()).or_insert(None);
+    if entry.is_none() {
         let conf = data_dir.join("conf");
         let _ = std::fs::create_dir_all(&conf);
         let path = conf.join("vault.stronghold");
@@ -193,13 +198,9 @@ fn open_at(
             sh.create_client(CLIENT_PATH.to_vec())
                 .map_err(|e| format!("创建 vault client 失败: {e}"))?;
         }
-        *guard = Some(sh);
+        *entry = Some(sh);
     }
-    Ok(guard)
-}
-
-fn open(state: &AppState) -> Result<std::sync::MutexGuard<'static, Option<Stronghold>>, String> {
-    open_at(&state.data_dir)
+    f(entry.as_ref().expect("with_open: 条目刚初始化必有句柄"))
 }
 
 // ---------------- 通用命名空间凭证（WB / Qoder / 豆包等非 Trae 家族） ----------------
@@ -218,11 +219,19 @@ pub fn ns_get(data_dir: &Path, ns: &str, key: &str) -> Option<serde_json::Value>
     if ns.is_empty() || key.is_empty() {
         return None;
     }
-    let guard = open_at(data_dir).ok()?;
-    let sh = guard.as_ref()?;
-    let client = sh.get_client(CLIENT_PATH.to_vec()).ok()?;
-    let v = client.store().get(&ns_vault_key(ns, key)).ok()??;
-    serde_json::from_slice(&v).ok()
+    with_open(data_dir, |sh| {
+        let client = sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+        match client.store().get(&ns_vault_key(ns, key)).map_err(|e| format!("vault 读取失败: {e}"))? {
+            Some(v) => {
+                serde_json::from_slice(&v).map(Some).map_err(|e| format!("凭证解析失败: {e}"))
+            }
+            None => Ok(None),
+        }
+    })
+    .ok()
+    .flatten()
 }
 
 /// 写入命名空间凭证 + 快照落盘。失败返回 Err（调用方对齐 Trae 红线：
@@ -231,28 +240,22 @@ pub fn ns_set(data_dir: &Path, ns: &str, key: &str, v: &serde_json::Value) -> Re
     if ns.is_empty() || key.is_empty() {
         return Err("命名空间凭证 key 为空".into());
     }
-    let guard = open_at(data_dir)?;
-    let Some(sh) = guard.as_ref() else {
-        return Err("vault 未初始化".into());
-    };
-    let client = sh
-        .get_client(CLIENT_PATH.to_vec())
-        .map_err(|e| format!("获取 vault client 失败: {e}"))?;
-    let value = serde_json::to_vec(v).map_err(|e| format!("凭证序列化失败: {e}"))?;
-    client
-        .store()
-        .insert(ns_vault_key(ns, key), value, None)
-        .map_err(|e| format!("vault 写入失败: {e}"))?;
-    sh.save().map_err(|e| format!("vault 快照落盘失败: {e}"))
+    with_open(data_dir, |sh| {
+        let client = sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+        let value = serde_json::to_vec(v).map_err(|e| format!("凭证序列化失败: {e}"))?;
+        client
+            .store()
+            .insert(ns_vault_key(ns, key), value, None)
+            .map_err(|e| format!("vault 写入失败: {e}"))?;
+        sh.save().map_err(|e| format!("vault 快照落盘失败: {e}"))
+    })
 }
 
 /// 删除命名空间凭证（失败仅日志，不阻断上层删除流程——残留加密记录无碍安全）
 pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
-    let result = (|| -> Result<(), String> {
-        let guard = open_at(data_dir)?;
-        let Some(sh) = guard.as_ref() else {
-            return Err("vault 未初始化".into());
-        };
+    let result = with_open(data_dir, |sh| {
         let client = sh
             .get_client(CLIENT_PATH.to_vec())
             .map_err(|e| format!("获取 vault client 失败: {e}"))?;
@@ -261,7 +264,7 @@ pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
             .delete(&ns_vault_key(ns, key))
             .map_err(|e| format!("vault 删除失败: {e}"))?;
         sh.save().map_err(|e| format!("vault 快照落盘失败: {e}"))
-    })();
+    });
     if let Err(e) = result {
         fs_utils::app_log(data_dir, &format!("vault: 删除 {ns}:{key} 凭证失败（残留加密记录无碍安全）: {e}"));
     }
@@ -274,35 +277,33 @@ pub fn ns_remove(data_dir: &Path, ns: &str, key: &str) {
 pub fn load_accounts(state: &AppState) -> AccountsFile {
     // SQLite 化（P3）：checkin_accounts.json → accounts 表（行保序、user_id 可空）
     let mut file: AccountsFile = crate::store::docs::accounts_load(&crate::store::db(&state.data_dir));
-    let Ok(guard) = open(state) else {
-        return file; // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）
-    };
-    let Some(sh) = guard.as_ref() else {
-        return file;
-    };
-    let Ok(client) = sh.get_client(CLIENT_PATH.to_vec()) else {
-        return file;
-    };
-    for a in file.accounts.iter_mut() {
-        let Some(uid) = a.user_id.as_deref().filter(|u| !u.is_empty()) else {
-            continue;
-        };
-        if !a.jwt.trim().is_empty() {
-            continue; // JSON 明文优先
-        }
-        if let Ok(Some(v)) = client.store().get(uid.as_bytes()) {
-            if let Ok(entry) = serde_json::from_slice::<SecretEntry>(&v) {
-                if !entry.jwt.is_empty() {
-                    a.jwt = entry.jwt;
-                }
-                if a.refresh_token.as_deref().map_or(true, |s| s.is_empty())
-                    && !entry.refresh_token.is_empty()
-                {
-                    a.refresh_token = Some(entry.refresh_token);
+    // vault 不可用：降级返回 JSON 原样（占位 jwt 视为空，上层自行报错）
+    let _ = with_open(&state.data_dir, |sh| {
+        let client = sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+        for a in file.accounts.iter_mut() {
+            let Some(uid) = a.user_id.as_deref().filter(|u| !u.is_empty()) else {
+                continue;
+            };
+            if !a.jwt.trim().is_empty() {
+                continue; // JSON 明文优先
+            }
+            if let Ok(Some(v)) = client.store().get(uid.as_bytes()) {
+                if let Ok(entry) = serde_json::from_slice::<SecretEntry>(&v) {
+                    if !entry.jwt.is_empty() {
+                        a.jwt = entry.jwt;
+                    }
+                    if a.refresh_token.as_deref().map_or(true, |s| s.is_empty())
+                        && !entry.refresh_token.is_empty()
+                    {
+                        a.refresh_token = Some(entry.refresh_token);
+                    }
                 }
             }
         }
-    }
+        Ok(())
+    });
     file
 }
 
@@ -341,48 +342,46 @@ fn wipe_placeholders(accounts: &mut AccountsFile) {
 
 /// 把非空凭据写入 vault：读旧值做字段级合并（防止空字段覆盖 vault 中的有效值），最后快照落盘
 fn write_vault_secrets(state: &AppState, accounts: &AccountsFile) -> Result<(), String> {
-    let guard = open(state)?;
-    let Some(sh) = guard.as_ref() else {
-        return Err("vault 未初始化".into());
-    };
-    let client = sh
-        .get_client(CLIENT_PATH.to_vec())
-        .map_err(|e| format!("获取 vault client 失败: {e}"))?;
-    let mut count = 0usize;
-    for a in &accounts.accounts {
-        let Some(uid) = a.user_id.as_deref().filter(|u| !u.is_empty()) else {
-            continue;
-        };
-        let jwt_new = a.jwt.trim();
-        let rt_new = a.refresh_token.as_deref().unwrap_or("").trim();
-        if jwt_new.is_empty() && rt_new.is_empty() {
-            continue; // 占位账号无凭据可写
-        }
-        let entry = merge_entry(
+    with_open(&state.data_dir, |sh| {
+        let client = sh
+            .get_client(CLIENT_PATH.to_vec())
+            .map_err(|e| format!("获取 vault client 失败: {e}"))?;
+        let mut count = 0usize;
+        for a in &accounts.accounts {
+            let Some(uid) = a.user_id.as_deref().filter(|u| !u.is_empty()) else {
+                continue;
+            };
+            let jwt_new = a.jwt.trim();
+            let rt_new = a.refresh_token.as_deref().unwrap_or("").trim();
+            if jwt_new.is_empty() && rt_new.is_empty() {
+                continue; // 占位账号无凭据可写
+            }
+            let entry = merge_entry(
+                client
+                    .store()
+                    .get(uid.as_bytes())
+                    .ok()
+                    .flatten()
+                    .and_then(|v| serde_json::from_slice::<SecretEntry>(&v).ok()),
+                jwt_new,
+                rt_new,
+            );
+            let value = serde_json::to_vec(&entry).map_err(|e| format!("凭据序列化失败: {e}"))?;
             client
                 .store()
-                .get(uid.as_bytes())
-                .ok()
-                .flatten()
-                .and_then(|v| serde_json::from_slice::<SecretEntry>(&v).ok()),
-            jwt_new,
-            rt_new,
-        );
-        let value = serde_json::to_vec(&entry).map_err(|e| format!("凭据序列化失败: {e}"))?;
-        client
-            .store()
-            .insert(uid.as_bytes().to_vec(), value, None)
-            .map_err(|e| format!("vault 写入失败: {e}"))?;
-        count += 1;
-    }
-    sh.save().map_err(|e| format!("vault 快照落盘失败: {e}"))?;
-    if count > 0 {
-        fs_utils::app_log(
-            &state.data_dir,
-            &format!("vault: 已加密写入 {count} 个账号凭据"),
-        );
-    }
-    Ok(())
+                .insert(uid.as_bytes().to_vec(), value, None)
+                .map_err(|e| format!("vault 写入失败: {e}"))?;
+            count += 1;
+        }
+        sh.save().map_err(|e| format!("vault 快照落盘失败: {e}"))?;
+        if count > 0 {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("vault: 已加密写入 {count} 个账号凭据"),
+            );
+        }
+        Ok(())
+    })
 }
 
 /// 字段级合并：新值非空才覆盖（纯函数，便于单测）
@@ -399,11 +398,7 @@ fn merge_entry(existing: Option<SecretEntry>, jwt_new: &str, rt_new: &str) -> Se
 
 /// 删除账号时同步清理 vault 记录（失败仅记录，不阻断账号删除）
 pub fn remove_secret(state: &AppState, uid: &str) {
-    let result = (|| -> Result<(), String> {
-        let guard = open(state)?;
-        let Some(sh) = guard.as_ref() else {
-            return Err("vault 未初始化".into());
-        };
+    let result = with_open(&state.data_dir, |sh| {
         let client = sh
             .get_client(CLIENT_PATH.to_vec())
             .map_err(|e| format!("获取 vault client 失败: {e}"))?;
@@ -412,7 +407,7 @@ pub fn remove_secret(state: &AppState, uid: &str) {
             .delete(uid.as_bytes())
             .map_err(|e| format!("vault 删除失败: {e}"))?;
         sh.save().map_err(|e| format!("vault 快照落盘失败: {e}"))
-    })();
+    });
     match result {
         Ok(()) => fs_utils::app_log(&state.data_dir, &format!("vault: 已删除账号 {uid} 的凭据记录")),
         Err(e) => fs_utils::app_log(

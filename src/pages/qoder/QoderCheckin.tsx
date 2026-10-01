@@ -27,8 +27,7 @@ type ParsedEvent =
   | { type: 'start'; total: number }
   | { type: 'done'; ok: number; already: number; failed: number }
   | { type: 'exit' }
-  | QoderAccountLine
-  | { index: 0; status: 'skip'; message: string };
+  | QoderAccountLine;
 
 function parseLine(raw: string): ParsedEvent | null {
   try {
@@ -80,7 +79,6 @@ export default function QoderCheckin() {
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState<QoderAccountLine[]>([]);
   const [doneInfo, setDoneInfo] = useState<{ ok: number; already: number; failed: number } | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [checkinMap, setCheckinMap] = useState<Map<string, QoderCheckinRecord[]>>(new Map());
   const [refreshing, setRefreshing] = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
@@ -120,7 +118,6 @@ export default function QoderCheckin() {
       if ('type' in parsed && parsed.type === 'start') {
         setLines([]);
         setDoneInfo(null);
-        setNotice(null);
       } else if ('type' in parsed && parsed.type === 'done') {
         setDoneInfo({ ok: parsed.ok, already: parsed.already, failed: parsed.failed });
         setRunning(false);
@@ -198,11 +195,6 @@ export default function QoderCheckin() {
       <PageHeader title="Qoder · 每日签到" desc="每天自动领取「签到」与「登录」两项奖励，重复执行不重复领" />
 
       {/* 双活动说明卡（§2.2） */}
-      {notice && (
-        <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
-          {notice}
-        </div>
-      )}
       <div className="card p-4">
         <div className="mb-3 flex items-center gap-2">
           <Gift size={16} className="text-violet-500" />
@@ -337,6 +329,8 @@ export default function QoderCheckin() {
                     ? 'text-emerald-600 dark:text-emerald-300'
                     : l.status === 'already'
                     ? 'text-sky-600 dark:text-sky-300'
+                    : l.status === 'skip'
+                    ? 'text-amber-600 dark:text-amber-300'
                     : 'text-rose-600 dark:text-rose-300';
                 const Icon = l.status === 'fail' ? XCircle : CheckCircle2;
                 return (

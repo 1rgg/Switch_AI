@@ -214,6 +214,23 @@ fn campaign_is_claimed(campaigns: &[Value], campaign_id: &str) -> bool {
     })
 }
 
+/// 多活动领取结果归并（纯函数，可单测）：success > fail > already——
+/// 任一 success → success；否则任一 fail → fail（保证失败触发调度器 30 分钟重试）；
+/// 否则 already。原实现「首个非 success 定型不互相覆盖」使 [already, fail] 归并为
+/// already，掩盖真实失败（全天不再重试）。
+fn merge_claim_kind(acc: &str, next: &str) -> String {
+    if acc == "success" || next == "success" {
+        return "success".into();
+    }
+    if acc == "fail" || next == "fail" {
+        return "fail".into();
+    }
+    if acc.is_empty() {
+        return next.to_string();
+    }
+    acc.to_string()
+}
+
 /// claim 网络异常后复查恢复（M1 任务，recon §3.2 cpa-multi-plugins 方案）：
 /// claim 请求可能已到达服务端但响应丢失（超时/断连），重新 GET campaigns 检查
 /// 该活动是否已变 CLAIMED——GET 幂等安全，绝不重发 claim（避免重复领取副作用）。
@@ -358,6 +375,12 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
         return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
                        "message": "凭证已过期且无刷新令牌，需重新登录或重新导入 PAT" });
     }
+    // P1 前置拦截：刷新令牌已被服务端 4xx 永久拒绝（auth_dead，池已标记 needs_relogin）
+    // 时本轮请求与 401 自愈同样注定失败——直接 fail 跳过，省一次必败网络请求
+    if note == "auth_dead" {
+        return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
+                       "message": "登录凭证已失效（刷新令牌被服务端拒绝），请重新导入账号凭证" });
+    }
     if refreshed {
         qoder_common::sync_pool_expiry(state, &aid, &creds);
     }
@@ -385,13 +408,9 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                         // 已领取活动的累计奖励不丢弃（真实入账，原 reward=None 会抹掉）
                         break;
                     }
-                    if k == "success" {
-                        // kind 优先级：success 覆写任何中间态（部分活动失败不掩盖整体成功）；
-                        // 其余 kind 仅在首个出现时定型（kind.is_empty() 门控），不互相覆盖
-                        kind = "success".into();
-                    } else if kind.is_empty() {
-                        kind = k.clone();
-                    }
+                    // kind 优先级归并（P2）：success > fail > already——
+                    // 部分活动失败不掩盖整体成功，任一失败也不被 already 掩盖
+                    kind = merge_claim_kind(&kind, &k);
                     if !m.is_empty() {
                         messages.push(m);
                     }
@@ -439,11 +458,8 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                             let mut reward = None;
                             for c in &claimable {
                                 let (k, m, r) = claim_one(agent, &headers, &urls, c);
-                                if k == "success" {
-                                    kind = "success".into();
-                                } else if kind.is_empty() {
-                                    kind = k.clone();
-                                }
+                                // kind 优先级归并（P2）：与首次路径同口径（success > fail > already）
+                                kind = merge_claim_kind(&kind, &k);
                                 if !m.is_empty() {
                                     messages.push(m);
                                 }
@@ -602,6 +618,18 @@ mod tests {
         let claimed = json!({"campaignId": "c2", "claimStatus": "CLAIMED"});
         let st2 = s_of(fs_utils::dig(&claimed, &["claimStatus"])).to_ascii_uppercase();
         assert_ne!(st2, "CLAIMABLE");
+    }
+
+    /// P2 归并口径：success > fail > already——[already, fail] 必须判 fail
+    ///（原实现归并为 already 掩盖失败），[success, fail] 判 success（部分失败不掩盖成功）
+    #[test]
+    fn merge_claim_kind_priority() {
+        assert_eq!(merge_claim_kind("", "already"), "already");
+        assert_eq!(merge_claim_kind("already", "fail"), "fail");
+        assert_eq!(merge_claim_kind("fail", "already"), "fail");
+        assert_eq!(merge_claim_kind("success", "fail"), "success");
+        assert_eq!(merge_claim_kind("fail", "success"), "success");
+        assert_eq!(merge_claim_kind("already", "already"), "already");
     }
 
     /// M1 claim 失败复查恢复：网络异常后按 campaignId 复查 claimStatus==CLAIMED

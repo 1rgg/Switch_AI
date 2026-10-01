@@ -231,7 +231,12 @@ fn import_device_creds(
             if !tier.is_empty() {
                 a.plan = tier;
             }
-            a.credential_source = "client".into();
+            // P2 审查修复：credential_source 保守更新——仅字段为空，或凭证本体实际
+            // 变化（按 uid 命中且新令牌派生 id 与原 id 不同 = 换发）时才更新，
+            // 防同账号多通道导入时徽标随「最后导入者」漂移
+            if a.credential_source.is_empty() || a.id != id {
+                a.credential_source = "client".into();
+            }
             // uid 空时不清空既有绑定（userinfo 失败且设备流未返回 uid 的降级场景）
             if !uid.is_empty() {
                 a.uid = uid.clone();

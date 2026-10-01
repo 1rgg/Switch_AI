@@ -130,11 +130,15 @@ pub struct IdeLogin {
     pub expires_at_ms: Option<i64>,
 }
 
-/// expireTime 提取：13 位毫秒时间戳（字符串/数字形态兼容）
+/// expireTime 提取：13 位毫秒时间戳（字符串/数字形态兼容）。
+/// P3 审查修复：秒/毫秒归一——>=1e12 视为毫秒原样返回，否则视为秒 ×1000
+/// （workbuddy::common::as_ts_seconds 为 pub(super) 不跨模块可用，本地实现同款阈值），
+/// 防秒级值被当作毫秒折算成 1970 年
 #[cfg(windows)]
 fn expire_ms_of(v: &serde_json::Value) -> Option<i64> {
     let raw = v.get("expireTime")?;
-    raw.as_i64().or_else(|| raw.as_str()?.trim().parse::<i64>().ok())
+    let ts = raw.as_i64().or_else(|| raw.as_str()?.trim().parse::<i64>().ok())?;
+    Some(if ts >= 1_000_000_000_000 { ts } else { ts * 1000 })
 }
 
 /// 读 IDE 存储当前登录态（未登录/解密失败 → Err，描述脱敏不含凭证）
@@ -214,7 +218,12 @@ pub fn qoder_ide_scan(state: State<AppState>) -> Result<QoderIdeScanResult, Stri
                 if a.nickname.is_empty() && !login.name.is_empty() {
                     a.nickname = login.name.clone();
                 }
-                a.credential_source = "ide_store".into();
+                // P2 审查修复：credential_source 保守更新——本路径按 id（token 摘要）命中，
+                // 同 id 即同 token、凭证本体未变，仅来源字段为空时回填，防多通道
+                // 导入时徽标随「最后导入者」漂移（与 uid/nickname 的保守回填策略一致）
+                if a.credential_source.is_empty() {
+                    a.credential_source = "ide_store".into();
+                }
                 a.token_expires_at = login.expires_at_ms.map(|ms| ms / 1000);
                 a.needs_relogin = false;
                 a.relogin_reason = String::new();
@@ -351,5 +360,10 @@ mod tests {
         assert_eq!(expire_ms_of(&v), None);
         let v: serde_json::Value = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(expire_ms_of(&v), None);
+        // P3：10 位秒级时间戳归一为毫秒（防被折算成 1970 年）
+        let v: serde_json::Value = serde_json::from_str(r#"{"expireTime":1791673619}"#).unwrap();
+        assert_eq!(expire_ms_of(&v), Some(1_791_673_619_000));
+        let v: serde_json::Value = serde_json::from_str(r#"{"expireTime":"1791673619"}"#).unwrap();
+        assert_eq!(expire_ms_of(&v), Some(1_791_673_619_000));
     }
 }

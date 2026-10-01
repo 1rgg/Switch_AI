@@ -411,6 +411,13 @@ pub fn unified_models_ex(
     // Buddy 侧上下文候选值：由末段按调度策略命中侧选定（issue #38-4，
     // WB 池未启用时残留快照数值不得拖低双源条目的上下文声明）
     let mut buddy_ctx: HashMap<String, u64> = HashMap::new();
+    // Qoder 侧候选值（审查修复，镜像 buddy_ctx 模式）：context/max_tokens/
+    // supports_images 由末段按命中侧（hit == qoder）选定——原实现合并时无条件
+    // 覆盖 context/max_tokens、丢弃 supportsImages，Qoder 池禁用时残留声明
+    // 仍拖低多源条目
+    let mut qoder_ctx: HashMap<String, u64> = HashMap::new();
+    let mut qoder_mt: HashMap<String, u64> = HashMap::new();
+    let mut qoder_img: HashMap<String, bool> = HashMap::new();
     // 自定义模型供应商（canonical → 用户填写值；聚合末段优先于系列推断）
     let mut custom_vendor: HashMap<String, String> = HashMap::new();
 
@@ -632,11 +639,17 @@ pub fn unified_models_ex(
                     if let Some(r) = qrate {
                         u.rate = Some(r);
                     }
+                    // 审查修复（镜像 buddy_ctx 模式）：候选记入 map，由末段按
+                    // 命中侧选定——禁用/未命中的 Qoder 声明不得覆盖多源条目；
+                    // supportsImages 同款（原实现合并时直接丢弃）
                     if let Some(c) = qctx {
-                        u.context_length = Some(c);
+                        qoder_ctx.insert(canonical.clone(), c);
                     }
                     if let Some(t) = qmt {
-                        u.max_tokens = Some(t);
+                        qoder_mt.insert(canonical.clone(), t);
+                    }
+                    if let Some(img) = qimg {
+                        qoder_img.insert(canonical.clone(), img);
                     }
                     if !qefforts.is_empty() {
                         u.efforts = super::efforts::declared_union(&[
@@ -720,6 +733,20 @@ pub fn unified_models_ex(
         if hit == Some("buddy") {
             if let Some(c) = buddy_ctx.get(&canonical) {
                 u.context_length = Some(*c);
+            }
+        }
+        // context_length/max_tokens/supports_image 命中 qoder → Qoder 目录声明
+        // （审查修复：Qoder 池禁用或未命中时残留声明不再拖低多源条目；
+        // supportsImages 此前合并即丢，此处随命中侧补齐）
+        if hit == Some("qoder") {
+            if let Some(c) = qoder_ctx.get(&canonical) {
+                u.context_length = Some(*c);
+            }
+            if let Some(t) = qoder_mt.get(&canonical) {
+                u.max_tokens = Some(*t);
+            }
+            if let Some(img) = qoder_img.get(&canonical) {
+                u.supports_image = Some(*img);
             }
         }
         // display：L1 人工 label 绝对最高优先（§3.2，覆盖双源展示名）；

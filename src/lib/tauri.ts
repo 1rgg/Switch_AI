@@ -462,12 +462,21 @@ export const api = {
       invoke<QoderCreditsResult>('qoder_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
     creditsHistoryList: () =>
       invoke<{ snapshots: QoderCreditsSnapshot[] }>('qoder_credits_history_list'),
-    /** 账号池导出（M4；includeCredentials=true 附带凭证副本——导出文件等同密码） */
-    accountsExport: (includeCredentials?: boolean) =>
-      invoke<QoderPoolExport>('qoder_accounts_export', { includeCredentials: includeCredentials ?? null }),
-    /** 账号池导入（M4；kind 强校验 + uid 幂等原位更新 + device_profile 仅本地为空才补入） */
-    accountsImport: (payload: Record<string, unknown>) =>
-      invoke<QoderPoolImportResult>('qoder_accounts_import', { payload }),
+    /**
+     * 账号池导出（M4；includeCredentials=true 必须提供 password——凭证经 AES-256-GCM
+     * 加密为 AIWQENC1 信封后才写入导出文件，后端对无密码含凭证导出直接拒绝）
+     */
+    accountsExport: (includeCredentials?: boolean, password?: string) =>
+      invoke<QoderPoolExport>('qoder_accounts_export', {
+        includeCredentials: includeCredentials ?? null,
+        password: password ?? null,
+      }),
+    /**
+     * 账号池导入（M4；kind 强校验 + uid 幂等原位更新 + device_profile 仅本地为空才补入）。
+     * payload 为加密信封（AIWQENC1）时必须提供 password 解密；旧明文导出文件免密向后兼容
+     */
+    accountsImport: (payload: Record<string, unknown>, password?: string) =>
+      invoke<QoderPoolImportResult>('qoder_accounts_import', { payload, password: password ?? null }),
     /** 环境重置清单（M4；8 项语义块 + 动态存在性标注） */
     envResetItems: () => invoke<QoderResetItem[]>('qoder_env_reset_items'),
     /** 环境重置执行（M4；自动关闭 Qoder CN，单项失败不中断） */

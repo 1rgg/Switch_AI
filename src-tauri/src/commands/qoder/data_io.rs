@@ -1,14 +1,21 @@
 //! Qoder 账号池导出/导入（F-80 M4，对照 WorkBuddy F-46 扩展同语义）。
 //!
 //! 导出：`kind: "aiwork-qoder-pool"` + version 强校验；include_credentials 开关
-//! （池/凭证分离，true 时整凭证对象作 `credential` 附带——导出文件等同密码）。
-//! 导入：id 三重校验（非空/ensure_uid_safe/qd-<12位十六进制小写>）→
+//! （池/凭证分离）。含凭证导出**强制密码加密**（审查 P1-1）：载荷 JSON 以
+//! AES-256-GCM 加密（口令 KDF = 迭代 SHA-256 10 万轮），信封 = 魔数 `AIWQENC1`
+//! + salt(16) + nonce(12) + 密文（含 16 字节 tag），base64 后作 `data` 字段随
+//! 信封 JSON 导出——凭证不再明文落盘；不设密码直接拒绝导出（兑现「含凭证必须
+//! 设密码」承诺）。不含凭证导出行为不变（明文本就无敏感数据）。
+//! 导入：检测魔数信封 → 必须提供密码解密（密码错误给友好错误）→ 走统一
+//! kind/version 校验；无魔数走原明文路径（旧明文导出文件向后兼容）。
+//! id 三重校验（非空/ensure_uid_safe/qd-<12位十六进制小写>）→
 //! find_uid_or_id 幂等原位更新（uid 优先 id 兜底）→ credential 回写 token store。
 //!
 //! 与 WorkBuddy 的关键差异（device_profile 指纹红线，§5.10）：指纹入池生成一次
 //! 永不轮换——命中已有账号时 device_profile 仅在本地为空才补入，绝不覆盖
 //! （覆盖等于轮换指纹）；新增账号时采用导出文件携带的指纹。
 
+use base64::Engine as _;
 use serde_json::Value;
 use tauri::State;
 
@@ -16,18 +23,108 @@ use super::common::{load_pool, load_pool_checked, save_pool, QoderAccount};
 use crate::fs_utils;
 use crate::state::AppState;
 
+// ── 凭证加密信封（审查 P1-1）────────────────────────────────────────────────
+
+/// 加密信封魔数（8 字节）。完整布局：magic(8) + salt(16) + nonce(12) + AES-256-GCM
+/// 密文（末尾自带 16 字节认证 tag）。
+const EXPORT_MAGIC: &[u8; 8] = b"AIWQENC1";
+/// 口令派生盐长度（随机生成，防彩虹表/跨文件重用）
+const SALT_LEN: usize = 16;
+/// AES-GCM 标准 nonce 长度（96 位）
+const NONCE_LEN: usize = 12;
+/// 口令 KDF 迭代轮数（慢哈希抬升暴力破解成本；sha2 为既有依赖，依赖层已开优化）
+const KDF_ITERATIONS: u32 = 100_000;
+
+/// 口令 KDF：链式迭代 SHA-256（10 万轮）。
+/// 项目无 argon2/pbkdf2 依赖（vault.rs 的 Stronghold 快照加密面向随机主密码，
+/// 非口令派生场景），故以既有 sha2 实现迭代慢哈希；盐前置混淆，逐轮回盐防中间态截断。
+fn kdf_password(password: &[u8], salt: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(salt);
+    h.update(password);
+    let mut acc = h.finalize();
+    for _ in 1..KDF_ITERATIONS {
+        let mut h = Sha256::new();
+        h.update(acc);
+        h.update(salt);
+        acc = h.finalize();
+    }
+    acc.into()
+}
+
+/// 明文 JSON → 加密信封字节（魔数+salt+nonce+密文）。salt/nonce 取自 OS CSPRNG
+/// （vault::csprng_fill，BCryptGenRandom；CSPRNG 失败直接报错，不降级弱熵）。
+pub(crate) fn seal_payload(plain: &[u8], password: &str) -> Result<Vec<u8>, String> {
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit};
+    let mut salt = [0u8; SALT_LEN];
+    crate::vault::csprng_fill(&mut salt)?;
+    let mut nonce = [0u8; NONCE_LEN];
+    crate::vault::csprng_fill(&mut nonce)?;
+    let key = kdf_password(password.as_bytes(), &salt);
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("加密初始化失败: {e}"))?;
+    let ct = cipher
+        .encrypt(aes_gcm::Nonce::from_slice(&nonce), plain)
+        .map_err(|e| format!("载荷加密失败: {e}"))?;
+    let mut out = Vec::with_capacity(EXPORT_MAGIC.len() + SALT_LEN + NONCE_LEN + ct.len());
+    out.extend_from_slice(EXPORT_MAGIC);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// 加密信封字节 → 明文 JSON。魔数不符/数据过短 = 非本应用生成的加密导出；
+/// 解密失败（GCM 认证不过）= 密码错误或文件损坏，均给友好错误。
+pub(crate) fn open_payload(sealed: &[u8], password: &str) -> Result<Vec<u8>, String> {
+    use aes_gcm::aead::Aead;
+    use aes_gcm::{Aes256Gcm, KeyInit};
+    let head = EXPORT_MAGIC.len() + SALT_LEN + NONCE_LEN;
+    if sealed.len() <= head || &sealed[..EXPORT_MAGIC.len()] != EXPORT_MAGIC {
+        return Err("文件不是本应用生成的加密导出（缺少 AIWQENC1 魔数头）".into());
+    }
+    let salt = &sealed[EXPORT_MAGIC.len()..EXPORT_MAGIC.len() + SALT_LEN];
+    let nonce = &sealed[EXPORT_MAGIC.len() + SALT_LEN..head];
+    let key = kdf_password(password.as_bytes(), salt);
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("解密初始化失败: {e}"))?;
+    cipher
+        .decrypt(aes_gcm::Nonce::from_slice(nonce), &sealed[head..])
+        .map_err(|_| "解密失败：导出密码错误或文件已损坏".to_string())
+}
+
+/// 识别载荷是否加密信封：`data` 字段 base64 解码后以魔数开头 → 返回信封字节；
+/// 其余形态（明文导出 JSON）返回 None，走原明文导入路径（向后兼容）。
+fn envelope_data_of(payload: &Value) -> Option<Vec<u8>> {
+    let data = payload.get("data")?.as_str()?;
+    let raw = base64::engine::general_purpose::STANDARD.decode(data).ok()?;
+    raw.starts_with(EXPORT_MAGIC).then_some(raw)
+}
+
 // ── 导出 ────────────────────────────────────────────────────────────────────
 
 /// 导出账号池：元数据必含；include_credentials=true 时附工具侧凭证副本
-/// （迁移场景用；导出文件等同密码，由前端提示）。池字段全量导出
-/// （device_profile 恒带，供异机导入沿用同一指纹）。
+/// （迁移场景用）。**含凭证必须提供 password**：载荷以 AES-256-GCM 加密为信封
+/// JSON（`encrypted: true` + `data: <base64>`），拒绝明文凭证导出；不含凭证导出
+/// 行为不变（明文，无敏感数据）。池字段全量导出（device_profile 恒带，
+/// 供异机导入沿用同一指纹）。
 #[tauri::command(async)]
 pub fn qoder_accounts_export(
     state: State<AppState>,
     include_credentials: Option<bool>,
+    password: Option<String>,
 ) -> Result<Value, String> {
     let pool = load_pool(&state);
     let include_cred = include_credentials.unwrap_or(false);
+    // 密码归一化：trim 后为空视为未提供（防误触空白密码）
+    let password = password.filter(|p| !p.trim().is_empty());
+    if include_cred && password.is_none() {
+        return Err(
+            "含凭证导出必须设置导出密码：凭证将以 AES-256-GCM 加密后写入导出文件，\
+             不提供密码将拒绝导出（不含凭证的元数据导出无需密码）"
+                .into(),
+        );
+    }
     let tokens = if include_cred {
         crate::tasks::qoder_common::load_token_store(&state)
             .get("tokens")
@@ -46,13 +143,32 @@ pub fn qoder_accounts_export(
             Ok(v)
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(serde_json::json!({
+    let payload = serde_json::json!({
         "kind": "aiwork-qoder-pool",
         "version": 1,
         "exported_at": fs_utils::now_iso(),
         "include_credentials": include_cred,
         "accounts": accounts,
-    }))
+    });
+    match (include_cred, password) {
+        (true, Some(pwd)) => {
+            // 加密信封导出：明文载荷序列化后整体加密，base64 随信封 JSON 落盘
+            let plain = serde_json::to_vec(&payload).map_err(|e| format!("序列化失败: {e}"))?;
+            let sealed = seal_payload(&plain, &pwd)?;
+            Ok(serde_json::json!({
+                "kind": "aiwork-qoder-pool",
+                "version": 1,
+                "exported_at": fs_utils::now_iso(),
+                "include_credentials": true,
+                "encrypted": true,
+                "cipher": "AES-256-GCM",
+                "kdf": format!("sha256-iter-{KDF_ITERATIONS}"),
+                "data": base64::engine::general_purpose::STANDARD.encode(&sealed),
+            }))
+        }
+        // 不含凭证：明文元数据导出（无敏感数据）；密码即使误传也忽略
+        _ => Ok(payload),
+    }
 }
 
 // ── 导入 ────────────────────────────────────────────────────────────────────
@@ -125,8 +241,26 @@ fn merge_account(pool: &mut Vec<QoderAccount>, a: &Value) -> MergeResult {
 
 /// 账号池导入：解析导出文件 → 逐账号幂等入池 + 凭证回写 token store
 /// （含凭证时按生效 id 写回，与池条目对齐）。
+/// 加密信封（AIWQENC1 魔数）必须提供 password 解密后再走统一校验链路；
+/// 无魔数走原明文路径（旧明文导出文件向后兼容，password 提供了也忽略）。
 #[tauri::command(async)]
-pub fn qoder_accounts_import(state: State<AppState>, payload: Value) -> Result<Value, String> {
+pub fn qoder_accounts_import(
+    state: State<AppState>,
+    payload: Value,
+    password: Option<String>,
+) -> Result<Value, String> {
+    // 加密信封解包（审查 P1-1）：识别在 kind 校验之前——信封外层无 accounts 字段
+    let payload = match envelope_data_of(&payload) {
+        Some(sealed) => {
+            let pwd = password.filter(|p| !p.trim().is_empty()).ok_or(
+                "该导出文件已加密（AIWQENC1 信封），需要提供导出时设置的密码才能导入",
+            )?;
+            let plain = open_payload(&sealed, &pwd)?;
+            serde_json::from_slice::<Value>(&plain)
+                .map_err(|e| format!("解密后内容解析失败: {e}"))?
+        }
+        None => payload,
+    };
     if payload.get("kind").and_then(Value::as_str) != Some("aiwork-qoder-pool") {
         return Err("文件格式无法识别（缺少 aiwork-qoder-pool 标记）".into());
     }
@@ -200,7 +334,7 @@ pub fn qoder_accounts_import(state: State<AppState>, payload: Value) -> Result<V
 
 #[cfg(test)]
 mod tests {
-    use super::merge_account;
+    use super::{envelope_data_of, merge_account, EXPORT_MAGIC, NONCE_LEN, SALT_LEN};
     use crate::commands::qoder::common::QoderAccount;
     use crate::tasks::qoder_device::QoderDeviceProfile;
 
@@ -331,5 +465,120 @@ mod tests {
             let payload = serde_json::json!({ "id": id });
             assert!(merge_account(&mut pool, &payload).is_err(), "应拒绝: {why}");
         }
+    }
+
+    // ==================== 加密信封（审查 P1-1）====================
+
+    use base64::Engine as _;
+
+    const KDF_FAST_ITERS: u32 = 1024;
+
+    /// 测试专用快速 KDF：与 kdf_password 同构，仅降低迭代轮数
+    /// （单测跑 10 万轮 × 多用例过慢；生产路径轮数由常量控制）
+    fn kdf_fast(password: &[u8], salt: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(salt);
+        h.update(password);
+        let mut acc = h.finalize();
+        for _ in 1..KDF_FAST_ITERS {
+            let mut h = Sha256::new();
+            h.update(acc);
+            h.update(salt);
+            acc = h.finalize();
+        }
+        acc.into()
+    }
+
+    fn seal_fast(plain: &[u8], password: &str) -> Result<Vec<u8>, String> {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit};
+        let mut salt = [0u8; SALT_LEN];
+        crate::vault::csprng_fill(&mut salt)?;
+        let mut nonce = [0u8; NONCE_LEN];
+        crate::vault::csprng_fill(&mut nonce)?;
+        let key = kdf_fast(password.as_bytes(), &salt);
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let ct = cipher
+            .encrypt(aes_gcm::Nonce::from_slice(&nonce), plain)
+            .unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(EXPORT_MAGIC);
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ct);
+        Ok(out)
+    }
+
+    fn open_fast(sealed: &[u8], password: &str) -> Result<Vec<u8>, String> {
+        use aes_gcm::aead::Aead;
+        use aes_gcm::{Aes256Gcm, KeyInit};
+        let head = EXPORT_MAGIC.len() + SALT_LEN + NONCE_LEN;
+        if sealed.len() <= head || &sealed[..EXPORT_MAGIC.len()] != EXPORT_MAGIC {
+            return Err("文件不是本应用生成的加密导出（缺少 AIWQENC1 魔数头）".into());
+        }
+        let salt = &sealed[EXPORT_MAGIC.len()..EXPORT_MAGIC.len() + SALT_LEN];
+        let nonce = &sealed[EXPORT_MAGIC.len() + SALT_LEN..head];
+        let key = kdf_fast(password.as_bytes(), salt);
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        cipher
+            .decrypt(aes_gcm::Nonce::from_slice(nonce), &sealed[head..])
+            .map_err(|_| "解密失败：导出密码错误或文件已损坏".to_string())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn envelope_加解密往返() {
+        let plain = br#"{"kind":"aiwork-qoder-pool","version":1,"accounts":[]}"#;
+        let sealed = seal_fast(plain, "p@ss-口令").expect("seal");
+        // 密文不等于明文且不含明文片段（凭证不明文落盘的基本面）
+        assert_ne!(&sealed[..], &plain[..]);
+        assert!(!sealed.windows(9).any(|w| w == b"aiwork-qo"));
+        // 魔数识别：信封以 AIWQENC1 开头
+        assert!(sealed.starts_with(EXPORT_MAGIC));
+        let round = open_fast(&sealed, "p@ss-口令").expect("open");
+        assert_eq!(round, plain.to_vec());
+        // envelope_data_of 识别：信封 JSON → Some；明文载荷 → None
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&sealed);
+        assert!(envelope_data_of(&serde_json::json!({ "data": b64 })).is_some());
+        assert!(envelope_data_of(&serde_json::json!({ "kind": "aiwork-qoder-pool" })).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn envelope_错误密码解密失败() {
+        let plain = b"secret-payload";
+        let sealed = seal_fast(plain, "correct-horse").expect("seal");
+        let err = open_fast(&sealed, "wrong-password").expect_err("错误密码应解密失败");
+        assert!(err.contains("密码错误"), "应给友好错误: {err}");
+        // 篡改密文同样认证失败（GCM 完整性）
+        let mut tampered = sealed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(open_fast(&tampered, "correct-horse").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn envelope_魔数不符拒绝() {
+        let mut sealed = seal_fast(b"x", "p").expect("seal");
+        sealed[0] = b'X'; // 破坏魔数
+        let err = open_fast(&sealed, "p").expect_err("魔数不符应拒绝");
+        assert!(err.contains("AIWQENC1"), "应提示缺少魔数头: {err}");
+    }
+
+    #[test]
+    fn envelope_明文载荷兼容() {
+        // 明文导出文件（无 data 字段 / 无魔数）→ envelope_data_of 返回 None → 走原明文路径
+        let legacy = serde_json::json!({
+            "kind": "aiwork-qoder-pool", "version": 1,
+            "include_credentials": false, "accounts": [],
+        });
+        assert!(envelope_data_of(&legacy).is_none());
+        // data 字段存在但非魔数开头（如普通 base64 文本）→ 不误判为信封
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"plain text not sealed");
+        assert!(envelope_data_of(&serde_json::json!({ "data": b64 })).is_none());
+        // data 非 base64 → None
+        assert!(envelope_data_of(&serde_json::json!({ "data": "!!!" })).is_none());
     }
 }

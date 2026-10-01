@@ -83,7 +83,8 @@ export default function QoderOverview() {
   // CLI 状态只读桥（本机登录账号数据源，对齐 BuddyOverview 登录账号卡）
   const [cliStatus, setCliStatus] = useState<QoderCliStatus | null>(null);
 
-  const refresh = async () => {
+  // fresh=false 初载走后端缓存（口径对齐 Dashboard/BuddyOverview）；仅顶部「刷新」按钮传 true 强制拉全账号
+  const refresh = async (fresh: boolean) => {
     setRefreshing(true);
     try {
       // creditsFetch 失败不拖垮整页（原裸 await 使单路 reject 连带其余三路 setState
@@ -92,7 +93,7 @@ export default function QoderOverview() {
       const [e, accs, crRes, recs] = await Promise.all([
         api.qoder.envCheck().catch(() => null),
         api.qoder.accountsList().catch(() => [] as QoderAccountView[]),
-        api.qoder.creditsFetch(undefined, true).then(
+        api.qoder.creditsFetch(undefined, fresh).then(
           (cr) => ({ ok: true as const, cr }),
           (err: unknown) => ({ ok: false as const, err }),
         ),
@@ -114,7 +115,7 @@ export default function QoderOverview() {
   };
 
   useEffect(() => {
-    void refresh();
+    void refresh(false);
     // 本机登录态（CLI 状态桥只读，失败静默——不影响主列表）
     api.qoder.cliStatus().then(setCliStatus).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -240,7 +241,7 @@ export default function QoderOverview() {
         title="Qoder · 概述"
         desc="Qoder CN（IDE / Work / CLI）运行总览 · 登录账号 / 本机套餐 / 告警提醒 / 签到趋势与积分榜"
         actions={
-          <button onClick={() => void refresh()} className="btn-outline" disabled={refreshing}>
+          <button onClick={() => void refresh(true)} className="btn-outline" disabled={refreshing}>
             <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
           </button>
         }
@@ -418,9 +419,21 @@ export default function QoderOverview() {
                 <div className="text-xs text-slate-500">{step.desc}</div>
               </div>
               {step.done ? (
-                <span className="shrink-0 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400">
-                  已完成
-                </span>
+                <div className="flex shrink-0 items-center gap-2">
+                  {/* client 步骤 done 后保留次级「打开」入口（「打开客户端」按钮会被已完成徽标吞掉） */}
+                  {step.key === 'client' && (
+                    <button
+                      onClick={openClient}
+                      className="btn-outline !px-3 !py-1 text-xs"
+                      disabled={openingClient}
+                    >
+                      {openingClient ? <Spinner /> : null} 打开
+                    </button>
+                  )}
+                  <span className="shrink-0 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-600 dark:bg-emerald-500/15 dark:text-emerald-400">
+                    已完成
+                  </span>
+                </div>
               ) : step.optional ? (
                 <span className="shrink-0 rounded-full bg-zinc-100 px-2.5 py-1 text-xs font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
                   可选

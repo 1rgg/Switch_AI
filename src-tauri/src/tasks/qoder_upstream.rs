@@ -291,11 +291,51 @@ fn read_state() -> CatalogState {
     }
 }
 
-fn write_state(state: CatalogState) {
+// ── 测试专用（cfg(test)）：目录状态互斥与复位 ──
+// 目录是进程级单例，而 catalog_for 在远程目录非空时完全替换静态兜底——
+// 并行测试中一方 adopt_remote 注入微型目录，会让另一方依赖兜底表的断言
+// （如 list 去重测试）读到被污染的状态。约定：凡测试中调用 adopt_remote，
+// 必须持有 catalog_test_guard()，持有期间独占、丢弃时（含 panic 展开）
+// 自动复位目录为「全空回落兜底」的初始态。
+
+/// 复位目录为初始态（双区远程清空 → 全部回落静态兜底表）
+#[cfg(test)]
+pub(crate) fn catalog_test_reset() {
+    let apply = |state: &mut CatalogState| {
+        state.global = Vec::new();
+        state.cn = Vec::new();
+        state.global_fetched_at = 0;
+        state.cn_fetched_at = 0;
+    };
     match catalog().write() {
-        Ok(mut guard) => *guard = state,
-        Err(poisoned) => *poisoned.into_inner() = state,
+        Ok(mut guard) => apply(&mut guard),
+        Err(poisoned) => apply(&mut poisoned.into_inner()),
     }
+}
+
+/// RAII 复位标记：丢弃时（含 panic 展开）调用 catalog_test_reset
+#[cfg(test)]
+pub(crate) struct CatalogTestGuard;
+
+#[cfg(test)]
+impl Drop for CatalogTestGuard {
+    fn drop(&mut self) {
+        catalog_test_reset();
+    }
+}
+
+/// 测试互斥入口：返回 (锁守卫, 复位守卫)，绑定到一个 let 即可
+#[cfg(test)]
+pub(crate) fn catalog_test_guard(
+) -> (std::sync::MutexGuard<'static, ()>, CatalogTestGuard) {
+    let lock = catalog_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+    (lock, CatalogTestGuard)
+}
+
+#[cfg(test)]
+fn catalog_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 /// 某地区当前生效的清单（远程优先，否则静态兜底）
@@ -316,6 +356,18 @@ fn catalog_for(state: &CatalogState, region: QoderRegion) -> Vec<Value> {
 /// 网络请求由接线层的刷新器发起（带 COSY 签名的 GET），本函数只做
 /// 「信封校验 + 解析 + 原子替换」。返回采纳的条目数。
 pub fn adopt_remote(region: QoderRegion, payload: &Value) -> Result<usize, String> {
+    fn apply(state: &mut CatalogState, region: QoderRegion, models: Vec<Value>, now: i64) {
+        match region {
+            QoderRegion::Global => {
+                state.global = models;
+                state.global_fetched_at = now;
+            }
+            QoderRegion::Cn => {
+                state.cn = models;
+                state.cn_fetched_at = now;
+            }
+        }
+    }
     if let Some(message) = envelope_error(payload) {
         return Err(message);
     }
@@ -325,18 +377,12 @@ pub fn adopt_remote(region: QoderRegion, payload: &Value) -> Result<usize, Strin
     }
     let count = models.len();
     let now = now_ms();
-    let mut state = read_state();
-    match region {
-        QoderRegion::Global => {
-            state.global = models;
-            state.global_fetched_at = now;
-        }
-        QoderRegion::Cn => {
-            state.cn = models;
-            state.cn_fetched_at = now;
-        }
+    // 读-改-写全程持写锁（P2 原子性）：原实现 read_state 克隆 → 修改 → write_state
+    // 整体替换，双区并发采纳（Global/CN 同时刷新完成）会互相覆盖丢一区数据
+    match catalog().write() {
+        Ok(mut guard) => apply(&mut guard, region, models, now),
+        Err(poisoned) => apply(&mut poisoned.into_inner(), region, models, now),
     }
-    write_state(state);
     Ok(count)
 }
 
@@ -774,9 +820,31 @@ fn truthy(value: &Value) -> bool {
 /// 转义形态把反斜杠去掉就与普通形态同形）
 fn raw_has_code(raw: &str, code: &str) -> bool {
     let flat: String = raw.chars().filter(|ch| *ch != '\\').collect();
-    flat.contains(&format!("\"code\":\"{code}\""))
-        || flat.contains(&format!("\"code\":{code}"))
+    // 字符串形态：闭合引号即天然边界，无前缀误匹配面
+    if flat.contains(&format!("\"code\":\"{code}\""))
         || flat.contains(&format!("\"code\": \"{code}\""))
+    {
+        return true;
+    }
+    // 数字形态需边界校验（P2 前缀误匹配：`"code":1053` 含 `"code":105` 子串，
+    // 使 1053 被误判为 105）
+    raw_contains_numeric_code(&flat, &format!("\"code\":{code}"))
+        || raw_contains_numeric_code(&flat, &format!("\"code\": {code}"))
+}
+
+/// 数字形态码的边界匹配：命中位置的后随字符若仍是 ASCII 数字，说明命中的只是
+/// 更长业务码的前缀（如 1053 之于 105），跳过继续找下一处；后随字符为
+/// JSON 分隔符（, } ] 空白等）才算真命中
+fn raw_contains_numeric_code(flat: &str, needle: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(pos) = flat[from..].find(needle) {
+        let after = from + pos + needle.len();
+        if !flat[after..].chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+            return true;
+        }
+        from = after;
+    }
+    false
 }
 
 /// 从文本里抠出定价页链接（蓝本正则 `/https?:\/\/[^"\\]*\/pricing[^"\\]*/i` 的无正则版）。
@@ -2448,6 +2516,9 @@ mod tests {
 
     #[test]
     fn list_union_dedups_global_first() {
+        // list() 在远程目录非空时替换兜底表：持测试锁避免读到并行
+        // adopt_remote 测试注入的瞬时状态（resolve 类测试有兜底回退不受影响）
+        let _catalog = catalog_test_guard();
         let items = list();
         let flash: Vec<&Value> = items.iter().filter(|m| m["id"] == "Qwen3.8-Flash").collect();
         assert_eq!(flash.len(), 1, "并集必须按 id 去重");
@@ -2470,6 +2541,8 @@ mod tests {
 
     #[test]
     fn adopt_remote_parses_and_resolves() {
+        // 采纳会写进程级目录：持测试锁独占，丢弃时自动复位回落兜底
+        let _catalog = catalog_test_guard();
         let payload = json!({
             "statusCodeValue": 200,
             "chat": [
@@ -2502,6 +2575,24 @@ mod tests {
         .is_err());
         // 空目录 → Err
         assert!(adopt_remote(QoderRegion::Cn, &json!({"chat": []})).is_err());
+    }
+
+    /// P2 前缀误匹配回归：数字形态码必须做后随字符边界校验——
+    /// `"code":1053` 不得命中 105，`"code":10605` 不得命中 1060/106；
+    /// 字符串形态与转义形态行为不变
+    #[test]
+    fn raw_has_code_rejects_prefix_of_longer_code() {
+        // 更长码的前缀 → 不命中
+        assert!(!raw_has_code(r#"{"code":1053,"message":"x"}"#, "105"));
+        assert!(!raw_has_code(r#"{"code": 10530}"#, "105"));
+        assert!(!raw_has_code(r#"{\"code\":10605}"#, "1060"));
+        // 精确码（数字/字符串/带空格/转义）→ 命中
+        assert!(raw_has_code(r#"{"code":105,"message":"expired"}"#, "105"));
+        assert!(raw_has_code(r#"{"code": 105}"#, "105"));
+        assert!(raw_has_code(r#"{"code":"105"}"#, "105"));
+        assert!(raw_has_code(r#"{\"code\":\"10605\"}"#, "10605"));
+        // 同文本中前缀命中失败但真码在后面 → 仍命中
+        assert!(raw_has_code(r#"{"code":1053,"then":{"code":105}}"#, "105"));
     }
 
     // ── 思考工具 ──

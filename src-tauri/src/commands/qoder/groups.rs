@@ -43,18 +43,34 @@ pub fn qoder_groups_list(state: State<AppState>) -> Vec<crate::commands::account
         .collect()
 }
 
-#[tauri::command]
-pub fn qoder_groups_create(state: State<AppState>, name: String, color: String) -> Result<String, String> {
-    let mut defs = load_defs(&state);
-    // 重名校验（审查 L）：同名分组会让前端按名匹配/展示产生歧义
+/// 分组名统一校验（trim/非空/全局重名；P2 审查修复：create 与 update 共用）。
+/// exclude_id 供 update 排除自身 id；返回 trim 后的名称
+fn validate_name(
+    defs: &[crate::models::Group],
+    name: &str,
+    exclude_id: Option<&str>,
+) -> Result<String, String> {
     let name = name.trim().to_string();
     if name.is_empty() {
         return Err("分组名不能为空".into());
     }
-    if defs.iter().any(|g| g.name == name) {
+    // 重名校验（审查 L）：同名分组会让前端按名匹配/展示产生歧义
+    if defs
+        .iter()
+        .any(|g| g.name == name && Some(g.id.as_str()) != exclude_id)
+    {
         return Err(format!("分组「{name}」已存在"));
     }
-    let id = format!("qoderg_{}", chrono::Local::now().timestamp_millis());
+    Ok(name)
+}
+
+#[tauri::command]
+pub fn qoder_groups_create(state: State<AppState>, name: String, color: String) -> Result<String, String> {
+    let mut defs = load_defs(&state);
+    let name = validate_name(&defs, &name, None)?;
+    // P3：追加 4 位随机 hex 后缀——timestamp_millis 同毫秒并发可撞 id
+    let rand = uuid::Uuid::new_v4().simple().to_string();
+    let id = format!("qoderg_{}{}", chrono::Local::now().timestamp_millis(), &rand[..4]);
     let order = (defs.len() as i32) + 1;
     defs.push(crate::models::Group {
         id: id.clone(),
@@ -75,8 +91,14 @@ pub fn qoder_groups_update(
     order: Option<i32>,
 ) -> Result<(), String> {
     let mut defs = load_defs(&state);
+    // P2 审查修复：name 复用 create 同款校验（trim/非空/重名，重名排除自身 id）；
+    // 先校验后可变借用，规避 defs 的 iter_mut 与校验读借用冲突
+    let new_name = match name.as_deref() {
+        Some(n) => Some(validate_name(&defs, n, Some(&id))?),
+        None => None,
+    };
     let g = defs.iter_mut().find(|g| g.id == id).ok_or("分组不存在")?;
-    if let Some(n) = name {
+    if let Some(n) = new_name {
         g.name = n;
     }
     if let Some(c) = color {

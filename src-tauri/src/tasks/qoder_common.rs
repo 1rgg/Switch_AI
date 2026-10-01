@@ -148,15 +148,32 @@ static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 以账号 id 为键的进程内锁串行化「读凭证→网络刷新→落库」全程；持锁后重读 token store
 /// 天然构成二次检查：他人已刷新落库则直接命中新凭证（fresh/复用），不再重复发网络请求。
 /// 锁序约定：refresh 锁 → TOKEN_STORE_LOCK（save_token_store 单向获取，无环）。
+/// 表本体提升到模块级（原为 refresh_lock_for 内静态）：供 refresh_lock_remove 在
+/// 账号移除路径主动清理访问（P3-L——账号移除后条目永驻 HashMap，进程生命周期内
+/// 每次增删账号泄漏一把锁）。
+static REFRESH_LOCKS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
+> = std::sync::Mutex::new(None);
+
 fn refresh_lock_for(acct_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
-    use std::collections::HashMap;
-    static LOCKS: std::sync::Mutex<Option<HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>> =
-        std::sync::Mutex::new(None);
-    let mut g = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
-    g.get_or_insert_with(HashMap::new)
+    let mut g = REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    g.get_or_insert_with(std::collections::HashMap::new)
         .entry(acct_id.to_string())
         .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
         .clone()
+}
+
+/// P3-L 主动清理：账号移除路径（qoder_account_remove 等删账号后）调用，回收其全局
+/// 刷新锁条目（仅摘表项，无 DB 读；并发持有者的 Arc 由引用计数自然释放，若移除与
+/// 并发刷新竞争，新到的 ensure_fresh 会重建条目，语义不变）。
+/// Q3：原方案在 ensure_fresh 内惰性 gc（每次调用 qoder_pool_load 全表 SELECT），
+/// 经网关 qoder_identity 回调成为热路径每请求 +1 次 DB 读，且 refresh_lock_for 先
+/// or_insert 建条目使 gc 永远命中无法短路——改为移除账号处主动调用本函数。
+pub(crate) fn refresh_lock_remove(acct_id: &str) {
+    let mut g = REFRESH_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = g.as_mut() {
+        map.remove(acct_id);
+    }
 }
 
 /// 敏感字段键名（审查 P0-1 凭证收敛）：rec 中这些字段一律占位（空串）存 DB，
@@ -418,12 +435,42 @@ pub fn get_json(
 
 // ── token 刷新（deviceToken/refresh；R-10 轮询参数侦察后补 poll 接入）───────
 
-/// 调 deviceToken/refresh（body {"refresh_token":...}）。
+/// 刷新失败分类（P1，移植 wb_common::RefreshFail 语义）：区分「凭证永久失效」与
+/// 「暂态故障」——原实现 status != 200 一律 None，401/403（refresh_token 永久吊销）
+/// 与断网同报 refresh_failed，调度器视为暂态无限重试，账号永不标记 needs_relogin
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshFail {
+    /// 网络不可达 / HTTP 5xx / 响应结构异常：暂态，保留 30 分钟冷却重试
+    Transient,
+    /// HTTP 4xx（含空 refresh_token 守卫）：refresh_token 被服务端永久拒绝
+    ///（吊销/过期；一次性轮换下旧 RT 不可恢复），应标记 needs_relogin 停止重试
+    AuthDead,
+}
+
+/// 非 200 的 HTTP 状态 → 刷新失败分类（Q1 抽纯函数便于单测；status=0/200 由调用方前置处理）。
+/// 429（限流）/408（请求超时）归 Transient：二者源于服务端压力/超时等暂态因素，
+/// 重试可恢复——若归 AuthDead 会经 mark_needs_relogin 永久停用本可自愈的账号；
+/// 其余 4xx 视为 refresh_token 被服务端永久拒绝（吊销/过期），归 AuthDead；
+/// 5xx 及其余状态为服务端故障，归 Transient。
+pub(crate) fn classify_refresh_status(status: u16) -> RefreshFail {
+    if status == 429 || status == 408 {
+        RefreshFail::Transient
+    } else if (400..500).contains(&status) {
+        RefreshFail::AuthDead
+    } else {
+        RefreshFail::Transient
+    }
+}
+
+/// 调 deviceToken/refresh（body {"refresh_token":...}）并给出失败分类。
 /// 成功返回新 Creds（expires 按 expiresIn 归一为毫秒回填——R-6 实测毫秒级 86400000，
 /// 秒级值兼容 ×1000；设备头原样透传保留）。
-pub fn refresh_token_once(agent: &ureq::Agent, creds: &QoderCreds) -> Option<QoderCreds> {
+pub fn refresh_token_once_ex(
+    agent: &ureq::Agent,
+    creds: &QoderCreds,
+) -> (Option<QoderCreds>, RefreshFail) {
     if creds.refresh_token.is_empty() {
-        return None;
+        return (None, RefreshFail::AuthDead);
     }
     // 刷新端点不带 Authorization（下方 retain 移除；鉴权完全靠 body 中的 refresh_token）+ Cosy 头
     let mut h = build_auth_headers(creds);
@@ -435,13 +482,20 @@ pub fn refresh_token_once(agent: &ureq::Agent, creds: &QoderCreds) -> Option<Qod
         &h,
         &serde_json::json!({ "refresh_token": creds.refresh_token }),
     );
-    if status != 200 {
-        return None;
+    if status == 0 {
+        return (None, RefreshFail::Transient);
     }
-    let body = body?;
+    if status != 200 {
+        // Q1：429（限流）/408（超时）为可恢复暂态（Transient），其余 4xx 才是
+        // 凭证被服务端永久拒绝（AuthDead）——分类理由见 classify_refresh_status
+        return (None, classify_refresh_status(status));
+    }
+    let Some(body) = body else {
+        return (None, RefreshFail::Transient);
+    };
     let acc = s_of(fs_utils::dig(&body, &["accessToken", "access_token", "token"]));
     if acc.is_empty() {
-        return None;
+        return (None, RefreshFail::Transient);
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
     let mut out = creds.clone();
@@ -452,6 +506,12 @@ pub fn refresh_token_once(agent: &ureq::Agent, creds: &QoderCreds) -> Option<Qod
     }
     if let Some(e) = i_of(fs_utils::dig(&body, &["expiresIn", "expires_in"])) {
         out.expires_at_ms = Some(now_ms + normalize_expires_in(e));
+    } else {
+        // P2：响应缺 expiresIn 时落保守本地过期基准（now+12h）——否则 expires_at 恒为
+        // None，ensure_fresh 的临期判定永无基准，每次调用都重发刷新请求。12h 低于客户端
+        // 典型 24h 有效期，宁多刷不误用；clamp_expires_at 仅钳非正/超界畸形值，
+        // now+12h 在合法域内不受影响
+        out.expires_at_ms = Some(now_ms + 12 * 3_600_000);
     }
     // 刷新令牌过期时刻随行解析（R-6 实测 refresh_token_expires_in≈48h ms；审查 L-RT）
     if let Some(e) = i_of(fs_utils::dig(
@@ -460,7 +520,7 @@ pub fn refresh_token_once(agent: &ureq::Agent, creds: &QoderCreds) -> Option<Qod
     )) {
         out.refresh_expires_at_ms = Some(now_ms + normalize_expires_in(e));
     }
-    Some(out)
+    (Some(out), RefreshFail::Transient)
 }
 
 // ── userinfo（PAT 导入时回填 uid/昵称；失败容错不阻塞导入）──────────────────
@@ -616,7 +676,7 @@ pub fn exchange_job_token(
 
 /// 惰性刷新：距过期 < lazy_hours 才刷；一次调用最多一次刷新。
 /// 返回 (creds, refreshed, note)，note ∈ no_credential/fresh/expired_needs_relogin/
-/// refreshed/refresh_failed/pat_rejected。
+/// refreshed/refreshed_unsaved/refresh_failed/auth_dead/pat_rejected。
 ///
 /// PAT 通道（R-6）：pt- 不被 sash 业务端点接受（实测 401），先经 jobToken 换取
 /// 24h 作业令牌；作业令牌临期（< lazy_hours，与客户端通道同语义）或已过期时用
@@ -679,7 +739,7 @@ pub fn ensure_fresh(
     // ── 客户端 token 通道：惰性刷新（deviceToken/refresh）──
     // 空 refresh_token 检查统一前置：过期/临期/未知过期（expires_at 缺失）一律无法
     // 客户端刷新。原实现仅在「已过期且带 expires_at」时前置判定，其余空 refresh_token
-    // 场景会掉进 refresh_token_once 的空守卫被误报 refresh_failed（暂态），触发无效重试
+    // 场景会掉进 refresh_token_once_ex 的空守卫被误报 refresh_failed（暂态），触发无效重试
     if creds.refresh_token.is_empty() {
         if let Some(exp) = creds.expires_at_ms {
             let remain_h = (exp - now_ms) as f64 / 3_600_000.0;
@@ -698,8 +758,13 @@ pub fn ensure_fresh(
             return (creds, false, "fresh");
         }
     }
-    if let Some(new) = refresh_token_once(agent, &creds) {
-        // §5.10：指纹不落库。refresh_token_once 原样保留注入指纹（返回值供本轮请求带
+    // P1（对照 wb 分类语义）：区分暂态与永久失败——HTTP 4xx 意味着 refresh_token 已被
+    // 服务端永久拒绝（吊销/过期），与网络故障同报 refresh_failed 会被调度器当暂态
+    // 无限重试；永久失败回写池 needs_relogin（对照 wb_common::mark_needs_relogin 落库）
+    // 并返回 auth_dead，qoder_refresh 等调用方按「需重登」处理、不再重试
+    let (new, fail) = refresh_token_once_ex(agent, &creds);
+    if let Some(new) = new {
+        // §5.10：指纹不落库。refresh_token_once_ex 原样保留注入指纹（返回值供本轮请求带
         // 设备头），但落库前须剥离设备字段——注入值/随机 machine_token 回写 store 后会被
         // creds_of 读作「真实捕获」，污染 merge_device_profile 的优先级①判定，且把
         // 「每会话现场随机」的 machine_token 固化。空串经 save_token_store 跳过 →
@@ -707,11 +772,23 @@ pub fn ensure_fresh(
         let mut persist = new.clone();
         persist.machine_id.clear();
         persist.machine_token.clear();
-        // 落库失败不能静默：否则刷新结果只存活本轮，凭证可能在下轮前过期
+        // P2 降级标记：落库失败不能仅记日志——刷新端点一次性轮换 refresh_token，
+        // 旧 RT 在服务端已作废，本轮新凭证只存活内存，进程重启后无法再刷新，
+        // 须重新导入/重登恢复。note=refreshed_unsaved 供调用方与日志可感知
+        //（本函数已记 error 日志；不改 NDJSON 事件契约，仅扩展 note 取值）
+        let mut note: &'static str = "refreshed";
         if let Err(e) = save_token_store(state, acct_id, &persist) {
-            fs_utils::app_log(&state.data_dir, &format!("[qoder] token 落库失败(id={acct_id}, 客户端通道): {e}"));
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!("[qoder] token 落库失败(id={acct_id}, 客户端通道): {e}"),
+            );
+            note = "refreshed_unsaved";
         }
-        return (new, true, "refreshed");
+        return (new, true, note);
+    }
+    if fail == RefreshFail::AuthDead {
+        mark_needs_relogin(state, acct_id, "客户端通道刷新被拒（refresh_token 已失效）");
+        return (creds, false, "auth_dead");
     }
     (creds, false, "refresh_failed")
 }
@@ -740,6 +817,36 @@ pub fn sync_pool_expiry(state: &AppState, aid: &str, creds: &QoderCreds) {
     }
     if changed {
         let _ = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool);
+    }
+}
+
+/// 标记账号需重新登录（P1，对照 wb_common::mark_needs_relogin 同语义落库）：
+/// 客户端通道刷新遇 HTTP 4xx 时 refresh_token 已被服务端永久拒绝（吊销/过期，
+/// 一次性轮换下不可恢复），重试无解——回写池 needs_relogin 后，看板/调度跳过
+/// 与 qoder_refresh 的「需重登」口径随之生效（reason 为静态描述，不含凭证）。
+pub fn mark_needs_relogin(state: &AppState, acct_id: &str, reason: &str) {
+    // I09：直操原始 JSON 保留未知字段，持池锁防并发整池覆盖丢写（sync_pool_expiry 同款）
+    let _guard = state
+        .qoder_pool_lock
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
+    let mut changed = false;
+    if let Some(accounts) = pool.get_mut("accounts").and_then(Value::as_array_mut) {
+        for a in accounts.iter_mut() {
+            if a.get("id").and_then(Value::as_str) == Some(acct_id) {
+                a["needs_relogin"] = serde_json::json!(true);
+                a["relogin_reason"] = serde_json::json!(reason);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let _ = crate::store::docs::qoder_pool_save(&crate::store::db(&state.data_dir), &pool);
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder] 账号 {acct_id} 已标记需重新登录（{reason}）"),
+        );
     }
 }
 
@@ -824,6 +931,21 @@ mod tests {
         let exp = now + normalize_expires_in(86_400_000);
         let hours = (exp - now) as f64 / 3_600_000.0;
         assert!((hours - 24.0).abs() < 0.01, "24h 窗口");
+    }
+
+    /// Q1：刷新失败状态分类——429（限流）/408（超时）为可恢复暂态归 Transient，
+    /// 不得触发 mark_needs_relogin 永久停用账号；401/403 及其余 4xx 为凭证被
+    /// 服务端永久拒绝归 AuthDead；5xx 服务端故障归 Transient
+    #[test]
+    fn classify_refresh_status_429_408_transient_rest_4xx_auth_dead() {
+        assert_eq!(classify_refresh_status(429), RefreshFail::Transient, "限流暂态");
+        assert_eq!(classify_refresh_status(408), RefreshFail::Transient, "超时暂态");
+        assert_eq!(classify_refresh_status(401), RefreshFail::AuthDead, "凭证被拒");
+        assert_eq!(classify_refresh_status(403), RefreshFail::AuthDead, "凭证被拒");
+        assert_eq!(classify_refresh_status(400), RefreshFail::AuthDead, "其余 4xx 永久拒绝");
+        assert_eq!(classify_refresh_status(422), RefreshFail::AuthDead, "其余 4xx 永久拒绝");
+        assert_eq!(classify_refresh_status(500), RefreshFail::Transient, "5xx 服务端故障");
+        assert_eq!(classify_refresh_status(503), RefreshFail::Transient, "5xx 服务端故障");
     }
 
     // ── p3-3 gateway 可行性探针（#[ignore]：cargo test probe_gateway -- --ignored --nocapture）──

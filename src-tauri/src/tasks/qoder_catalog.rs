@@ -6,7 +6,8 @@
 //! → [`qoder_upstream::adopt_remote`] 原子替换 CN 区缓存。
 //! - 空池空转；全部账号无凭证（未登录/需重登）静默跳过不计失败；
 //! - 网络/服务端失败返 Err 交调度器 30 分钟冷却重试；
-//! - 首个可用账号即目标（目录是账号无关的全局数据，无需逐账号拉取）。
+//! - 目录是账号无关的全局数据，无需逐账号拉取：按池序逐可用账号尝试，
+//!   任一账号成功即收口；单个账号失败记日志后试下一个，全部失败才 Err（P3）。
 
 use serde_json::{json, Value};
 
@@ -31,6 +32,8 @@ pub fn run_task(state: &AppState) -> Result<Value, String> {
     }
     let agent = http_agent(20);
     let url = model_list_url();
+    // P3：单个账号失败不再整体 Err——记日志后试下一个可用账号，全部失败才上抛
+    let mut last_err: Option<String> = None;
     for a in &accounts {
         let id = a.id.as_str();
         // 24h 惰性窗口（对齐探针/常规任务语义）：临期先刷再用
@@ -46,30 +49,62 @@ pub fn run_task(state: &AppState) -> Result<Value, String> {
             email: "",
             machine_id: &creds.machine_id,
         };
-        let headers = qoder_sign::build_cosy_headers(None, &url, &identity)?;
+        let headers = match qoder_sign::build_cosy_headers(None, &url, &identity) {
+            Ok(h) => h,
+            Err(e) => {
+                last_err = Some(format!("model/list 签名构造失败: {e}"));
+                crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!(
+                        "[qoder] 账号 {id} 目录同步失败，尝试下一账号: {}",
+                        last_err.as_deref().unwrap_or("")
+                    ),
+                );
+                continue;
+            }
+        };
         let resp = headers
             .into_iter()
             .fold(agent.get(&url), |r, (k, v)| r.set(&k, &v))
             .call();
         match resp {
             Ok(resp) if resp.status() == 200 => {
-                let body = resp
+                // Q2：响应读取失败 / 非 JSON / 目录采纳失败与签名/HTTP 非 200/网络
+                // 失败同款容错——记 last_err 后落循环尾部日志试下一账号，仅在全部
+                // 可用账号尝试完毕仍无成功时上抛最后错误（不再因单账号解析失败
+                // 提前 Err，与函数头「单个账号失败记日志后试下一个」声明一致）
+                match resp
                     .into_string()
-                    .map_err(|e| format!("model/list 响应读取失败: {e}"))?;
-                let payload: Value = serde_json::from_str(&body)
-                    .map_err(|e| format!("model/list 响应非 JSON: {e}"))?;
-                let count = qoder_upstream::adopt_remote(qoder_upstream::QoderRegion::Cn, &payload)?;
-                return Ok(json!({ "ok": true, "models": count, "account": id }));
+                    .map_err(|e| format!("model/list 响应读取失败: {e}"))
+                    .and_then(|body| {
+                        serde_json::from_str::<Value>(&body)
+                            .map_err(|e| format!("model/list 响应非 JSON: {e}"))
+                    })
+                    .and_then(|payload| {
+                        qoder_upstream::adopt_remote(qoder_upstream::QoderRegion::Cn, &payload)
+                            .map_err(|e| format!("model/list 目录采纳失败: {e}"))
+                    })
+                {
+                    Ok(count) => return Ok(json!({ "ok": true, "models": count, "account": id })),
+                    Err(e) => last_err = Some(e),
+                }
             }
             Ok(resp) => {
-                return Err(format!("model/list HTTP {}", resp.status()));
+                last_err = Some(format!("model/list HTTP {}", resp.status()));
             }
             Err(e) => {
-                return Err(format!("model/list 网络失败: {e}"));
+                last_err = Some(format!("model/list 网络失败: {e}"));
             }
         }
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder] 账号 {id} 目录同步失败，尝试下一账号: {}", last_err.as_deref().unwrap_or("")),
+        );
     }
-    Ok(json!({ "ok": true, "skipped": "无可用 Qoder 凭证" }))
+    match last_err {
+        Some(e) => Err(e),
+        None => Ok(json!({ "ok": true, "skipped": "无可用 Qoder 凭证" })),
+    }
 }
 
 #[cfg(test)]

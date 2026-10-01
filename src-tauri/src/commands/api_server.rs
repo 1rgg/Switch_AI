@@ -303,10 +303,14 @@ pub async fn do_start(
         }),
     });
 
-    // F-76②/F-77 热参数：池并发上限（两池同构生效）+ wb_sticky 显式 TTL
+    // F-76②/F-77 热参数：池并发上限（三池同构生效；审查修复：qoder_pool
+    // 此前遗漏，恒默认 1）+ wb_sticky 显式 TTL
     shared.pool.set_concurrency_limit(pool_file.account_concurrency_limit);
     shared
         .wb_pool
+        .set_concurrency_limit(pool_file.account_concurrency_limit);
+    shared
+        .qoder_pool
         .set_concurrency_limit(pool_file.account_concurrency_limit);
     shared
         .wb_sticky
@@ -719,12 +723,17 @@ pub fn pool_set(
         rt.shared.wb_pool.set_strategy(
             crate::api_server::pool::PoolStrategy::resolve_wb(&pool_file.strategy, &pool_file.wb_strategy),
         );
-        // F-76②/F-77 热参数即时生效（两池同构）
+        // F-76②/F-77 热参数即时生效（三池同构）
         rt.shared
             .pool
             .set_concurrency_limit(pool_file.account_concurrency_limit);
         rt.shared
             .wb_pool
+            .set_concurrency_limit(pool_file.account_concurrency_limit);
+        // Qoder 池并发上限热应用（审查修复：此前仅热应用 qoder_enabled 开关，
+        // 并发上限改动需重启才生效，与 trae/wb 池行为不一致）
+        rt.shared
+            .qoder_pool
             .set_concurrency_limit(pool_file.account_concurrency_limit);
         rt.shared.wb_sticky.set_explicit_ttl(pool_file.wb_sticky_ttl_secs as i64);
         rt.shared.wb_longctx_downgrade.store(
@@ -978,6 +987,9 @@ pub fn api_keys_list(
 
 /// 保存 API Key 列表（整表写盘；每次请求重读文件，改动立即生效）。
 /// `auth_disabled` 不传时保留现值（避免整表保存覆盖鉴权开关）。
+/// 审查 G3：保存动作同样是鉴权状态的写入点，非环回监听时与启动门禁
+/// （server.rs::ensure_bind_auth_policy）同策略拦截——否则服务运行中经
+/// 此命令关闭鉴权/清空 Key 可绕过启动时校验，局域网裸奔。
 #[tauri::command]
 pub fn api_keys_save(
     state: State<'_, AppState>,
@@ -989,6 +1001,16 @@ pub fn api_keys_save(
         keys,
         auth_disabled: auth_disabled.unwrap_or(prev.auth_disabled),
     };
+    // 非环回监听 + （新状态显式关闭鉴权 或 无任何启用 Key）→ 拒绝保存
+    let host = crate::api_server::gateway_settings::load(&state.data_dir).host;
+    if !crate::api_server::server::is_loopback_host(&host)
+        && (file.auth_disabled || !file.has_enabled())
+    {
+        return Err(format!(
+            "当前网关监听地址为 {host}（非本机环回），局域网可访问；\
+             出于安全要求必须启用至少一个 API Key 且不可关闭鉴权"
+        ));
+    }
     crate::api_server::api_keys::save(&state.data_dir, &file);
     Ok(())
 }
@@ -1081,7 +1103,10 @@ pub fn gateway_settings_get(
     crate::api_server::gateway_settings::load(&state.data_dir)
 }
 
-/// 保存网关设置（端口改动在下次启动 API 服务后生效；返回规范化后的生效值）
+/// 保存网关设置（端口改动在下次启动 API 服务后生效；返回规范化后的生效值）。
+/// 审查 G2：host 字段前端保存时必须回传——缺失按 serde default、空/纯空白按
+/// normalized 兜底，统一归一为 127.0.0.1（环回）；不回传会被当作环回覆盖
+/// 用户已配置的非环回地址（后端无法区分「未携带」与「显式环回」）。
 #[tauri::command]
 pub fn gateway_settings_set(
     state: State<'_, AppState>,
