@@ -217,6 +217,7 @@ fn main() {
             commands::api_server::api_usage_stats,
             commands::api_server::api_wb_usage_stats,
             commands::api_server::api_custom_usage_stats,
+            commands::api_server::api_qoder_usage_stats,
             commands::api_server::api_keys_list,
             commands::api_server::api_keys_save,
             commands::api_server::api_wb_catalog_sync,

@@ -2,7 +2,7 @@
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::State;
 
@@ -165,20 +165,77 @@ pub(crate) fn machine_id_of(state: &AppState, account_id: &str) -> Option<String
 
 // ── 环境检测（M0 侦察结论固化为候选路径；M0 R-1/R-2 缺口闭合后扩展）─────────
 
+/// 0.4.3+ 拆分形态检测：真 IDE 已独立安装于 `%LOCALAPPDATA%\Programs\Qoder CN IDE\`
+pub(crate) fn ide_split_installed() -> bool {
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|l| {
+            PathBuf::from(l)
+                .join("Programs")
+                .join("Qoder CN IDE")
+                .join("Qoder CN IDE.exe")
+                .exists()
+        })
+        .unwrap_or(false)
+}
+
+/// 过期 IDE 手动路径：指向 `Programs\Qoder CN\Qoder CN.exe`（0.4.3 前该路径是
+/// IDE，现在语义已是 Work 本体）。拆分形态已装时判定过期，忽略手动值走默认候选
+fn is_stale_ide_manual(p: &Path) -> bool {
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|l| {
+            p == PathBuf::from(l)
+                .join("Programs")
+                .join("Qoder CN")
+                .join("Qoder CN.exe")
+        })
+        .unwrap_or(false)
+}
+
+/// Work 本体已安装检测（0.4.3+ 拆分形态 `%LOCALAPPDATA%\Programs\Qoder CN\`）
+fn work_body_installed() -> bool {
+    std::env::var("LOCALAPPDATA")
+        .ok()
+        .map(|l| {
+            PathBuf::from(l)
+                .join("Programs")
+                .join("Qoder CN")
+                .join("Qoder CN.exe")
+                .exists()
+        })
+        .unwrap_or(false)
+}
+
 /// IDE exe 候选：settings.qoder_ide_path 人工指定优先，否则默认安装布局。
-/// M0 实测（2026-09-26）：`%LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe`（无版本化子目录），
-/// 设计文档的 `.qoder-versions\<ver>\` 形态（国际版）与本机不符——候选列表按两种形态兼容。
+/// 实测（2026-09-30，Qoder CN 0.4.3 起 IDE 与 Work 拆分安装目录）：
+/// 真 IDE = `%LOCALAPPDATA%\Programs\Qoder CN IDE\Qoder CN IDE.exe`（VS Code fork），
+/// `Programs\Qoder CN\Qoder CN.exe` 已是 Work 本体（Electron），仅作旧版一体化形态兼容；
+/// `.qoder-versions\<ver>\` 形态为国际版布局，一并保留兼容。
 pub(crate) fn ide_exe_candidates(state: &AppState) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(p) = state.settings().qoder_ide_path.as_deref() {
         let p = p.trim();
         if !p.is_empty() {
-            out.push(PathBuf::from(p));
-            return out;
+            let pb = PathBuf::from(p);
+            // 过期手动值降级：拆分形态已装且手动值指向 Work 本体旧语义路径 →
+            // 忽略手动值走默认候选（用户曾保存 0.4.3 前语义的 IDE 路径）
+            if !(ide_split_installed() && is_stale_ide_manual(&pb)) {
+                out.push(pb);
+                return out;
+            }
         }
     }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        let base = PathBuf::from(&local).join("Programs").join("Qoder CN");
+        let programs = PathBuf::from(&local).join("Programs");
+        // 0.4.3+ 拆分形态：真 IDE 独立目录
+        out.push(
+            programs
+                .join("Qoder CN IDE")
+                .join("Qoder CN IDE.exe"),
+        );
+        // 旧版一体化形态：Programs\Qoder CN\Qoder CN.exe（现已是 Work 本体，兜底）
+        let base = programs.join("Qoder CN");
         out.push(base.join("Qoder CN.exe"));
         // 国际版形态：.qoder-versions\<ver>\Qoder CN.exe（版本化目录枚举，最多 4 个）
         if let Ok(entries) = std::fs::read_dir(base.join(".qoder-versions")) {
@@ -204,19 +261,36 @@ pub(crate) fn ide_data_dir() -> Option<PathBuf> {
         .map(|d| PathBuf::from(d).join("QoderCN"))
 }
 
-/// QoderWork CN exe 候选：settings.qoderwork_path 人工指定优先，否则默认安装布局。
-/// 需求方确认（2026-09-27）：QoderWork CN Windows 默认经 Launcher 安装于
-/// `%LOCALAPPDATA%\Qoder CN\Qoder CN Launcher\Qoder CN Launcher.exe`。
+/// QoderWork exe 候选：settings.qoderwork_path 人工指定优先，否则默认安装布局。
+/// 实测（2026-09-30，0.4.3）：Work 本体 = `%LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe`
+/// （Electron，带 Launcher 转发能力）；`%LOCALAPPDATA%\Qoder CN\Qoder CN Launcher\` 为
+/// 旧版 Launcher 形态，保留兜底。
 pub(crate) fn work_exe_candidates(state: &AppState) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(p) = state.settings().qoderwork_path.as_deref() {
         let p = p.trim();
         if !p.is_empty() {
-            out.push(PathBuf::from(p));
-            return out;
+            let pb = PathBuf::from(p);
+            // 过期手动值降级：指向旧版 Launcher 且 Work 本体已安装 → 忽略手动值
+            // 走默认候选（用户曾保存 0.4.3 前 Launcher 路径，本体优先）
+            let stale_launcher = pb
+                .file_name()
+                .map(|f| f == "Qoder CN Launcher.exe")
+                .unwrap_or(false)
+                && work_body_installed();
+            if !stale_launcher {
+                out.push(pb);
+                return out;
+            }
         }
     }
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        out.push(
+            PathBuf::from(&local)
+                .join("Programs")
+                .join("Qoder CN")
+                .join("Qoder CN.exe"),
+        );
         out.push(
             PathBuf::from(&local)
                 .join("Qoder CN")
@@ -229,12 +303,23 @@ pub(crate) fn work_exe_candidates(state: &AppState) -> Vec<PathBuf> {
 
 // tasklist/creation_flags 为 Windows 专属（与 ide_store.rs 同款逐函数门控）
 #[cfg(windows)]
-fn is_running() -> bool {
+fn proc_running(image: &str) -> bool {
     let out = Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq Qoder CN.exe", "/NH"])
+        .args(["/FI", &format!("IMAGENAME eq {image}"), "/NH"])
         .creation_flags(0x08000000)
         .output();
-    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains("Qoder CN.exe"))
+    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains(image))
+}
+
+#[cfg(windows)]
+fn is_running() -> bool {
+    // 0.4.3+ 拆分形态装了独立 IDE：只认 IDE 进程（Qoder CN.exe 是 Work 本体，
+    // 不能作为 IDE 运行信号）；旧版一体化形态 Qoder CN.exe 即 IDE
+    if ide_split_installed() {
+        proc_running("Qoder CN IDE.exe")
+    } else {
+        proc_running("Qoder CN.exe")
+    }
 }
 
 #[cfg(not(windows))]
@@ -243,16 +328,13 @@ fn is_running() -> bool {
 }
 
 #[cfg(windows)]
-fn launcher_running() -> bool {
-    let out = Command::new("tasklist")
-        .args(["/FI", "IMAGENAME eq Qoder CN Launcher.exe", "/NH"])
-        .creation_flags(0x08000000)
-        .output();
-    matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).contains("Qoder CN Launcher.exe"))
+fn work_running() -> bool {
+    // Work 本体（0.4.3+）进程名 Qoder CN.exe；旧版 Launcher 形态兜底
+    proc_running("Qoder CN.exe") || proc_running("Qoder CN Launcher.exe")
 }
 
 #[cfg(not(windows))]
-fn launcher_running() -> bool {
+fn work_running() -> bool {
     false
 }
 
@@ -295,7 +377,9 @@ pub fn qoder_env_check(state: State<AppState>) -> serde_json::Value {
         .as_ref()
         .and_then(|p| crate::commands::env::version_of(&p.to_string_lossy()));
     let work_version = work_exe.as_ref().and_then(|p| {
-        // Launcher exe ProductVersion 恒 0.0.0：真实版本优先读同目录 state.ini targetVersion
+        // Work 本体 exe 直接读 ProductVersion；旧版 Launcher 形态 ProductVersion 恒 0.0.0，
+        // 优先读同目录 state.ini/install.ini 的 targetVersion（launcher_version 对本体
+        // 目录读不到 ini 自然回退 exe 版本探测）
         launcher_version(p).or_else(|| crate::commands::env::version_of(&p.to_string_lossy()))
     });
     serde_json::json!({
@@ -307,10 +391,11 @@ pub fn qoder_env_check(state: State<AppState>) -> serde_json::Value {
         "ide_data_dir_exists": data_dir.map(|p| p.exists()).unwrap_or(false),
         "cli_dir": home,
         "cli_dir_exists": !home.is_empty() && PathBuf::from(&home).join(".qoder-cn").exists(),
-        // QoderWork：即 Qoder CN 本体（v1.4.1 产品同一性澄清），exe 装机检测走 Launcher 形态；
-        // 用户数据目录即 ide_data_dir（%APPDATA%\QoderCN），无独立布局
+        // QoderWork：Qoder CN 本体（Electron，0.4.3 起与 IDE 拆分，userData=
+        // %APPDATA%\com.qodercn.app.stable），exe 装机检测走 Launcher 形态；
+        // ide_data_dir（%APPDATA%\QoderCN）专属拆分后的 IDE
         "qoderwork_installed": work_exe.is_some(),
-        "qoderwork_running": launcher_running(),
+        "qoderwork_running": work_running(),
         "qoderwork_exe": work_exe.map(|p| p.to_string_lossy().to_string()),
         "qoderwork_version": work_version,
     })

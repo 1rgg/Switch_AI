@@ -45,6 +45,8 @@ export default function ApiService() {
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [enabledUids, setEnabledUids] = useState<Set<string>>(new Set());
   const [poolGroups, setPoolGroups] = useState<Set<string>>(new Set());
+  // Trae 池参与调度开关（每池自管开关；默认开 = 历史恒可用行为）
+  const [traeEnabled, setTraeEnabled] = useState(true);
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [savingPool, setSavingPool] = useState(false);
   const [clearingCooldowns, setClearingCooldowns] = useState(false);
@@ -181,6 +183,7 @@ export default function ApiService() {
       const pool = await withMinDelay(api.apiServer.poolList());
       setEnabledUids(new Set(pool.enabled_uids));
       setPoolGroups(new Set(pool.group_ids ?? []));
+      setTraeEnabled(pool.trae_enabled ?? true);
     } catch {
       // 初始化加载失败静默保留空列表；手动点击刷新失败需给出提示
       if (manual) toast('error', '加载账号池失败，请重试');
@@ -247,9 +250,14 @@ export default function ApiService() {
   const savePool = async () => {
     setSavingPool(true);
     try {
-      // 调度策略已收口至全局 API 管理「调度策略中心」，本页只保存成员/分组（未传字段后端保留原值）
-      await withMinDelay(api.apiServer.poolSet([...enabledUids], undefined, [...poolGroups]));
-      toast('success', '账号池已更新（服务运行中即时生效）');
+      // 调度策略已收口至全局 API 管理「调度策略中心」，本页只保存成员/分组/本池开关
+      //（未传字段后端保留原值）
+      await withMinDelay(
+        api.apiServer.poolSet([...enabledUids], undefined, [...poolGroups], {
+          traeEnabled,
+        }),
+      );
+      toast('success', `账号池已更新（Trae 池${traeEnabled ? '启用' : '停用'}，服务运行中即时生效）`);
     } catch (err) {
       toast('error', `保存账号池失败：${String(err)}`);
     } finally {
@@ -456,6 +464,24 @@ export default function ApiService() {
             <>
               {/* 分组筛选（T10，保存后热重载即时生效）；调度策略已收口至全局 API 管理调度策略中心 */}
               <div className="mb-3 space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
+                {/* 本池开关（每池自管开关：Trae 页管 Trae 池 / Buddy 页管 wb_enabled / Qoder 页管 qoder_enabled） */}
+                <div className="flex items-center gap-2">
+                  <input
+                    id="trae-pool-enabled"
+                    type="checkbox"
+                    checked={traeEnabled}
+                    onChange={(e) => setTraeEnabled(e.target.checked)}
+                  />
+                  <label
+                    htmlFor="trae-pool-enabled"
+                    className="text-xs font-medium text-slate-600 dark:text-zinc-300"
+                  >
+                    启用 Trae 池
+                    <span className="ml-1 font-normal text-slate-400">
+                      （默认开；停用后 Trae 模型不参与调度，仅 Trae 源模型显式报错）
+                    </span>
+                  </label>
+                </div>
                 {groups.length > 0 && (
                   <div className="flex items-start gap-2">
                     <label className="shrink-0 pt-1 text-xs text-slate-500 dark:text-zinc-400">

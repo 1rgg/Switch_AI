@@ -4,12 +4,174 @@
 
 ---
 
+## [未发布] · Qoder 网关审查修复批 + 每池自管开关
+
+> 范围：p3-3 Qoder 上游接入 + 积分看板三平台化整体代码审查后的修复批（8 项，双子代理交叉验证全数确认）；随批落地「每个资源池管理自己的开关」架构（Trae 开关新增，默认开）。
+
+### 新功能
+
+- **[P2] Qoder 上游开关 UI 化（qoder_enabled）**：审查发现开关无任何产品入口（pool_set 参数无调用方，只能手改 SQLite kv）——Qoder 环境配置页新增「网关上游」卡：启用 Qoder 网关上游（api_pool 装载失败时诚实禁用 + 保存拦截，对齐 settingsErr 模式）；保存经 poolSet 回传现有池白名单保全 Trae 池成员，运行中热应用。
+- **每池自管开关（trae_enabled 新增，默认开）**：Trae 资源调度页新增「启用 Trae 池」开关（serde default true 保持历史恒可用行为；关闭后仅 Trae 源模型显式报 400 `trae_pool_disabled`，双/三源模型回退其他池，源剔除不算回退）——三池三页各自管理自己的开关：Trae 页管 `trae_enabled`、Buddy 页管 `wb_enabled`、Qoder 页管 `qoder_enabled`；`/v1/models` 与 `api_unified_models` 的 Trae 源徽章联动（关闭置灰）。
+
+### 修复
+
+- **[P2] 三源调度早退缺陷（dispatch.rs）**：WbDisabled 早退判定未感知 Qoder 源——buddy+qoder 双源模型（不在 Trae 列表，如 Kimi-K3）在 wb_enabled=false 且 qoder_enabled=true 时被误报 400 `wb_upstream_disabled`，Qoder 池本可服务；现早退条件补 Qoder 可用性守卫（与 QoderDisabled 判定的 buddy.is_none() 守卫对称）。
+- **[P2] 思考档位别名映射先于白名单（qoder_upstream.rs）**：`"max"→"xhigh"` 别名归一导致 efforts 白名单含 max 的 CN 模型（GLM-5.3/Kimi/DeepSeek 系）无法显式请求 max 档、被静默降级为 high 且无日志；现白名单原值命中直用、再做别名映射。
+- **[P3] consumed=null 口径（积分看板）**：qoderSnapshotsToPoints 把差分不可比日（首日/账号数变动日）画成 0 柱/0 热力格，与「不计入」文案矛盾（earned 侧已有正确过滤，consumed 是唯一偏离者）；现 null 日不进 points，KPI「今日消耗」null 显示「—」（`PlatformKpi.todayConsumed` 扩为 `number | null`）。
+- **[P3] identity 回调 agent 无超时**：网关请求路径凭证解析闭包裸 `Agent::new()` 无超时，ensure_fresh 临期真发刷新请求时会在 H-1 串行锁内挂起阻塞同账号后续刷新；现改 `http_agent(20)`。
+- **[P3] AGENT.md 契约同步**：补 `api_qoder_usage_stats` 命令、pool_set 的 qoder_enabled/trae_enabled 参数、dispatch_policy 缺省 priority 含 qoder、§5.4 调度四任务（含 qoder-catalog-sync 05:50）与网关上游约定条目。
+- **[P3] 区域边界注释**：qoder_route 两处 resolve 调用点与 dispatch 源判定明示 v1 CN-only 边界（resolve 双区兜底可命中 Global 条目，但请求恒发 CN 网关；接线 Global 区时需按账号区域分流）。
+
+### 口径说明
+
+- Trae 开关关闭属「显式关闭」语义（400 TraeDisabled），与「池耗尽 503 NoHealthy」区分；pool_set 对未传开关字段一律保留原值，三页互不覆写（前端绑定层扩展 qoderEnabled/traeEnabled，null = 保留原值）。
+- Qoder 开关默认仍为 false（未部署 Qoder 的环境零噪音）；Trae 开关默认 true（主池行为不变，升级零感知）。
+
+### 测试
+
+- `cargo test` 664 passed / 0 failed（新增 dispatch t43/t44/t45/t46、resolve_thinking max 档断言、pool_merge trae 保留语义）；`cargo check` 零警告；`tsc --noEmit` 全绿。
+
+---
+
+## [未发布] · Qoder 积分看板（credits-dashboard 平台化 · 阶段 1）
+
+> 范围：Qoder 接入积分看板三平台体系（Trae/Buddy/Qoder），旧 QoderCredits 页下线，路由直接复用 CreditsDashboard；消耗侧唯一可靠来源 = 本地快照差分（官网无按日消耗/模型/token 端点），网关 Qoder 池与本地 token 统计在后续阶段接入。
+
+### 新功能
+
+- **[P1] Qoder 积分看板上线（qoder-credits 视图替换旧页）**：`CreditsDashboard` 平台参数扩展为 `trae | buddy | qoder`，App.tsx 路由 `qoder-credits` 直接渲染看板（key="qoder" 强制重挂载），删除旧 `pages/qoder/QoderCredits.tsx`。KPI 卡（账号数/总余额/剩余包数/今日新增/今日消耗/7 天到期）、Credits 趋势与日热度、到期日历全部落地；Token 页整页诚实空态（本地会话统计/网关 Qoder 上游后续接入，官网无 token 用量接口）。
+- **[P2] 7 天到期卡口径：积分包 + Plan 订阅重置额度**：到期窗口内除剩余 Add-on/积分包外，订阅周期在窗口内到期的账号将 Plan 剩余额度全额计入；KPI、到期行、到期日历三处口径一致（Plan 项仅在 plan_credits > 0 时展示，日历 kind=「订阅重置」，Add-on 包标注「随订阅周期重置」）。
+- **[P3] Qoder 账号管理按钮重排**：快照管理移至分组管理之后（与 Buddy 账号管理排序对齐）。
+
+### 口径说明
+
+- 今日消耗 = 本地快照差分（前一快照日余额 − 当日余额 + 当日签到奖励，负值记 0；首日与账号数变动日记 null 不计入）；今日新增 = 当日快照 earned（签到奖励合计），无快照时回退签到日志；模型筛选/模型排行对 Qoder 不生效（快照仅有日合计，无模型粒度）。
+- 覆盖窗口 Badge 明示「Qoder 快照 N 天」；消耗源 Badge 标注差分推导语义；Qoder 页 Token 的三源全部禁用并给出原因（诚实空态，§8 不静默合并）。
+
+### 阶段 2 spike 结论（Qoder 本地 token 存储调研 · M0 未通过，qoder_token_stats 不落地）
+
+- 实测 Qoder CN 本机数据目录：`main.sqlite` 的 `chat_session_messages` 无 usage 字段、`chat_session_context_usage` 仅为上下文窗口占比快照（覆盖写、`apiUsage:null`）；`~\.qoder-cn\logs\sessions` 的 `model.response.completed` 事件虽含 input/output/cache token 字段，但 `provider:qoder` 官方模型（auto/qmodel_latest）计费在服务端，本机全部事件恒为占位 0；logs 有 `.last-cleanup` 留存期不明。Qoder Token 的可靠出路在网关侧落库（阶段 3 专项）；Token 页空态与源禁用原因文案已按实测结论修正。
+
+### 测试
+
+- `tsc --noEmit` 全绿；后端零改动（复用 qoder_credits_fetch / credits_history_list / checkin_results 既有命令）。
+
+---
+
+## [未发布] · 网关 Qoder 池专项（阶段 3 · 进行中）
+
+> 范围：网关四桶用量基建（Trae/WB/Custom → +Qoder）先行铺管道；Qoder chat 协议逆向（MITM 抓包）与上游接入后续推进。
+
+### 新功能（四桶用量基建 · 本批完成）
+
+- **用量第四桶 Qoder**：`UsageBucket` 新增 `Qoder` 变体，`UsageFile` 新增 `qoder_days`（`#[serde(default)]` 旧文件兼容）；`bucket_mut`/`day_stats`/`recent_in`/`trim`/`save_day` 及 `store/docs.rs` 的 `bucket_name`/`bucket_of`/`bucket_map_mut` 全分支补齐，沿用 api_usage 表 (bucket, day) 行文档 + 脏队列 2s flusher 既有落盘链。
+- **记账与查询管道**：`ApiServer::record_usage_qoder`（uid 语义 = Qoder 账号 uid，上游接入后填真实值）；新命令 `api_qoder_usage_stats`（`query_recent_in` + Qoder 桶，1~90 天钳制）并注册。
+- **前端三池并行**：`qoderUsageStats(days)` 绑定层；Tokens 页 `GatewayDays` 加 `qoder` 字段、`gwPoolsFor`/网关 Badge 加 Qoder 臂；Dashboard `loadGateway` 三池并行拉取、Qoder 页网关懒加载门控放开（上游接入后零前端改动）；Credits 页三处网关池选择第三臂 `[]` → `gateway?.qoder ?? []`。
+
+### 口径说明
+
+- Qoder 网关源当前仍禁用（上游未接入，qoder 池恒空），源禁用原因文案更新为「Qoder 上游未接入（网关用量管道已铺，接入后点亮）」——管道点亮仅需上游接入，前端与落盘链零改动。
+- `cargo check` 有 1 条预期 dead_code 警告（`record_usage_qoder` 暂无调用方，上游转发接入后消除）。
+
+### 新功能（p3-2 抓包基建）
+
+- **解密白名单默认值追加 Qoder 三域（qoder.sh / qoder.cn / qoder.ai）**：抓包逆向确认 Qoder Work agent worker 的 chat 流量不走管理面 `openapi.qoder.com.cn`，而是模型服务器 `api2-v2.qoder.sh`（`/model/v1/chat/completions`，OpenAI 兼容）+ SSE 端点 `/algo/api/v2/service/pro/sse/agent_chat_generation`，MCP 走 `mcp.qoder.cn`——旧白名单仅含 `qoder.com.cn`，chat 流量即使进代理也只会被透明直通。`default_proxy_domains`/`DEFAULT_TARGETS` 同步扩展，存量持久化旧默认（未自定义过）自动迁移；用户自定义过则不动。
+
+### 新功能（p3-2e 上游直连白名单域 · 打通 IDE chat 抓包）
+
+- **转发路径新增「直连白名单域」例外**：IDE chat 失败的代码级根因是 MITM 转发三路径（MITM 解密 Client / WS / 透明隧道）全部「上游 VPN 优先、失败回退直连」——qoder 域流量全被塞进上游 VPN（7890），而该组国内域经 VPN 实测全挂、直连恢复（2026-09-30 IDE chat 链路），VPN 分流反而破坏出口路径。现 `UpstreamConnector` 携带 `direct_domains`（后缀匹配，语义对齐解密白名单 `host_in_targets`），https 目标命中白名单 → 直连优先、失败回退上游兜底；三条转发路径（MITM Client / WS `connect_tls_upstream_first` / 透明隧道 `tunnel_raw`）全覆盖，明文路径仅命中时直连。
+- **白名单默认值与环境变量覆盖**：默认 `DEFAULT_UPSTREAM_BYPASS_DOMAINS = [qoder.com.cn, qoder.sh, qoder.cn, qoder.ai]`；环境变量 `UPSTREAM_BYPASS_DOMAINS`（逗号分隔）优先。代理启动横幅打印生效白名单。与 OAuth 的 Windows ProxyOverride 直连豁免（bypass.rs）是两个互不相干的机制，未改动。
+- **修复解密白名单迁移遗漏（三 Qoder 域版旧默认）**：p3-2b 迁移列表漏了 F-80 扩展版默认（qoder.com.cn + qoder.cn + qoder.com 三域），存量持久化被误判为「用户自定义」导致 qoder.sh/qoder.ai 始终未进解密白名单（2026-09-30 运行时横幅实测确认）。补 `legacy_proxy_domains_qoder_com()` 进 state.rs 迁移条件。
+- **IDE chat 流量路径实测结论（netstat 实锤）**：IDE 管理面（Electron 主进程）走系统代理 7799 正常；但 chat 由独立 native 组件**直连** `gateway.qoder.com.cn:443`（阿里云 IP），不读系统代理也不读环境变量（reqwest 类网络栈默认直连）——任何代理层改造都无法拦截，需 hosts 劫持 + 透明 TLS 入站（SNI 路由）方案。chat 网关与 Work chat 同域（gateway.qoder.com.cn），服务端链路同构。
+
+### 抓包情报（p3-2 · Work chat 全链路已收全，IDE chat 受系统代理链路阻断）
+
+- **管理面 API 全景**（proxy_req 日志 600 请求实测）：`/sash/api/v2/me/usage` 为官方额度接口（`userQuota`/`addOnQuota`/`totalUsagePercentage`/`isQuotaExceeded`/`expiresAt` 一枪全给，价值远超快照差分，上游接入候选）；鉴权 = `authorization: Bearer dt-…` + `cosy-*` 设备指纹头家族 + UA `Qoder`；`/api/v2/user/plan`、`/api/v1/userinfo`、`/sash/api/v1/me/campaigns`（每日领 100 Credits 活动状态）。
+- **Qoder Work agent 架构**：`@qoder-ai/qoder-cn-agent-sdk`（Claude Code CLI 形态 SDK fork），worker runtime = 混淆的 `qoder-worker-runtime.obf.mjs`，启动参数 `--print --output-format stream-json --model qfmodel --permission-mode auto`；worker 为 Node 进程，不读 Windows 系统代理（第一轮 chat 流量未抓到的根因）——但其 fetch 层内建 undici `EnvHttpProxyAgent`，认 `HTTPS_PROXY`/`HTTP_PROXY` 环境变量，且 `NODE_EXTRA_CA_CERTS` 可注入抓包 CA 信任 → **环境变量法第二轮抓包可行**。
+- **worker 鉴权 = jobToken 机制**：`POST /api/v1/me/jobToken`（body `{clientId}`）换 24h token + 48h refresh，经 `%TEMP%\qoder-sdk-auth-*\payload.json` 传给 worker；队列/限流语义实测（错误码 10605：`isQueued`/`queueType:"p3"`/`retryAfterSeconds`）。
+- Work 侧会话日志（`com.qodercn.app.stable\logs\*\qodercli\sessions\*.log`）无 token_usage 字段（stream-json 但 usage 恒缺）——阶段 2「本地 token 恒 0」结论维持，Qoder Token 可靠出路仍在网关侧落库。
+- **Work chat 全链路（第二轮抓包实锤，修正早前「chat=api2-v2.qoder.sh」结论）**：agent chat 实走 `gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`（api2-v2.qoder.sh 是 worker 配置里的模型服务器，由 gateway 内部转发，抓包面不可见）；每轮后跟 `POST /algo/api/v2/service/business/finish?Encode=1`（响应仅 `success`）与 `/algo/api/v1/tracking?Encode=1`；chat 鉴权 = `Authorization: Bearer <jobToken>`，签名头 `Cosy-Key` 每请求变化；请求体为 B94 风格自定义编码（`Encode=1`，521888B，解码非必需）。
+- **chat SSE 流式帧格式**：包裹帧 `data:{"headers":{...},"body":"<转义 OpenAI chunk JSON>","statusCodeValue":200,"statusCode":"OK"}`，`delta.reasoning_content → delta.content`；**尾部 usage 帧**（`[DONE]` 前最后一块）含 `usage:{billable, completion_tokens, credits, original_credits, prompt_tokens, prompt_tokens_details{cacheable_tokens, cached_tokens}, total_tokens}`——MITM 被动捕获即可得每请求 token+credits（推翻阶段 2「本地拿不到 token」口径，网关落库数据源实锤）；末帧 `event:finish` 含 `firstTokenDuration/totalDuration/serverDuration`。
+- **model/list 模型目录接口（p3-3 资源调度数据源）**：`GET gateway.qoder.com.cn/algo/api/v2/model/list`（Work 轮询带 `?Encode=1`、IDE 裸请求，同一明文 JSON，gzip 解压 67856B）；字段全景 `key/format/display_name/price_factor/original_price_factor/max_input_tokens/context_config{200K|400K|1M+default}/thinking_config{disabled|enabled.efforts}/is_vl/is_reasoning/is_free/is_sensitive/is_default/promotion(错峰 4 折 22:00-08:00, rule_id=idle_time_model_credit_discount)`；日志预览已解析 13/14 模型（Auto 0.5x、Qwen3.8-Flash 0x 免费、Qwen3.7-Plus 0.1x、DeepSeek-Flash 0.1x、GLM-5.3 0.8x、Kimi-K3 1.4x…，与 IDE 选择器展示一致；`X-Model-Key` 即此处的 key，chat 请求头实测 dfmodel=DeepSeek-Flash）；MiniMax-M2.7 与 `chat` 数组之外的其余配置段（~59KB）因日志预览截断未获，重抓后补全。
+- **IDE 网络行为与 chat 失败根因**：IDE（Electron）网络栈只认系统代理（进程级 `HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS` 注入无效）；系统代理开 → 管理面 API 与 model/list 经 7799 全 200 正常，但 chat 区域端点经「7799 → 上游 VPN 7890」链路失败，关系统代理直连即恢复——CA 证书（CurrentUser+LocalMachine Root）无涉。已由 p3-2e 直连白名单域改造修复：系统代理开启时 qoder 域经 7799 解密后直连目标（出口与关代理一致），IDE chat 恢复可用且可抓。
+
+### 调研情报（p3-3-r · 9+1 开源仓库深度调研收口，agent2api 定为 p3-3 Rust 蓝本）
+
+- **选型结论**：9 个 Qoder2API 仓库 + 1 个参考仓库全部读完。`aimod-cc/agent2api`（Rust+Tauri、MIT+使用声明、进程内网关）为**主蓝本**（同语言可移植，Qoder provider 17 文件已全量消化）；`shuishuipingan/qoder2api-hub`（Python，功能最全）与 `Liki4/qodercli2api`（Go，AGPL-3.0，仅协议细节交叉验证不抄代码）佐证；`foxy1402/qoder-proxy` 为 CLI 子进程包装方案，排除。
+- **403/101 根因闭环（签名层）**：chat/model/list 网关请求须带 `Authorization: Bearer COSY.<payloadB64>.<md5sig>` 三段式（此前发裸 `Bearer <jobToken>` 必 403）。agent2api `cosy.rs` 完整算法已逐字节对拍验证：① 16 ASCII 随机字符一次性 AES 密钥；② 身份 JSON 固定键序手写 `{"uid","security_oauth_token","name","aid":"","email"}`（serde_json 未开 preserve_order 时 json! 会按键排序导致密文漂移）；③ `info=b64(AES-128-CBC(identity, key=iv=tempKey, PKCS7))`；④ `cosy_key=b64(RSA_PKCS1v15(tempKey))`（1024 位公钥模数 `c0f22307…ebcecf`，e=65537，PS 非零随机）；⑤ `payload=b64({"version":"v1","requestId","info","cosyVersion":"1.1.38","ideVersion":""})` 固定键序；⑥ `sig=hex(md5(payload+"\n"+cosyKey+"\n"+date+"\n"+body+"\n"+sigpath))`，`sigpath`＝URL path 去 `/algo` 前缀不含查询串；⑦ body 先 `encode_body` 再签名（顺序不可颠倒），另带 `Cosy-Bodyhash=md5(body)`/`Cosy-Bodylength`。共 18 头。依赖极简（aes/cbc/base64/num-bigint/md-5/getrandom 全可复用或轻量），无 rsa/cbc-block-padding crate。
+- **请求体编码 encode_body**：标准 base64 → 尾/中/首三段轮转（各 len/3）→ 自定义字母表替换（`_doRTgHZ…qWA!` 64 字符，与 qoder2api-hub 交叉验证一致）+ `=`→`$`。
+- **端点与双区路由（endpoints.rs）**：CN 版统一 `gateway.qoder.com.cn`（jt-/dt- 两种令牌都收）；Global 版按令牌前缀分流：`jt-`→`https://api2.qoder.sh/`（api3 拒绝 jt- 报 Login expired）、`dt-`→`api3.qoder.sh`。openapi 刷新端点设备流/作业流不可互换（`/api/v1/deviceToken/refresh` vs `/api/v1/jobToken/refresh`），且**刷新不需要签名与 Authorization**（凭证在 body `refresh_token`）；center 端点 `/algo/api/v3/user/refresh_token` 只认 jt- 族。
+- **对话端点与请求体（chat.rs/protocol.rs 实证）**：`POST {inference_base}algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`，头额外带 `X-Model-Key`（目录 key）+`X-Model-Source`（目录 source）+`Accept: text/event-stream`；请求体固定信封（request_id/request_set_id/chat_record_id 三 UUID、session_id、stream:true、session_type:"qodercli"、agent_id:"agent_common"、parameters{max_tokens≤32768, enable_thinking, reasoning_effort}、model_config 剥掉 thinking_config 防覆盖、business{product:"cli",type:"agent",stage:"start"}）；`record_id=sha256("qoder-record"+key+messages+tools+mt)[:16]`、`session_id=sha256("qoder-session"+uid+key)[:16]-{seed|uuid}`。
+- **SSE 双层信封（stream.rs）**：外层 `{"statusCodeValue":200,"body":"<内层 OpenAI chunk JSON 字符串>"}`——业务错误**不体现在 HTTP 状态码**（恒 200）而在 `statusCodeValue`；内层 body 为转义 JSON 字符串需二次解析；思考内容可能以 `<thinking>/<think>/<reasoning>/<thought>` 标签混在正文需跨分片拆解；usage 取最后一次出现的 `chunk.usage`。
+- **错误四分类到动作映射（errors.rs，码表实证）**：10605+isQueued=**排队**（403 承载 `{isQueued:true,queueType:"p3",retryAfterSeconds:9~30}`，退避重发、非错误非换号非刷凭证）；105=**鉴权失效**（刷新凭证后同账号重试一次）；110/112~119/122=**额度不足**（换凭证，映射 429）；裸 403=**Forbidden**（刷凭证白刷，映射 401）。正文常为多层嵌套 JSON 字符串需逐层钻取（`message`/`body`/`data` 深度≤5）。
+- **model/list 目录解析（models.rs，p3-3 数据源直接相关）**：`GET {gateway}algo/api/v2/model/list?Encode=1` + COSY 签名覆盖**空体**（GET 无 body，签名 None 同样有效）；响应 `{chat:[{key,display_name,enable,is_vl,is_reasoning,price_factor,max_input_tokens,thinking_config.enabled.efforts,format,source}]}`；对外 id=display_name 去空白，倍率 price_factor=0 为合法免费值不可当缺失；TTL 1h 缓存 + 静态兜底表；`enable` 字段=当前套餐可用性（不过滤，区分「不存在」与「无权限」）。
+- **排队与上下文细节**：免费模型（qfmodel）走排队制，agent2api 按上游建议 5~30s 钳制退避；输出上限 32768（实测 >32K 行为退化：混思考/空内容/断连）；Qwen3.8 系列 `enable_thinking=false` 无效（混正文或断连），「关闭思考」降级为「不指定档位」；思考档位白名单来自目录 `thinking_config.enabled.efforts`（Qwen3.8 为 low/medium/xhigh）。
+- **凭证与刷新（refresh.rs/credentials.rs）**：刷新串打包格式 `{prefix}|{user_id}|{machine_id}`；上游每次刷新**轮换**访问+刷新令牌（旧立即失效，须整体回写）；`expires_in` 单位跨实现歧义（毫秒），只认绝对时间字段缺省按 30 天兜底；续期响应核对 user_id（只认 `user_id/uid/userId` 键，设备响应 `id` 是设备会话号）。
+- **版本常量待联调验证**：GATEWAY_COSY_VERSION 三处不一（agent2api 1.1.38 / qoder2api-hub 1.1.64 / 本地抓包 IDE 1.32.0），实现取同一常量进 payload 与 header，首次联调验证服务端接受区间。
+
+### 抓包收口（p3-2d · model/list 全量重抓，真签名直通）
+
+- **绕开 GUI 代理依赖的直通重抓**：代理通道需手动开 GUI（应用 `auto_start_proxy=false`），改为 `#[ignore]` 探针直打——token store 真凭证（ensure_fresh fresh）+ `build_cosy_headers` 真签名（GET 空体）请求 `gateway.qoder.com.cn/algo/api/v2/model/list`，**HTTP 200 直通**，全量 JSON（67856B，与抓包侧 gzip 解压大小完全一致）落盘 `temp/qoder_model_list_full.json`。qoder_sign COSY 签名链路端到端实证有效（对比早前「假 Cosy-Key 403/101」探针组）。
+- **chat 数组 14 条目全清**（此前日志预览仅 13）：补 MiniMax-M2.7（key=mmodel，0.2x，reasoning=false，vl=false）、Qwen3.7-Flash（q37fmodel，0.1x）、GLM-5.2（gm51model，0.6x，efforts [high,max]）。
+- **倍率漂移实证（蓝本快照已过期）**：GLM-5.3 0.6→**0.8**（智能排序键消费此值）、Kimi-K3 0.8→**1.4**、Kimi-K2.8-Preview 0.3→**0.8**、DeepSeek-V4-Pro 0.8→**0.5**、DeepSeek-Flash 0.2→**0.1**、Qwen3.8-Flash 0.1→**0.0**（免费）、Auto 1→**0.5**。
+- **thinking 档位白名单全景**：Qwen3.8 系 [xhigh,low,medium]、GLM-5.3 系 [high,low,max]、DeepSeek-V4-Pro [high,max]、DeepSeek-Flash [high,max,low]、Kimi 系 [high,low,max]；Qwen3.7 系 thinking_config 存在但 efforts 空 = 不支持档位；MiniMax-M2.7 无 thinking_config。DeepSeek-Flash/Kimi-K3 is_reasoning=false 但带 efforts（parse_catalog 按「有 tc 即 reasoning」判定，行为正确）。
+- **顶层 11 键全景**：`app/assistant/byok_enterprise/byok_teams/chat/developer/experts/inline/quest/qwake/qwork`——chat 仅 8313B，其余 ~59KB 为各 agent 形态模型配置段（app/developer/assistant 与 chat 同构 8313B，inline 7306B、quest/qwork/qwake 7950B、experts 2937B、byok 两键空）。
+- **落地**：qoder_upstream CN 兜底表全量对齐实抓 14 条（倍率/名称/efforts/is_vl）；Global 表仅修 MiniMax-M3→M2.7 名称漂移（global 区结构无实据不动）；真实样本回归测试 `parse_catalog_eats_real_model_list_snapshot`（#[ignore]，断言 14 条目 + MiniMax-M2.7 key + GLM-5.3 0.8 + qfmodel 0.0）。远程刷新（adopt_remote）路径吃真实数据验证通过。
+
+### 运行实证（rebuild-app）
+
+- 主应用重建（debug 1m39s）+ 重启，`app.log` 实证 p3-3 全链路生效：`API服务启动-Qoder上游池: enabled=false accounts=1`——`ApiPoolFile.qoder_enabled` serde 默认 false 零噪音 + 真实 Qoder 账号（qd-443681d83879，2026-09-30 IDE 存储导入）经 `qoder::load_pool` + token store 快照成功装配入池；Trae/WB 池与 API 服务（7864）不受影响正常自启。
+
+### 新功能（p3-3 收尾 · model/list 定时刷新器接线）
+
+- **tasks/qoder_catalog.rs 新建（调度器/CLI 共用）**：`run_task` = 空池空转 → 逐账号 `ensure_fresh(24h)` 取首个可用凭证（needs_relogin/无凭证账号跳过，全部失败静默 skipped 不计失败）→ `CosyIdentity` + `build_cosy_headers(None, url)` 真 COSY 签名 GET `QoderRegion::Cn.gateway()` 拼接的 model/list → `adopt_remote(Cn)` 原子替换目录缓存；HTTP 非 200/网络失败/解析失败返 Err 交调度器 30 分钟冷却重试。URL 拼接抽 `model_list_url()` 纯函数锚定端点。
+- **调度注册**：`SchedTask { qoder-catalog-sync, "Qoder 模型目录同步", 05:50, kind "models" }`（对齐 trae-models-sync/wb-catalog-sync 惯例；无 settings 键恒开——幂等低风险 + qoder_enabled 默认关时池空空转，规避「有配置无 UI」死配置，对齐 qoder-refresh 惯例）；调度器 `run_task` 分发 + CLI `--task-run qoder-catalog-sync` 双入口。
+- **dead_code 清零**：`qoder_upstream::QoderRegion::gateway()` 与 `adopt_remote` 两处 `#[allow(dead_code)]` 移除（刷新器消费）——p3-3 全部 `#[allow(dead_code)]` 收口，仅余 unified_catalog 旧签名包装两处（测试消费，语义明确）。
+- **验证三重实锤**：①单测 3 项（URL 端点锚定/空池 skipped/无凭证静默跳过）；②CLI 端到端 `--task-run qoder-catalog-sync` → `{"account":"qd-443681d83879","models":14,"ok":true}`；③调度器启动补跑实测——`app.log`：`[调度器] Qoder 模型目录同步（每日 05:50）：{"account":"qd-443681d83879","models":14,"ok":true}`（11:39:09，启动 90s 后首 tick 对「05:50 已过 + 当日无调度记录」任务自动补跑）。目录刷新后网关 `resolve`/`list` 与智能排序倍率即用真实数据（断网/未登录才回落静态兜底表）。
+- `cargo test` 660 passed / 0 failed（657 + qoder_catalog 3）；`cargo check` 零警告。
+
+### 新功能（p3-3 · Qoder 上游接入网关 · 本批完成）
+
+- **tasks/qoder_upstream.rs 七层落地（agent2api 蓝本全量移植）**：①目录（静态兜底表 + `adopt_remote`/`resolve`/`list` 并集去重）；②协议常量（`gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?...` 端点 + 18 头 COSY 签名家族，复用 qoder_sign）；③错误四分类（10605 排队不冷却同号退避 3 次clamp 1-30s、105 鉴权、110/112~119/122 额度、裸 403 Forbidden；`UpstreamKind::to_err_kind()` 映射 HardCredit/SoftRate/SessionDead/Forbidden/Server）；④传输+翻译（`make_qoder_request` encode_body+签名、`open_qoder_stream` 双层信封逐条翻译 OpenAI chunk 分帧语义对齐 WbSseParser.feed_line、`aggregate_qoder` 聚合取末次 usage）；⑤流式/聚合入口（err_slot 传递流内 ErrMeta）；⑥31 单测；⑦请求体构造 `prepare_qoder_body`（OpenAI→agent 固定信封：三 UUID/session_type=qodercli/business{product:cli}信封、model_config 剥 thinking_config 防覆盖、`record_id`/`session_id` sha256 派生、thinking 档位白名单降级——原六层计划遗漏层，读蓝本 protocol.rs 补遗）。
+- **api_server/qoder_route.rs 新建（~700 行）**：`qoder_stream_chat`（keep-alive 15s + `DoneSignal` 复用 routes）、`run_qoder_stream`（取号→identity 回调解析凭证→prepare→make→`stream_forward_ex`）、`qoder_aggregate_chat`（spawn_blocking + 协议投影复用 wb_sse::completion_to_anthropic/text/wb_responses）；HTTP 层走 retry_plan + classify_upstream_error，回调缺失换号不冷却、回调 Err → SessionDead 禁用换号；凭证不入日志。
+- **智能调度扩展（dispatch.rs）**：`TargetPool::Qoder` 变体（as_str/parse、默认优先级 `buddy→trae→qoder`）、`DispatchError::QoderDisabled`、`ModelSources.qoder` 多源计数（is_dual 泛化）、`available_count` smart 门槛≥2、smart 排序键 Qoder 倍率取 `credits_rate_of`（"x0.6 credits"→0.6）、pool_health/final_model_for/effort_for/max_mode_for Qoder 臂；新增 t40/t41/t42（Qoder-only 接管/QoderDisabled/NoHealthy）。
+- **pool.rs**：`QoderSyncAccount{uid,name,access_token,machine_id,needs_relogin}` + `sync_from_qoder`（entries 全量重建、credits 恒 None、needs_relogin→disabled、空令牌账号不入池）。
+- **unified_catalog.rs**：`unified_models_ex`/`unified_models_whitelisted_ex`（`qoder=Some((开关,池健康))` 时合并 Qoder 目录，vendor="Qoder"、rate=credits 文本解析倍率、efforts 取 declared_union；条目始终入表镜像 WB 内置语义，enabled 徽章=开关&&池健康）；旧签名 `unified_models`/`unified_models_whitelisted` 包装 qoder=None（既有调用方/测试零变化）。
+- **commands/api_server.rs 接线**：`ApiPoolFile.qoder_enabled`（serde default **false**，未部署 Qoder 环境零告警噪音/目录徽章熄灭）；`apply_pool_snapshot` 扩四池签名返回四元组（Qoder 装配 = `qoder::load_pool` 账号行 + token store 快照 access_token + device_profile.machine_id → `sync_from_qoder`，白名单 fail-open 全部入池）；do_start 注入 `qoder_identity` 回调（闭包借 AppHandle 走 `ensure_fresh` 全防护：H-1 串行化锁 + PAT/客户端双通道惰性刷新 + 设备指纹合并注入，请求路径临期窗口 1h；凭证缺失返回 Err）+ Qoder 池启动日志；`pool_set` 新增 `qoder_enabled` 参数（None 保留原值）+ 运行中热应用 AtomicBool；`api_unified_models` 迁 `unified_models_ex` 传实时池旗标（运行中读 qoder_pool.has_selectable，未运行放宽 true）。
+- **routes.rs**：dispatch_error_response 加 QoderDisabled 臂、no_healthy_detail 加 Qoder 描述、Chat/Anthropic/Messages 三协议端点 match 补 Qoder 分支（Responses 端点 WB-only 不加）、models 端点迁 `unified_models_whitelisted_ex` 传实时池健康。
+
+### 口径说明（p3-3）
+
+- Qoder 池无独立白名单配置：账号 fail-open 全部入池（量级小、needs_relogin 单点表达禁用），参与调度由 `qoder_enabled` 全局开关控制（pool_set 热应用）；池内 access_token 仅为入池门槛快照，请求期真凭证由 identity 回调按次经 ensure_fresh 解析（含惰性刷新与落库）。
+- 遗留测试兼容：dispatch Fixture `qoder_enabled=false`（编码前 Qoder 时代部署契约，Qoder 排序参与/接管行为由 t40~t42 专属覆盖）；unified_models 旧签名包装不合并 Qoder 源。
+- 排队语义：业务码 10605 不冷却不换号，同号按上游 retryAfterSeconds 退避重试（上限 3 次）；QoderDisabled = 开关关闭（非健康态），路由层直接拒绝不进池。
+
+### 测试（p3-3）
+
+- `cargo test` 657 passed / 0 failed（含 qoder_upstream 31 单测、dispatch t40~t42、pool sync_from_qoder、unified_catalog Qoder 合并、pool_set merge qoder_enabled 保留语义）；`cargo check` 零警告（旧签名包装定点 `#[allow(dead_code)]`——生产调用方已迁 _ex、测试仍消费）。
+
+### 修复
+
+- **抓包日志响应体预览 8KB→256KB**：device_proxy `log_request` 对解压后响应体的落盘预览原截断 8192 字节，model/list（解压 67856B）等配置类 JSON 只能拿到前 12%，完整模型目录无法离线解析；预览上限提至 256KB，下次重抓即可获得全量 model/list 与 region endpoints 载荷。
+- **过期手动路径遮蔽 IDE/Work 按钮目标（早退降级）**：用户此前在设置页保存的手动路径在 0.4.3 拆分后语义已变（`qoder_ide_path` = Work 本体旧路径、`qoderwork_path` = 旧 Launcher），而候选函数对手动值非空即早退，永久遮蔽修复后的默认候选。现 `ide_exe_candidates`/`work_exe_candidates` 对过期形态判定降级：拆分 IDE 已装且手动值指向 `Programs\Qoder CN\Qoder CN.exe`、或手动值指向旧 Launcher 且 Work 本体已装时，忽略手动值走默认候选；拆分检测抽为 `ide_split_installed()` 与 `is_running` 共用。环境配置页自动检测（`qoder_env_check` 走候选函数）连带修正，占位符/提示文案同步对齐拆分语义（IDE → `Programs\Qoder CN IDE\`，Work → `Programs\Qoder CN\` 本体）。
+- **打开 QoderWork 按钮误拉 Launcher**：`work_exe_candidates` 首位改为 Work 本体 `%LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe`（0.4.3+），旧版 Launcher 降为兜底；`work_running` 进程检测补 Launcher 兼容。`get_environment_info` 的 `qoderwork_running` 改用新检测。
+- **打开 Qoder IDE 拉起 Work 本体（0.4.3 安装目录拆分适配）**：Qoder CN 0.4.3 起 IDE 与 Work 拆分安装目录——真 IDE 为 `%LOCALAPPDATA%\Programs\Qoder CN IDE\Qoder CN IDE.exe`，`Programs\Qoder CN\Qoder CN.exe` 已是 Work 本体（Electron）。`ide_exe_candidates` 候选补入真 IDE 路径（优先于旧一体化形态兜底），`is_running` 进程检测适配独立进程名 `Qoder CN IDE.exe`；环境检测 qoderwork 注释同步修正（Work 本体 userData = `%APPDATA%\com.qodercn.app.stable`，`%APPDATA%\QoderCN` 专属拆分后 IDE）。
+
+### 测试
+
+- `cargo check` 通过（仅 1 条预期 dead_code 警告，含日志预览上限与 p3-2e 改动）；`tsc --noEmit` 全绿。
+
+---
+
 ## [未发布] · Qoder 模块全面审查修复批
 
 > 范围：Qoder 模块（29 命令 + 6 后台任务 + 6 前端页）整体审查后的全量修复；功能行为不变，correctness 与健壮性加固。
 
 ### 修复
 
+- **[P3] 每日签到页「今日获得」已签不展示**：`already` 记录的 reward（幂等回放 / 断网复查确认的真实入账）此前被整类排除，账号状态「已领（此前已领）」时今日获得恒显示「—」；现两遍扫描计入 already 奖励，与 success/fail 同额视为同活动重复回放去重防双计（与记录顺序无关）。
+- **[P3] 签到页文案通俗化**：页面概述「sash campaigns 幂等领取 · 双活动一次覆盖」与双活动卡「接口层同源 / FEFO 扣减 / 开窗」等术语改为直白说明（领取内容、刷新与有效期、跳过与防重复领取语义不变）。
+- **[P3] 环境配置计划任务按钮「注销」改「卸载」**：每日签到 Windows 计划任务的移除按钮及成功/失败 toast 文案统一为「卸载」，消除与「退出登录」语义的歧义。
 - **[P1] 并发刷新丢 token（高危）**：签到/积分/定时兜底/401 自愈多通道并发触发同一账号 `ensure_fresh` 时，两线程可能同时用旧凭证换新 token，后落库者覆盖先落库者（被覆盖方被迫重登）。现加三层防护：① 每账号刷新互斥锁（`refresh_lock_for`，持锁重读即二次检查，他人已刷新直接复用不再发网络请求）；② `save_token_store` 落库前重新 load DB 最新表做仅目标行替换的行级合并（把跨进程 last-writer-wins 覆盖窗口从 vault 全程收窄到数毫秒）；③ 双写版本闸门保持。
 - **[P2] 签到失败无重试**：调度器/CLI 的 `qoder-checkin` 此前无论成败恒返 Ok，暂态失败错过调度器 30 分钟冷却重试；现在 done.failed>0 时返 Err 交既有冷却机制自愈（scheduler.rs 与 tasks/mod.rs 双路同步）。
 - **[P2] jobToken 探测顺序**：PAT→作业令牌换取此前先试两个未证实通道（/api/v1/jobToken/exchange）再试抓包实证的 `/api/v1/me/jobToken`，有效通道每次多耗两次无效请求；已调整为已证实通道优先。

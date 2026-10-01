@@ -159,7 +159,9 @@ pub async fn do_start(
     let pool = ApiPool::new();
     pool.set_strategy(strategy);
     let wb_pool = ApiPool::new();
-    let (pool_count, wb_uids_len, wb_accounts_total) = apply_pool_snapshot(state, &pool, &wb_pool);
+    let qoder_pool = ApiPool::new();
+    let (pool_count, wb_uids_len, wb_accounts_total, qoder_count) =
+        apply_pool_snapshot(state, &pool, &wb_pool, &qoder_pool);
 
     let healthy_count = pool.diagnose().iter().filter(|d| d.reason.starts_with("healthy")).count();
     fs_utils::app_log(
@@ -186,6 +188,15 @@ pub async fn do_start(
         ),
     );
     wb_pool.set_strategy(wb_strategy);
+
+    // Qoder 池启动概况（p3-3）：开关默认 false，未启用时不产生告警噪音
+    fs_utils::app_log(
+        &state.data_dir,
+        &format!(
+            "API服务启动-Qoder上游池: enabled={} accounts={}",
+            pool_file.qoder_enabled, qoder_count,
+        ),
+    );
 
     // 池为空时给出明确警告：分别指明是哪个池——Trae 池空 ≠ 全部资源不可用，
     // Buddy(WB) 池可能正常服务（2026-09-20 实测反馈：警告误导排查方向）
@@ -262,6 +273,32 @@ pub async fn do_start(
             std::sync::Arc::new(move |uid: &str| {
                 let st = app.state::<AppState>();
                 crate::commands::accounts::refresh_jwt_impl(&st, uid, true)
+            })
+        }),
+        // Qoder 上游（p3-3）：专用池 + identity 回调注入。回调借 AppHandle 每次
+        // 取 State 走 ensure_fresh 全防护链路（H-1 串行化锁 + PAT/客户端双通道
+        // 惰性刷新 + 设备指纹合并注入）；凭证缺失返回 Err → 网关侧 SessionDead
+        // 语义（禁用换号），未启用 Qoder 时回调不触发
+        trae_enabled: std::sync::atomic::AtomicBool::new(pool_file.trae_enabled),
+        qoder_pool,
+        qoder_enabled: std::sync::atomic::AtomicBool::new(pool_file.qoder_enabled),
+        qoder_identity: Some({
+            let app = app.clone();
+            std::sync::Arc::new(move |acct_id: &str| {
+                let st = app.state::<AppState>();
+                // 请求路径临期窗口 1h：1 小时内到期的令牌先刷再用，避免带着
+                // 临期令牌发请求吃 401（对齐 qoder_refresh LAZY_HOURS>6 的调度
+                // 语义，网关请求路径取更激进的短窗口）
+                // 带超时 agent（整体 20s，审查修复）：ensure_fresh 临期时真发刷新
+                // 请求，裸 Agent::new() 无超时会在 H-1 串行锁内挂起并阻塞同账号
+                // 后续刷新
+                let agent = crate::tasks::http_agent(20);
+                let (creds, _, status) =
+                    crate::tasks::qoder_common::ensure_fresh(&st, &agent, acct_id, 1);
+                if creds.access_token.is_empty() {
+                    return Err(format!("qoder 凭证缺失(id={acct_id}, status={status})"));
+                }
+                Ok(creds)
             })
         }),
     });
@@ -449,9 +486,14 @@ fn merge_pool_expire_times(rc: &RemainingCreditsFile) -> std::collections::HashM
 }
 
 /// 池装配公共逻辑（do_start 构建 / 凭据变更热重载共用）：
-/// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建两池内条目。
-/// 返回 (trae 池条目数, wb 白名单长度, wb 账号总数) 供调用方记日志。
-fn apply_pool_snapshot(state: &AppState, pool: &ApiPool, wb_pool: &ApiPool) -> (usize, usize, usize) {
+/// 读取 vault 账号 + 池配置 + 分组 + 冷却 + 积分 + 设备映射，全量重建三池内条目。
+/// 返回 (trae 池条目数, wb 白名单长度, wb 账号总数, qoder 池条目数) 供调用方记日志。
+fn apply_pool_snapshot(
+    state: &AppState,
+    pool: &ApiPool,
+    wb_pool: &ApiPool,
+    qoder_pool: &ApiPool,
+) -> (usize, usize, usize, usize) {
     let accounts = crate::vault::load_accounts(state);
     let pool_file: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
     let groups_file: crate::models::GroupsFile =
@@ -496,7 +538,36 @@ fn apply_pool_snapshot(state: &AppState, pool: &ApiPool, wb_pool: &ApiPool) -> (
     };
     let wb_uids = effective_wb_uids(&pool_file, &wb_accounts);
     wb_pool.sync_from_wb(&wb_accounts, &wb_uids);
-    (pool.count(), wb_uids.len(), wb_accounts.len())
+    // Qoder 池装配（p3-3）：账号池行 + token store 快照 → QoderSyncAccount。
+    // 白名单 fail-open（全部入池，对齐 WB 池空白名单语义）：Qoder 账号量级小且
+    // 由 needs_relogin 单点表达禁用，独立白名单暂无需求；开关由 qoder_enabled 全局控制。
+    // access_token 取 token store 快照（sync_from_qoder 跳过空令牌账号）；请求期
+    // 真凭证由 identity 回调按次经 ensure_fresh 解析（含惰性刷新），池内快照仅作入池门槛。
+    let qoder_accounts_raw = crate::commands::qoder::load_pool(state);
+    let token_store = crate::tasks::qoder_common::load_token_store(state);
+    let qoder_sync: Vec<crate::api_server::pool::QoderSyncAccount> = qoder_accounts_raw
+        .iter()
+        .map(|a| crate::api_server::pool::QoderSyncAccount {
+            uid: a.id.clone(),
+            name: a.nickname.clone(),
+            access_token: token_store
+                .get("tokens")
+                .and_then(|t| t.get(&a.id))
+                .and_then(|c| c.get("access_token"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            machine_id: a
+                .device_profile
+                .as_ref()
+                .map(|p| p.machine_id.clone())
+                .unwrap_or_default(),
+            needs_relogin: a.needs_relogin,
+        })
+        .collect();
+    let qoder_ids: Vec<String> = qoder_sync.iter().map(|a| a.uid.clone()).collect();
+    qoder_pool.sync_from_qoder(&qoder_sync, &qoder_ids);
+    (pool.count(), wb_uids.len(), wb_accounts.len(), qoder_pool.count())
 }
 
 /// 网关运行中热重载两池（凭据/成员变更联动）：OAuth 重登、refresh_token 刷新、
@@ -510,11 +581,12 @@ pub fn reload_pools_if_running(
 ) {
     let guard = safe_lock(runtime);
     let Some(rt) = guard.as_ref() else { return };
-    let (trae, wb_uids, wb_total) = apply_pool_snapshot(state, &rt.shared.pool, &rt.shared.wb_pool);
+    let (trae, wb_uids, wb_total, qoder) =
+        apply_pool_snapshot(state, &rt.shared.pool, &rt.shared.wb_pool, &rt.shared.qoder_pool);
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "API服务池热重载(凭据/成员变更联动): trae_pool={trae} wb_whitelist={wb_uids} wb_accounts={wb_total}"
+            "API服务池热重载(凭据/成员变更联动): trae_pool={trae} wb_whitelist={wb_uids} wb_accounts={wb_total} qoder_pool={qoder}"
         ),
     );
 }
@@ -539,6 +611,8 @@ fn merge_pool_set(
     pool_sticky_ttl_secs: Option<u64>,
     wb_sticky_ttl_secs: Option<u64>,
     wb_uids: Option<Vec<String>>,
+    qoder_enabled: Option<bool>,
+    trae_enabled: Option<bool>,
 ) -> ApiPoolFile {
     // Trae 池白名单剥离 wb- 前缀条目：WB 账号归属独立白名单 wb_enabled_uids，
     // 旧版混存于共享 enabled_uids（历史兼容形态），保存时迁移归位防丢失
@@ -562,6 +636,7 @@ fn merge_pool_set(
         }
     });
     ApiPoolFile {
+        trae_enabled: trae_enabled.unwrap_or(existing.trae_enabled),
         enabled_uids: trae_uids,
         strategy: strategy.unwrap_or_else(|| existing.strategy.clone()),
         wb_strategy: wb_strategy.unwrap_or_else(|| existing.wb_strategy.clone()),
@@ -579,6 +654,7 @@ fn merge_pool_set(
         pool_sticky_ttl_secs: pool_sticky_ttl_secs.unwrap_or(existing.pool_sticky_ttl_secs),
         wb_sticky_ttl_secs: wb_sticky_ttl_secs.unwrap_or(existing.wb_sticky_ttl_secs),
         wb_enabled_uids,
+        qoder_enabled: qoder_enabled.unwrap_or(existing.qoder_enabled),
     }
 }
 
@@ -608,6 +684,10 @@ pub fn pool_set(
     // Buddy 池入池白名单（wb- 前缀账号 id）；None = 保留原值（含旧数据迁移），
     // Some(list) = 覆盖（Buddy 页账号池勾选保存）
     wb_uids: Option<Vec<String>>,
+    // Qoder 上游开关（p3-3）；None = 保留原值
+    qoder_enabled: Option<bool>,
+    // Trae 池参与调度开关（默认开）；None = 保留原值
+    trae_enabled: Option<bool>,
 ) -> Result<(), String> {
     let existing: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
     let pool_file = merge_pool_set(
@@ -627,6 +707,8 @@ pub fn pool_set(
         pool_sticky_ttl_secs,
         wb_sticky_ttl_secs,
         wb_uids,
+        qoder_enabled,
+        trae_enabled,
     );
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     // 热应用：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
@@ -665,6 +747,11 @@ pub fn pool_set(
         rt.shared
             .wb_enabled
             .store(pool_file.wb_enabled, std::sync::atomic::Ordering::Relaxed);
+        // Trae 池开关热应用（每池自管开关，默认开）
+        rt.shared.trae_enabled.store(
+            pool_file.trae_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         rt.shared.wb_default_thinking.store(
             pool_file.wb_default_thinking,
             std::sync::atomic::Ordering::Relaxed,
@@ -675,6 +762,11 @@ pub fn pool_set(
         rt.shared
             .wb_bg_downgrade
             .store(pool_file.wb_bg_downgrade, std::sync::atomic::Ordering::Relaxed);
+        // Qoder 上游开关热应用（p3-3）
+        rt.shared.qoder_enabled.store(
+            pool_file.qoder_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     // 成员/分组热应用：此前仅策略/参数热生效，成员变更要求重启服务；
     // 现统一走凭据/成员变更联动热重载，保存账号池后立即生效
@@ -863,6 +955,17 @@ pub fn api_custom_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> 
     )
 }
 
+/// 查询最近 N 天的 Qoder 上游用量统计（qoder_days 桶，与 Trae/WB/Custom 侧分账；上游接入前恒空）
+#[tauri::command]
+pub fn api_qoder_usage_stats(state: State<'_, AppState>, days: Option<u32>) -> Vec<crate::api_server::usage::UsageDayView> {
+    let days = days.unwrap_or(14).clamp(1, 90);
+    crate::api_server::usage::query_recent_in(
+        &state.data_dir,
+        days,
+        crate::api_server::usage::UsageBucket::Qoder,
+    )
+}
+
 // ==================== 多 API Key 命令 ====================
 
 /// 读取 API Key 列表与鉴权开关
@@ -902,27 +1005,33 @@ pub fn api_unified_models(
     runtime: State<'_, Mutex<Option<ApiServerRuntime>>>,
     available_only: Option<bool>,
 ) -> Vec<crate::api_server::unified_catalog::UnifiedModel> {
-    let (wb_enabled, trae_ok, buddy_ok) = match safe_lock(&runtime).as_ref() {
+    let (wb_enabled, qoder_enabled, trae_ok, buddy_ok, qoder_ok) = match safe_lock(&runtime).as_ref() {
         Some(rt) => {
             let s = &rt.shared;
             (
                 s.wb_enabled
                     .load(std::sync::atomic::Ordering::Relaxed),
-                s.pool.has_selectable(),
+                s.qoder_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                // Trae 开关（默认开）参与可用性：关闭时 Trae 源徽章置灰
+                s.trae_enabled.load(std::sync::atomic::Ordering::Relaxed)
+                    && s.pool.has_selectable(),
                 s.wb_pool.has_selectable(),
+                s.qoder_pool.has_selectable(),
             )
         }
         None => {
             let pf: ApiPoolFile = crate::store::db(&state.data_dir).kv_get("api_pool");
-            (pf.wb_enabled, true, true)
+            (pf.wb_enabled, pf.qoder_enabled, pf.trae_enabled, true, true)
         }
     };
     let data_dir = state.data_dir.clone();
-    let mut list = crate::api_server::unified_catalog::unified_models(
+    let mut list = crate::api_server::unified_catalog::unified_models_ex(
         &data_dir,
         wb_enabled,
         trae_ok,
         buddy_ok,
+        Some((qoder_enabled, qoder_ok)),
     );
     if available_only.unwrap_or(false) {
         list.retain(|m| m.sources.iter().any(|s| s.enabled));
@@ -1130,6 +1239,7 @@ mod pool_merge_tests {
     /// 模拟已存在的 api_pool.json（各字段均非默认值，验证"保留"是否生效）
     fn existing() -> ApiPoolFile {
         ApiPoolFile {
+            trae_enabled: true,
             enabled_uids: vec!["u1".into()],
             strategy: "weighted".into(),
             wb_strategy: "p2c".into(),
@@ -1145,6 +1255,7 @@ mod pool_merge_tests {
             wb_sticky_ttl_secs: 3600,
             wb_enabled_uids: Vec::new(),
             wb_group_ids: vec!["wg1".into()],
+            qoder_enabled: true,
         }
     }
 
@@ -1154,20 +1265,8 @@ mod pool_merge_tests {
         let m = merge_pool_set(
             &existing(),
             vec!["u2".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None,
         );
         assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
         assert_eq!(m.strategy, "weighted");
@@ -1185,6 +1284,9 @@ mod pool_merge_tests {
         assert_eq!(m.account_concurrency_limit, 2);
         assert_eq!(m.pool_sticky_ttl_secs, 600);
         assert_eq!(m.wb_sticky_ttl_secs, 3600);
+        // Qoder 开关未传 → 保留原值（p3-3）；Trae 开关未传 → 保留原值（默认开）
+        assert!(m.qoder_enabled);
+        assert!(m.trae_enabled);
     }
 
     #[test]
@@ -1197,20 +1299,8 @@ mod pool_merge_tests {
         let m = merge_pool_set(
             &legacy,
             vec!["1001".into(), "wb-abc".into(), "1002".into(), "wb-def".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None,
         );
         // Trae 白名单剥离 wb- 条目
         assert_eq!(m.enabled_uids, vec!["1001".to_string(), "1002".to_string()]);
@@ -1277,6 +1367,8 @@ mod pool_merge_tests {
             None,
             None,
             Some(vec!["wb-new".into()]),
+            None,
+            None,
         );
         assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
         assert_eq!(m.enabled_uids, vec!["u1".to_string()]);
@@ -1336,6 +1428,8 @@ mod pool_merge_tests {
             Some(60),
             Some(120),
             None,
+            None,
+            None,
         );
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
@@ -1359,20 +1453,8 @@ mod pool_merge_tests {
         let m = merge_pool_set(
             &existing(),
             vec!["u1".into(), "u3".into()],
-            None,
-            None,
-            Some(vec!["g2".into()]),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, None, Some(vec!["g2".into()]), None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -1388,20 +1470,8 @@ mod pool_merge_tests {
         let m = merge_pool_set(
             &ApiPoolFile::default(),
             vec!["u1".into()],
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None,
         );
         assert_eq!(m.strategy, "");
         assert_eq!(m.wb_strategy, "");
@@ -1412,6 +1482,8 @@ mod pool_merge_tests {
         assert_eq!(m.account_concurrency_limit, 1);
         assert_eq!(m.pool_sticky_ttl_secs, 300);
         assert_eq!(m.wb_sticky_ttl_secs, 1800);
+        // Trae 开关 serde default = true（主池缺省恒可用）
+        assert!(m.trae_enabled);
     }
 }
 

@@ -521,6 +521,10 @@ export const api = {
         wbUids?: string[] | null;
         /** Buddy 池分组筛选；null/未传 = 保留原值，空数组 = 清空（不限分组） */
         wbGroupIds?: string[] | null;
+        /** Qoder 上游开关（p3-3）；null/未传 = 保留原值 */
+        qoderEnabled?: boolean;
+        /** Trae 池参与调度开关（默认开）；null/未传 = 保留原值 */
+        traeEnabled?: boolean;
       },
       wbStrategy?: string,
     ) =>
@@ -539,6 +543,8 @@ export const api = {
         poolStickyTtlSecs: wbFlags?.poolStickyTtlSecs ?? null,
         wbStickyTtlSecs: wbFlags?.wbStickyTtlSecs ?? null,
         wbUids: wbFlags?.wbUids ?? null,
+        qoderEnabled: wbFlags?.qoderEnabled ?? null,
+        traeEnabled: wbFlags?.traeEnabled ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
@@ -592,6 +598,9 @@ export const api = {
     // 自定义模型用量统计（custom_days 桶，API 管理·用量统计「自定义」筛选）
     customUsageStats: (days?: number) =>
       invoke<UsageDayView[]>('api_custom_usage_stats', { days: days ?? null }),
+    // Qoder 上游用量统计（qoder_days 桶，与 Trae/WB/Custom 侧分账；上游接入前恒空）
+    qoderUsageStats: (days?: number) =>
+      invoke<UsageDayView[]>('api_qoder_usage_stats', { days: days ?? null }),
     // 自定义模型列表（custom_models.json，OpenAI 兼容上游直通）
     customModelsList: () => invoke<CustomModel[]>('custom_models_list'),
     // 保存自定义模型（upsert：id 空 = 新增；返回保存后的完整列表）

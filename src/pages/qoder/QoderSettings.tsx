@@ -5,7 +5,7 @@ import { Badge, Spinner } from '../../components/ui';
 import { withMinDelay } from '../../lib/delay';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
-import type { QoderEnvCheck, QoderSettings } from '../../types';
+import type { ApiPoolFile, QoderEnvCheck, QoderSettings } from '../../types';
 
 /**
  * qoder-settings 环境配置（F-80 §5.8，布局对齐 BuddySettings）：
@@ -30,6 +30,11 @@ export default function QoderSettings() {
   const [checkinHhmm, setCheckinHhmm] = useState('10:15');
   const [creditsHhmm, setCreditsHhmm] = useState('23:40');
   const [creditsSyncEnabled, setCreditsSyncEnabled] = useState(true);
+  // 网关上游开关（p3-3）：api_pool 配置 + Qoder 池成员保全所需的 poolFile 快照；
+  // 加载失败时开关禁用（对齐 settingsErr 的诚实禁用模式，避免保存静默跳过误报成功）
+  const [poolFile, setPoolFile] = useState<ApiPoolFile | null>(null);
+  const [poolErr, setPoolErr] = useState(false);
+  const [qoderGateway, setQoderGateway] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -48,12 +53,21 @@ export default function QoderSettings() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [ts, e] = await Promise.all([
+      const [ts, e, pf] = await Promise.all([
         api.qoder.checkinTaskStatus().catch(() => [] as string[]),
         api.qoder.envCheck().catch(() => null),
+        api.apiServer.poolList().catch(() => null),
       ]);
       setTaskTimes(ts);
       setEnv(e);
+      if (pf) {
+        setPoolFile(pf);
+        setQoderGateway(pf.qoder_enabled ?? false);
+        setPoolErr(false);
+      } else {
+        setPoolFile(null);
+        setPoolErr(true);
+      }
       await loadQoderSettings();
     } catch (err) {
       pushToast('error', `检测失败：${String(err)}`);
@@ -84,6 +98,10 @@ export default function QoderSettings() {
       pushToast('error', 'qoder-settings 加载失败，签到开关暂不可保存；请点「重新检测」重试');
       return;
     }
+    if (poolErr) {
+      pushToast('error', 'api_pool 配置加载失败，网关上游开关暂不可保存；请点「重新检测」重试');
+      return;
+    }
     if (!isValidHHMM(checkinHhmm)) {
       pushToast('error', `签到时刻格式无效：${checkinHhmm}（应为 HH:MM）`);
       return;
@@ -104,6 +122,17 @@ export default function QoderSettings() {
             qoder_credits_sync_enabled: creditsSyncEnabled,
           }),
           qoderSettings ? api.qoder.settingsSet(qoderSettings) : Promise.resolve(),
+          // 网关上游开关（p3-3）：uids 回传现值保全 Trae 池白名单；未传字段后端保留原值。
+          // poolFile 加载失败时跳过（开关已禁用 + 保存前显式拦截提示，不静默误报）
+          poolFile
+            ? api.apiServer
+                .poolSet(poolFile.enabled_uids ?? [], undefined, undefined, {
+                  qoderEnabled: qoderGateway,
+                })
+                .catch((err) => {
+                  throw new Error(`网关上游开关保存失败：${String(err)}`);
+                })
+            : Promise.resolve(),
         ]),
         800,
       );
@@ -134,9 +163,9 @@ export default function QoderSettings() {
     try {
       await api.qoder.checkinTaskUnregister();
       setTaskTimes(await api.qoder.checkinTaskStatus());
-      pushToast('success', 'Windows 计划任务已注销');
+      pushToast('success', 'Windows 计划任务已卸载');
     } catch (err) {
-      pushToast('error', `注销失败：${String(err)}`);
+      pushToast('error', `卸载失败：${String(err)}`);
     }
   };
 
@@ -204,7 +233,7 @@ export default function QoderSettings() {
                     className="input flex-1 font-mono text-xs"
                     value={idePath}
                     onChange={(e) => setIdePath(e.target.value)}
-                    placeholder={env?.ide_exe ?? 'C:\\Users\\...\\AppData\\Local\\Programs\\Qoder CN\\Qoder CN.exe'}
+                    placeholder={env?.ide_exe ?? 'C:\\Users\\...\\AppData\\Local\\Programs\\Qoder CN IDE\\Qoder CN IDE.exe'}
                   />
                   <button className="btn-outline shrink-0 !px-2 !py-1" onClick={() => detectPath('ide')}>
                     <Search size={13} /> 自动检测
@@ -222,13 +251,13 @@ export default function QoderSettings() {
                     className="input flex-1 font-mono text-xs"
                     value={workPath}
                     onChange={(e) => setWorkPath(e.target.value)}
-                    placeholder={env?.qoderwork_exe ?? 'C:\\Users\\...\\AppData\\Local\\Qoder CN\\Qoder CN Launcher\\Qoder CN Launcher.exe'}
+                    placeholder={env?.qoderwork_exe ?? 'C:\\Users\\...\\AppData\\Local\\Programs\\Qoder CN\\Qoder CN.exe'}
                   />
                   <button className="btn-outline shrink-0 !px-2 !py-1" onClick={() => detectPath('work')}>
                     <Search size={13} /> 自动检测
                   </button>
                 </div>
-                <p className="mt-1.5 text-slate-400">Launcher 拉起与已安装检测使用 · 留空 = 自动检测 · 随右上角「保存配置」生效</p>
+                <p className="mt-1.5 text-slate-400">Work 本体拉起与已安装检测使用 · 留空 = 自动检测 · 随右上角「保存配置」生效</p>
               </div>
             </div>
             {/* 签到行为（并入通用配置卡内部分节） */}
@@ -260,6 +289,39 @@ export default function QoderSettings() {
                   {settingsErr && (
                     <span className="mt-1 block text-xs text-amber-600 dark:text-amber-400">
                       qoder-settings 加载失败，当前显示为默认值且不可修改；请点右上角「重新检测」重试
+                    </span>
+                  )}
+                </span>
+              </label>
+            </div>
+            {/* 网关上游（p3-3）：Qoder 推理网关接入 API 网关的总开关 */}
+            <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+            <h3 className="mb-2 font-medium">网关上游</h3>
+            <div className="grid gap-3">
+              <label
+                className={`flex items-start gap-2 rounded-lg border p-3 ${
+                  poolErr
+                    ? 'border-amber-200 bg-amber-50/50 opacity-70 dark:border-amber-500/30 dark:bg-amber-500/5'
+                    : 'border-slate-100 dark:border-zinc-800'
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  disabled={poolErr}
+                  checked={qoderGateway}
+                  onChange={(e) => setQoderGateway(e.target.checked)}
+                />
+                <span className="text-sm">
+                  启用 Qoder 网关上游
+                  <span className="block text-xs text-slate-400">
+                    开启后 API 网关的 Qoder 目录模型（Auto/Qwen/GLM/Kimi 等）路由到 Qoder 账号池，
+                    按倍率计费不消耗通用积分；需先在「账号管理」导入 Qoder 账号。
+                    保存后立即生效（服务运行中热应用）。
+                  </span>
+                  {poolErr && (
+                    <span className="mt-1 block text-xs text-amber-600 dark:text-amber-400">
+                      api_pool 配置加载失败，当前不可修改；请点右上角「重新检测」重试
                     </span>
                   )}
                 </span>
@@ -298,7 +360,7 @@ export default function QoderSettings() {
                 />
                 {taskTimes.length > 0 ? (
                   <button className="btn-ghost !px-3 !py-1 text-xs text-rose-500" onClick={() => void unregisterTask()}>
-                    注销
+                    卸载
                   </button>
                 ) : (
                   <button className="btn-outline !px-3 !py-1 text-xs" onClick={() => void registerTask()}>

@@ -48,7 +48,7 @@ ai-work-assistant/
 │   ├── lib/                      # tauri.ts(invoke 封装+事件订阅) / themes.ts(主题) / delay.ts(withMinDelay) / cn.ts / about.ts / useIsDark.ts
 │   ├── components/               # TitleBar/Sidebar/TopBar/Toaster/PageHeader/SetupGuide/ui + SystemDialog(系统设置+系统日志弹框)/GeneralSettingsPanel/AboutDialog
 │   └── pages/                    # Dashboard / Accounts(661行编排 + accounts/ 16 个拆分子组件) / Checkin / Logs / ApiService / Settings
-│   │                             #   dashboard/ 积分看板（platform 参数化：credits 视图=Trae 页、buddy-credits 视图=Buddy 页；KpiRow/CreditsTab/TokensTab/ExpiryTab/adapters）
+│   │                             #   dashboard/ 积分看板（platform 参数化：credits 视图=Trae 页、buddy-credits 视图=Buddy 页、qoder-credits 视图=Qoder 页替换旧 QoderCredits；KpiRow/CreditsTab/TokensTab/ExpiryTab/adapters）
 │   │                             #   buddy/（BuddyOverview/BuddyAccounts/BuddyCheckin/BuddyApiService/BuddySettings）
 ├── scripts/                      # dev-tauri.mjs(tauri 脚本入口) / sync_version.mjs / rename_release.mjs / package_portable.mjs / gen_asset_base64.mjs
 ├── src-tauri/
@@ -150,16 +150,16 @@ ai-work-assistant/
 | 设备 | `device_reset(userId)` | 删 `device_map.json[ uid ]` |
 | JWT | `jwt_parse(jwt)` / `refresh_jwt(userId)` | 解析 / 自动刷新（需 refresh_token） |
 | API | `api_server_start()` / `api_server_stop()` / `api_server_status()` | API 网关启停（端口/默认模型由设置页提供；鉴权统一走 API Keys 列表） |
-| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理；`pool_set` 扩展 `strategy`（expire_first/credit_first/random/**weighted/p2c**）/ `group_ids` / `wb_enabled`（T2.1 WB 上游开关）/ `wb_default_thinking`（T5.3）/ `wb_tool_exec`（T5.5，默认开）/ `wb_bg_downgrade`（T5.6③）——未传字段保留原值 |
+| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理；`pool_set` 扩展 `strategy`（expire_first/credit_first/random/**weighted/p2c**）/ `group_ids` / `wb_enabled`（T2.1 WB 上游开关）/ `wb_default_thinking`（T5.3）/ `wb_tool_exec`（T5.5，默认开）/ `wb_bg_downgrade`（T5.6③）/ `qoder_enabled`（p3-3 Qoder 上游开关，默认关，Qoder 环境配置页·网关上游）/ `trae_enabled`（Trae 池开关，默认开，Trae 资源调度页）——未传字段保留原值；三池三页各自管理自己的开关 |
 | API | `api_debug_toggle` / `api_debug_status` | API 请求日志开关 |
 | API | `api_models_list()` / `api_models_sync()` | 模型列表读取（data/api_models.json）/ 官网同步（不消耗积分，最多试 3 账号） |
 | API | `api_logs_list(...)` / `api_logs_detail(...)` / `api_logs_search(...)` | API 请求日志查询 / 详情 / 搜索 |
 | API | `api_usage_stats(days?)` → `UsageDayView[]` | 网关用量按日统计（T1，data/api_usage.json，保留 90 天，直读落盘） |
 | API | `api_keys_list()` / `api_keys_save(keys)` | 多 API Key 列表管理（T2，data/api_keys.json，每日配额；主 Key 双轨已移除） |
 | API | `api_unified_models(available_only?)` | 统一模型目录（v3.3.x）：Trae 官网同步 + WB 目录 + 自定义模型三源合并（canonical_id trim+lowercase 归并），元数据四层兜底（L1 人工覆盖 trae_model_meta.json → L2 官网 → L3 默认 → L4 系列推断）；与 `GET /v1/models` 共用视图 |
-| API | `dispatch_policy_get()` / `dispatch_policy_set(policy)` | 池间调度策略（data/dispatch_policy.json）：`strategy`（smart=到期优先→倍率→健康积分和 / priority=严格按序）、`priority`（trae/buddy 数组，缺省 ["buddy","trae"]）、`per_model` 模型级覆盖（显式覆盖不做智能重排）、`fallback` 跨池回退开关；带 mtime 兜底解析缓存 |
+| API | `dispatch_policy_get()` / `dispatch_policy_set(policy)` | 池间调度策略（data/dispatch_policy.json）：`strategy`（smart=到期优先→倍率→健康积分和 / priority=严格按序）、`priority`（trae/buddy/qoder 数组，缺省 ["buddy","trae","qoder"]）、`per_model` 模型级覆盖（显式覆盖不做智能重排）、`fallback` 跨池回退开关；带 mtime 兜底解析缓存 |
 | API | `custom_models_list()` / `custom_models_save(model)` / `custom_model_test(model)` | 自定义 OpenAI 兼容上游（data/custom_models.json，v3.3.x）：列表 / upsert（name/base_url 必填、canonical 不重复、id `cm-<12hex>` 自动生成）/ 连通性测试（与保存同口径预检）；模型命中即直达 custom 池，不参与 dispatch 池间策略 |
-| API | `api_wb_usage_stats(days?)` / `api_custom_usage_stats(days?)` | WB 池 / 自定义池用量按日统计（分库查询，days 默认 14 clamp 1~90） |
+| API | `api_wb_usage_stats(days?)` / `api_custom_usage_stats(days?)` / `api_qoder_usage_stats(days?)` | WB 池 / 自定义池 / Qoder 池用量按日统计（四桶分库查询，days 默认 14 clamp 1~90；Qoder 桶上游接入后产生数据） |
 | 日志 | `logs_query({ opts: { log_type, date, keyword, limit } })` → `LogLine[]` | `split_time` 会 strip BOM 前缀 |
 | 日志 | `logs_clear(log_type)` → `u32` | 按类型删除日志文件（all/proxy/checkin/switch，T6，幂等） |
 | 设置 | `settings_get()` / `settings_set(patch: Settings)` | Settings 全部 snake_case |
@@ -238,7 +238,8 @@ ai-work-assistant/
 - **并发防护（三层）**：① `TOKEN_STORE_LOCK` 表级读改写互斥；② **每账号刷新锁**（`refresh_lock_for`）串行化同账号 ensure_fresh 全程，持锁重读即二次检查（防并发刷新互相覆盖丢 token）；③ save_token_store 落库前重新 load DB 最新表做**仅目标行替换**的行级合并（收窄跨进程 last-writer-wins 窗口）。锁序：refresh 锁 → TOKEN_STORE_LOCK。
 - **设备指纹（设计文档 §5.10 多账号并发）**：每账号入池即生成稳定 `QoderDeviceProfile`（一次生成永不轮换）；MITM/抓包真实捕获值优先透传，缺失时 `effective_creds` 注入账号绑定 machine_id + 现场随机 machine_token（随机值不落库）。注入唯一出口 = `effective_creds` / ensure_fresh 合并层。
 - **expires_at 域钳制**：store 读入的过期时间超 (0, now+10y) 一律视为无过期信息（防脏数据溢出/千年展示）；`refresh_expires_at_ms` 随设备流/refresh 响应解析落库留档。
-- **调度三任务**：每日签到（默认 10:15，覆盖 0 点签到 + 10:00 登录奖励；失败返 Err → 调度器 30min 冷却重试；启动补签 60s 延迟 + 轮次锁互斥，empty_campaigns 不推送打扰）/ 积分快照（qoder_credits_sync_hhmm）/ 凭证 6h 兜底刷新（lazy 7h 窗口，暂态失败返 Err 重试，永久失败落日志提示人工）。轮次锁 `QODER_ROUND_LOCK`：调度器/启动补签/UI 三路互斥，抢不到锁幂等跳过。
+- **调度四任务**：每日签到（默认 10:15，覆盖 0 点签到 + 10:00 登录奖励；失败返 Err → 调度器 30min 冷却重试；启动补签 60s 延迟 + 轮次锁互斥，empty_campaigns 不推送打扰）/ 积分快照（qoder_credits_sync_hhmm）/ 凭证 6h 兜底刷新（lazy 7h 窗口，暂态失败返 Err 重试，永久失败落日志提示人工）/ 模型目录同步（qoder-catalog-sync，每日 05:50，真 COSY 签名拉 model/list → adopt_remote 替换 CN 区缓存；空池/无凭证静默跳过，恒开无 settings 键）。轮次锁 `QODER_ROUND_LOCK`：调度器/启动补签/UI 三路互斥，抢不到锁幂等跳过。
+- **网关上游（p3-3，v1 仅 CN 区）**：`qoder_enabled` 开关（Qoder 环境配置页·网关上游，运行中热应用）→ Qoder 目录模型路由专用 `qoder_pool`（fail-open 全量入池，needs_relogin 即禁用；池内 access_token 仅入池门槛，请求期真凭证由 `qoder_identity` 回调按次 `ensure_fresh` 解析）。执行链 = `prepare_qoder_body` agent 固定信封 → `encode_body` → COSY 19 头签名（qoder_sign.rs，RSA 内置公钥）→ `gateway.qoder.com.cn` agent_chat_generation SSE → 双层信封翻译（qoder_upstream.rs）。错误四分类：10605 排队（不冷却不换号，同号退避≤3 次）/ 105 鉴权 / 110~122 额度 / 裸 403 Forbidden；用量独立 `qoder_days` 桶（`api_qoder_usage_stats`）。Global 区（api3.qoder.sh）未接线：resolve 双区兜底可命中 Global 条目但请求恒发 CN 网关。
 - **切换器**：`target_app="Qoder"`（authfile 布局），快照落 `data/profiles_qoder`。
 
 ## 6. Tauri 事件（Rust → 前端）

@@ -10,6 +10,7 @@ pub mod gateway_settings;
 pub mod models_sync;
 pub mod pool;
 pub mod payload;
+pub mod qoder_route;
 pub mod retry;
 pub mod routes;
 pub mod server;
@@ -105,6 +106,22 @@ pub struct ApiSharedState {
     /// 入参 user_id，内部走 refresh_jwt_impl 全防护链路强制刷新并持久化。
     /// None（单测/降级构造）时 401 维持原「note_error + 换号」语义
     pub trae_jwt_refresh: Option<std::sync::Arc<dyn Fn(&str) -> Result<String, String> + Send + Sync>>,
+    /// Trae 池参与调度开关（api_pool.json.trae_enabled，默认开）：关闭后 Trae 目录
+    /// 模型不路由 Trae 池（每个资源池管理自己的开关，与 wb_enabled/qoder_enabled 同族）
+    pub trae_enabled: std::sync::atomic::AtomicBool,
+    // ── Qoder 上游（p3-3，gateway.qoder.com.cn 推理网关）─────────────────
+    /// Qoder 上游账号池：独立池实例与 SOLO/WB 并列；Qoder 无积分余额概念，
+    /// 调度只看冷却/禁用/在途。凭证正文不在池内（access_token 会过期），
+    /// 请求时经 qoder_identity 回调解析
+    pub qoder_pool: ApiPool,
+    /// Qoder 上游开关（api_pool.json.qoder_enabled；关闭时 Qoder 模型不参与路由）
+    pub qoder_enabled: std::sync::atomic::AtomicBool,
+    /// Qoder 凭证解析回调（网关层无 AppState 引用，由启动方注入）：
+    /// 入参账号 uid（token store 键），返回经 secure 回填与 effective 合并的
+    /// 完整凭证（PAT 换 24h 作业令牌 / 刷新链路在闭包内走全防护）。
+    /// None（单测/未启用 Qoder）时 Qoder 池不参与路由
+    pub qoder_identity:
+        Option<std::sync::Arc<dyn Fn(&str) -> Result<crate::tasks::qoder_common::QoderCreds, String> + Send + Sync>>,
 }
 
 impl ApiSharedState {
@@ -197,6 +214,37 @@ impl ApiSharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((usage::UsageBucket::Custom, day));
+    }
+
+    /// 记录一次 Qoder 上游请求用量（独立 qoder_days 桶，与 Trae/WB/Custom 侧分账）；
+    /// uid 用 Qoder 账号 uid（管道先铺，上游接入后填真实值），落盘策略与 record_usage 相同
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage_qoder(
+        &self,
+        model: &str,
+        uid: &str,
+        key_id: &str,
+        ok: bool,
+        is_stream: bool,
+        duration_ms: u64,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) {
+        let mut guard = self
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.record_in(
+            usage::UsageBucket::Qoder,
+            model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+        );
+        // 批次 C 削峰：同 record_usage_custom，仅标脏不落盘
+        let day = usage::today_key();
+        drop(guard);
+        self.usage_dirty
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((usage::UsageBucket::Qoder, day));
     }
 
     /// 排空用量脏队列并落盘（flusher 线程 2s 一次 + stop 时调用）。
@@ -528,6 +576,10 @@ mod inflight_tests {
             wb_probe_ts_ms: std::sync::atomic::AtomicI64::new(-1),
             wb_probe_ok: std::sync::atomic::AtomicI64::new(-1),
             trae_jwt_refresh: None,
+            trae_enabled: std::sync::atomic::AtomicBool::new(true),
+            qoder_pool: pool::ApiPool::new(),
+            qoder_enabled: std::sync::atomic::AtomicBool::new(true),
+            qoder_identity: None,
         };
         {
             let _g = state.inflight_guard();

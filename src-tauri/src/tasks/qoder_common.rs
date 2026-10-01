@@ -825,4 +825,176 @@ mod tests {
         let hours = (exp - now) as f64 / 3_600_000.0;
         assert!((hours - 24.0).abs() < 0.01, "24h 窗口");
     }
+
+    // ── p3-3 gateway 可行性探针（#[ignore]：cargo test probe_gateway -- --ignored --nocapture）──
+    // 背景：gateway.qoder.com.cn 对无/假 Cosy-Key 已实测 403 code=101 "Signature invalid"
+    //（model/list，curl 无凭证与假签名两组）。本探针用真实 jobToken（vault）+ 仿 SOLO 抓包头
+    // 探测 ①model/list ②chat Encode=0 明文 body 的服务端反应，区分：
+    //   101 Signature invalid → 签名强校验（chat 上游死路，转 catalog 观察器方案）
+    //   401/403 非签名码     → token 形态被拒（jobToken 不被 gateway 接受）
+    //   400/422 参数类       → 签名已过！body schema 问题（可迭代，重大利好）
+    //   200/SSE              → 全通；读流前 5 行即主动断开（免费模型 qfmodel 零消耗）
+    // 注意：应用运行时 vault 快照可能被锁，凭证读取降级为空（探针报错无害）。
+
+    fn probe_agent() -> ureq::Agent {
+        ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(20))
+            .build()
+    }
+
+    /// 仿 SOLO chat 抓包头（Cosy-Clienttype: 0 通道，抓包 2026-09-30 21:17:40），
+    /// Cosy-Key 为占位假值（探测服务端是否真校验签名内容）
+    fn probe_cosy_headers(token: &str) -> Vec<(String, String)> {
+        let now = chrono::Utc::now().timestamp();
+        vec![
+            ("Authorization".into(), format!("Bearer {token}")),
+            ("Content-Type".into(), "application/json".into()),
+            ("Accept".into(), "text/event-stream".into()),
+            ("User-Agent".into(), "Go-http-client/1.1".into()),
+            ("Cosy-Clienttype".into(), "0".into()),
+            ("Cosy-Data-Policy".into(), "AGREE".into()),
+            ("Cosy-Date".into(), now.to_string()),
+            ("Cosy-Clientip".into(), "169.254.0.70".into()),
+            ("Cosy-Key".into(), "cHJvYmVmYWtlZGtleV9ub3Rfc2lnbmF0dXJlX3Rlc3Q=".into()),
+            ("Cosy-Machineid".into(), "34303537-3736-432d-a130-30773a35302d".into()),
+            ("Cosy-Machineos".into(), "x86_64_windows".into()),
+            ("Cosy-Version".into(), "1.32.0".into()),
+            ("Login-Version".into(), "v2".into()),
+        ]
+    }
+
+    /// 池内第一个可用账号 id（探针用，非生产路径）
+    fn probe_first_account(state: &AppState) -> String {
+        let pool = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
+        pool.get("accounts")
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.first())
+            .and_then(|a| a.get("id"))
+            .and_then(Value::as_str)
+            .expect("Qoder 账号池为空或缺 id")
+            .to_string()
+    }
+
+    fn print_probe_result(tag: &str, result: Result<ureq::Response, ureq::Error>) {
+        match result {
+            Ok(resp) => {
+                println!("[{tag}] HTTP {} content-type={:?}", resp.status(), resp.content_type());
+                // 成功情形（SSE 流）：只读前 5 行即主动断开，把推理消耗压到最低
+                use std::io::BufRead;
+                let reader = std::io::BufReader::new(resp.into_reader());
+                for (i, line) in reader.lines().enumerate() {
+                    match line {
+                        Ok(l) if l.is_empty() => continue,
+                        Ok(l) => println!("  << {}", &l[..l.len().min(400)]),
+                        Err(e) => { println!("  <read-err> {e}"); break; }
+                    }
+                    if i >= 4 { println!("  …(探针截断，主动断开)"); break; }
+                }
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                println!("[{tag}] HTTP {code}: {}", &body[..body.len().min(500)]);
+            }
+            Err(e) => println!("[{tag}] NET-ERR: {e}"),
+        }
+    }
+
+    /// 探针 ①：model/list 带 jobToken + 假 Cosy-Key（对照 curl 无凭证 403/101）
+    #[test]
+    #[ignore]
+    fn probe_gateway_model_list_with_jobtoken() {
+        let state = crate::state::AppState::new().expect("构造 AppState 失败");
+        let acct_id = probe_first_account(&state);
+        let agent = probe_agent();
+        let (creds, _r, note) = ensure_fresh(&state, &agent, &acct_id, 24);
+        let kind = if creds.access_token.starts_with("pt-") { "pt-" } else { "非pt(作业令牌)" };
+        println!("acct = {acct_id}, ensure_fresh = {note}, token 形态 = {kind}");
+        assert!(!creds.access_token.is_empty(), "无可用凭证（vault 被锁或池空）");
+        let url = "https://gateway.qoder.com.cn/algo/api/v2/model/list";
+        let req = probe_cosy_headers(&creds.access_token)
+            .into_iter()
+            .fold(agent.get(url), |r, (k, v)| r.set(&k, &v));
+        print_probe_result("model/list+jobToken", req.call());
+    }
+
+    /// 探针 ②：chat Encode=0 明文 OpenAI 风格 body + 假 Cosy-Key + 免费模型 qfmodel
+    #[test]
+    #[ignore]
+    fn probe_gateway_chat_encode0() {
+        let state = crate::state::AppState::new().expect("构造 AppState 失败");
+        let acct_id = probe_first_account(&state);
+        let agent = probe_agent();
+        let (creds, _r, note) = ensure_fresh(&state, &agent, &acct_id, 24);
+        println!("acct = {acct_id}, ensure_fresh = {note}");
+        assert!(!creds.access_token.is_empty(), "无可用凭证（vault 被锁或池空）");
+        let url = "https://gateway.qoder.com.cn/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=0";
+        let body = json!({
+            "model": "qfmodel",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let req = probe_cosy_headers(&creds.access_token)
+            .into_iter()
+            .fold(agent.post(url), |r, (k, v)| r.set(&k, &v));
+        print_probe_result("chat+encode0", req.send_string(&body.to_string()));
+    }
+
+    /// 探针 ③（p3-2d）：model/list 真 COSY 签名全量重抓。
+    /// 背景：抓包日志预览此前截断 8KB，model/list（解压 67856B）只拿到前 12%，
+    /// MiniMax-M2.7 与 chat 数组外的其余配置段缺失；256KB 上限修复后需重抓，
+    /// 但代理通道要求手动开 GUI——本探针直接用 token store 真凭证 +
+    /// build_cosy_headers 真签名（GET 空体）打 gateway，全量 JSON 落盘
+    /// `<仓库根>/temp/qoder_model_list_full.json` 供 qoder_upstream 目录核对。
+    /// 运行：cargo test probe_gateway_model_list_signed_full -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn probe_gateway_model_list_signed_full() {
+        let state = crate::state::AppState::new().expect("构造 AppState 失败");
+        let acct_id = probe_first_account(&state);
+        let agent = probe_agent();
+        let (creds, _r, note) = ensure_fresh(&state, &agent, &acct_id, 24);
+        println!("acct = {acct_id}, ensure_fresh = {note}");
+        assert!(!creds.access_token.is_empty(), "无可用凭证（vault 被锁或池空）");
+        let identity = super::super::qoder_sign::CosyIdentity {
+            user_id: &creds.uid,
+            auth_token: &creds.access_token,
+            name: &creds.nickname,
+            email: "",
+            machine_id: &creds.machine_id,
+        };
+        let url = "https://gateway.qoder.com.cn/algo/api/v2/model/list";
+        let headers = super::super::qoder_sign::build_cosy_headers(None, url, &identity)
+            .expect("构造 COSY 签名头失败");
+        let req = headers
+            .into_iter()
+            .fold(agent.get(url), |r, (k, v)| r.set(&k, &v));
+        match req.call() {
+            Ok(resp) => {
+                let status = resp.status();
+                let ctype = resp.content_type().to_string();
+                let body = resp.into_string().unwrap_or_default();
+                println!("[model/list+cosy签名] HTTP {status} content-type={ctype} bytes={}", body.len());
+                let out_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../temp/qoder_model_list_full.json");
+                if let Some(parent) = out_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(&out_path, body.as_bytes()).expect("写盘失败");
+                println!("全量 JSON 已落盘: {}", out_path.display());
+                // 粗验：chat 数组 + MiniMax 关键字
+                let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let chat_len = v.get("chat").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+                println!("chat 数组条目 = {chat_len}; 含 MiniMax = {}", body.contains("MiniMax"));
+                assert_eq!(status, 200);
+                assert!(chat_len > 0, "响应无 chat 数组");
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let body_text = resp.into_string().unwrap_or_default();
+                println!("[model/list+cosy签名] HTTP {code}: {}", &body_text[..body_text.len().min(600)]);
+                panic!("签名请求失败 HTTP {code}");
+            }
+            Err(e) => panic!("NET-ERR: {e}"),
+        }
+    }
 }

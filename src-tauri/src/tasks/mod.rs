@@ -17,12 +17,15 @@
 pub mod doubao_chats;
 pub mod doubao_quota;
 pub mod doubao_session;
+pub mod qoder_catalog;
 pub mod qoder_checkin;
 pub mod qoder_common;
 pub mod qoder_credits;
 pub mod qoder_device;
 pub mod qoder_oauth;
 pub mod qoder_refresh;
+pub mod qoder_sign;
+pub mod qoder_upstream;
 pub mod scheduler;
 pub mod trae_checkin;
 pub mod ui_click;
@@ -110,6 +113,8 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         "qoder-credits-snapshot" => qoder_credits::run_snapshot_task(state),
         // Qoder 凭证 6h 兜底刷新（调度器/CLI 共用；空池空转）
         "qoder-refresh" => qoder_refresh::run_task(state),
+        // Qoder 模型目录每日同步（调度器/CLI 共用；空池/无凭证空转，p3-3 收尾）
+        "qoder-catalog-sync" => qoder_catalog::run_task(state),
         // Trae JWT 定时续期（issue #27；调度器/CLI 共用批量惰性刷新）
         "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(state),
         // Trae 每日签到：vault 解密全量账号跑单轮

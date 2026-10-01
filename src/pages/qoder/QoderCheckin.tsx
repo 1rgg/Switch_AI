@@ -166,11 +166,20 @@ export default function QoderCheckin() {
 
   const todayEarnedOf = (uid: string): number | null => {
     const recs = checkinMap.get(uid) ?? [];
-    // reward 口径 = 真实入账：fail 记录保留的部分入账计入；
-    // already 幂等回放会重复返回当日已领 reward，须排除防重复计数
-    const sum = recs.reduce((s, r) => s + (r.status !== 'already' && r.reward != null ? r.reward : 0), 0);
-    if (sum > 0) return Math.round(sum * 100) / 100;
-    return recs.find((r) => r.status !== 'already' && r.reward != null)?.reward ?? null;
+    // 真实入账合计：success/fail 的 reward 全计（双活动同额属真实两笔）；
+    // already 的 reward（幂等回放 / 断网复查确认）同为当日真实入账，一并计入展示，
+    // 但与 success/fail 同额时视为同活动重复回放，去重防双计（与顺序无关，两遍扫描）
+    const real = recs.filter((r) => r.status !== 'already' && r.reward != null);
+    const realAmts = new Set(real.map((r) => r.reward));
+    let sum = real.reduce((s, r) => s + (r.reward ?? 0), 0);
+    const seenAlready = new Set<number>();
+    for (const r of recs) {
+      if (r.status !== 'already' || r.reward == null) continue;
+      if (realAmts.has(r.reward) || seenAlready.has(r.reward)) continue;
+      seenAlready.add(r.reward);
+      sum += r.reward;
+    }
+    return sum > 0 ? Math.round(sum * 100) / 100 : null;
   };
   const checkinStatusOf = (uid: string): 'success' | 'already' | 'fail' | 'skip' | null => {
     const live = lines.find((l) => l.user_id === uid);
@@ -186,7 +195,7 @@ export default function QoderCheckin() {
 
   return (
     <div className="animate-fade-in">
-      <PageHeader title="Qoder · 每日签到" desc="sash campaigns 幂等领取 · 双活动一次覆盖" />
+      <PageHeader title="Qoder · 每日签到" desc="每天自动领取「签到」与「登录」两项奖励，重复执行不重复领" />
 
       {/* 双活动说明卡（§2.2） */}
       {notice && (
@@ -197,25 +206,25 @@ export default function QoderCheckin() {
       <div className="card p-4">
         <div className="mb-3 flex items-center gap-2">
           <Gift size={16} className="text-violet-500" />
-          <span className="text-sm font-medium">每日双活动（接口层同源，一次触发全覆盖）</span>
+          <span className="text-sm font-medium">每日双活动（一次执行，两项奖励同时领）</span>
         </div>
         <div className="grid gap-3 lg:grid-cols-2">
           <div className="rounded-lg border border-slate-100 p-3 text-sm dark:border-zinc-800">
-            <div className="font-medium">QoderWork 每日签到</div>
+            <div className="font-medium">活动一：每日签到</div>
             <div className="mt-1 text-xs text-slate-400">
-              100 Credits/天（独立 30 天有效期包，FEFO 扣减）· 每日 0 点刷新 · 当天未签不补签
+              每天 0 点刷新，签到领 100 Credits（独立 30 天有效期包，优先消耗将过期的）；当天漏签不补发
             </div>
           </div>
           <div className="rounded-lg border border-slate-100 p-3 text-sm dark:border-zinc-800">
-            <div className="font-medium">每日登录奖励</div>
+            <div className="font-medium">活动二：每日登录奖励</div>
             <div className="mt-1 text-xs text-slate-400">
-              100 通用 Add-on Credits/天（仅个人版）· 每日 10:00 开窗至次日 10:00 · 官方暂无结束时间
+              每天 10:00 起可领 100 通用 Add-on Credits（仅个人版），有效期至次日 10:00；结束时间以官方公告为准
             </div>
           </div>
         </div>
         <p className="mt-3 text-xs text-slate-400">
-          调度默认 10:15 单次覆盖双活动（应用内调度器 + Windows 计划任务双轨，环境配置页可改）；
-          claim 天然幂等，重复执行无副作用。
+          调度默认每天 10:15 自动执行一次（此时两项活动都已开放）；支持应用内定时与 Windows
+          计划任务双轨，时刻可在环境配置修改。已领过的账号自动跳过，重复执行不会重复领取。
         </p>
       </div>
 

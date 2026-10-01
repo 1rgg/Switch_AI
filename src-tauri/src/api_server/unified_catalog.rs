@@ -27,6 +27,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::dispatch::TargetPool;
 use super::models_sync::{self, ModelOption};
@@ -230,15 +231,29 @@ pub fn save_whitelist(data_dir: &Path, models: &[String]) -> Result<Vec<String>,
 }
 
 /// 聚合目录 ∩ 白名单（GET /v1/models 对外目录用）；
-/// 管理端 api_unified_models 不过滤（需全量 + 白名单状态展示）
+/// 管理端 api_unified_models 不过滤（需全量 + 白名单状态展示）。
+/// 旧签名：不合并 Qoder 源（既有调用方/测试零变化）
+#[allow(dead_code)] // 旧签名包装：生产调用方已迁 _ex，测试仍消费
 pub fn unified_models_whitelisted(
     data_dir: &Path,
     wb_enabled: bool,
     trae_ok: bool,
     buddy_ok: bool,
 ) -> Vec<UnifiedModel> {
+    unified_models_whitelisted_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None)
+}
+
+/// 同 [`unified_models_whitelisted`]，`qoder = Some((开关, 池健康))` 时合并
+/// Qoder 目录（p3-3：HTTP /v1/models 端点传入，管理端/测试传 None）
+pub fn unified_models_whitelisted_ex(
+    data_dir: &Path,
+    wb_enabled: bool,
+    trae_ok: bool,
+    buddy_ok: bool,
+    qoder: Option<(bool, bool)>,
+) -> Vec<UnifiedModel> {
     let wl = load_whitelist(data_dir);
-    unified_models(data_dir, wb_enabled, trae_ok, buddy_ok)
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, qoder)
         .into_iter()
         .filter(|m| whitelist_allows(&wl, &m.id))
         .collect()
@@ -350,11 +365,25 @@ fn wb_rate(m: &WbModel) -> Option<f64> {
 ///
 /// `wb_enabled`：Buddy 源总开关；`trae_ok` / `buddy_ok`：两池是否存在可选账号
 /// （§3.3 #5 运行时派生，调用方按需取值——HTTP 端点用实时池，命令在服务未运行时放宽）。
+/// 旧签名包装：不合并 Qoder 源（既有调用方/测试零变化）
+#[allow(dead_code)] // 旧签名包装：生产调用方已迁 _ex，测试仍消费
 pub fn unified_models(
     data_dir: &Path,
     wb_enabled: bool,
     trae_ok: bool,
     buddy_ok: bool,
+) -> Vec<UnifiedModel> {
+    unified_models_ex(data_dir, wb_enabled, trae_ok, buddy_ok, None)
+}
+
+/// 同 [`unified_models`]，`qoder = Some((开关, 池健康))` 时合并 Qoder 目录：
+/// 条目始终入表（镜像 WB 内置目录语义），`enabled` 徽章 = 开关 && 池健康
+pub fn unified_models_ex(
+    data_dir: &Path,
+    wb_enabled: bool,
+    trae_ok: bool,
+    buddy_ok: bool,
+    qoder: Option<(bool, bool)>,
 ) -> Vec<UnifiedModel> {
     let l1 = load_meta(data_dir);
     // 注（issue #38-4 排查决策）：Trae 侧快照（kv api_models）无条件参与聚合，
@@ -369,6 +398,8 @@ pub fn unified_models(
         TargetPool::Buddy => wb_enabled && buddy_ok,
         // 自定义模型可用性 = 条目 enabled（find_enabled 只回 enabled 条目）
         TargetPool::Custom => true,
+        // Qoder：开关 && 池健康（调用方未提供旗标时该源不参与聚合）
+        TargetPool::Qoder => qoder.map_or(false, |(e, ok)| e && ok),
     };
 
     let mut order: Vec<String> = Vec::new();
@@ -545,6 +576,98 @@ pub fn unified_models(
                         manual: false,
                     },
                 );
+            }
+        }
+    }
+
+    // 源4：Qoder（p3-3，qoder_upstream 进程目录；对外标识 qoder）——
+    // 远程清单 + 静态兜底并集。开关关闭或调用方未提供旗标时不合并
+    //（旧签名包装传 None：测试面与既有调用方零变化）。双源/三源同 canonical
+    // 条目仅追加来源标记（倍率取 credits 文本解析值）
+    if let Some((_qoder_enabled, _qoder_ok)) = qoder {
+        for m in crate::tasks::qoder_upstream::list() {
+            let Some(id) = m.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let canonical = canonical_id(id);
+            if canonical.is_empty() {
+                continue;
+            }
+            let qrate = m
+                .get("credits")
+                .and_then(Value::as_str)
+                .and_then(crate::tasks::qoder_upstream::credits_rate_of);
+            let qctx = m
+                .get("maxInputTokens")
+                .and_then(Value::as_u64)
+                .filter(|v| *v > 0);
+            let qmt = m
+                .get("maxOutputTokens")
+                .and_then(Value::as_u64)
+                .filter(|v| *v > 0);
+            let qimg = m.get("supportsImages").and_then(Value::as_bool);
+            let display = m
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(id)
+                .to_string();
+            let qefforts: Vec<String> = m
+                .get("efforts")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            match acc.get_mut(&canonical) {
+                Some(u) => {
+                    u.sources.push(UnifiedSource {
+                        pool: "qoder",
+                        rate: qrate,
+                        enabled: enabled_of(TargetPool::Qoder),
+                    });
+                    if let Some(r) = qrate {
+                        u.rate = Some(r);
+                    }
+                    if let Some(c) = qctx {
+                        u.context_length = Some(c);
+                    }
+                    if let Some(t) = qmt {
+                        u.max_tokens = Some(t);
+                    }
+                    if !qefforts.is_empty() {
+                        u.efforts = super::efforts::declared_union(&[
+                            std::mem::take(&mut u.efforts),
+                            qefforts,
+                        ]);
+                    }
+                }
+                None => {
+                    order.push(canonical.clone());
+                    acc.insert(
+                        canonical.clone(),
+                        UnifiedModel {
+                            id: id.to_string(),
+                            display,
+                            vendor: "Qoder".to_string(),
+                            rate: qrate,
+                            efforts: qefforts,
+                            max_mode: false,
+                            context_length: qctx,
+                            max_tokens: qmt,
+                            supports_image: qimg,
+                            sources: vec![UnifiedSource {
+                                pool: "qoder",
+                                rate: qrate,
+                                enabled: enabled_of(TargetPool::Qoder),
+                            }],
+                            manual: false,
+                        },
+                    );
+                }
             }
         }
     }

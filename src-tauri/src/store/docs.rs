@@ -950,6 +950,7 @@ fn bucket_name(b: UsageBucket) -> &'static str {
         UsageBucket::Trae => "trae",
         UsageBucket::Wb => "wb",
         UsageBucket::Custom => "custom",
+        UsageBucket::Qoder => "qoder",
     }
 }
 
@@ -958,6 +959,7 @@ fn bucket_of(name: &str) -> Option<UsageBucket> {
         "trae" => Some(UsageBucket::Trae),
         "wb" => Some(UsageBucket::Wb),
         "custom" => Some(UsageBucket::Custom),
+        "qoder" => Some(UsageBucket::Qoder),
         _ => None,
     }
 }
@@ -967,6 +969,7 @@ fn bucket_map_mut<'a>(f: &'a mut UsageFile, b: UsageBucket) -> &'a mut std::coll
         UsageBucket::Trae => &mut f.days,
         UsageBucket::Wb => &mut f.wb_days,
         UsageBucket::Custom => &mut f.custom_days,
+        UsageBucket::Qoder => &mut f.qoder_days,
     }
 }
 

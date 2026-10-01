@@ -18,14 +18,13 @@ import BuddyOverview from './pages/buddy/BuddyOverview';
 import BuddyAccounts from './pages/buddy/BuddyAccounts';
 import BuddyCheckin from './pages/buddy/BuddyCheckin';
 // 积分看板（credits-dashboard-plan.md；平台拆分）：同一组件按 platform 渲染
-// Trae 页（credits 视图，替换原 pages/Credits.tsx）与 Buddy 页（buddy-credits 视图）
+// Trae 页（credits 视图）、Buddy 页（buddy-credits 视图）、Qoder 页（qoder-credits 视图，替换旧 QoderCredits.tsx）
 import CreditsDashboard from './pages/dashboard/Dashboard';
 import BuddyApiService from './pages/buddy/BuddyApiService';
 import BuddySettings from './pages/buddy/BuddySettings';
 import QoderOverview from './pages/qoder/QoderOverview';
 import QoderAccounts from './pages/qoder/QoderAccounts';
 import QoderCheckin from './pages/qoder/QoderCheckin';
-import QoderCredits from './pages/qoder/QoderCredits';
 import QoderSettings from './pages/qoder/QoderSettings';
 import ApiManagerModal from './components/api/ApiManagerModal';
 
@@ -72,7 +71,7 @@ function renderView(view: string) {
     case 'qoder-checkin':
       return <QoderCheckin />;
     case 'qoder-credits':
-      return <QoderCredits />;
+      return <CreditsDashboard key="qoder" platform="qoder" />;
     case 'qoder-settings':
       return <QoderSettings />;
     default:

@@ -81,6 +81,10 @@ const TASKS: &[SchedTask] = &[
     // 模型同步（每日 HH:MM，默认开；无账号时静默跳过不计失败，对齐 models-sync 惯例）
     SchedTask { key: "trae-models-sync", name: "Trae 模型列表同步", hhmm: "05:40", kind: "models" },
     SchedTask { key: "wb-catalog-sync", name: "WorkBuddy 模型目录同步", hhmm: "05:45", kind: "models" },
+    // Qoder 模型目录同步（p3-3 收尾）：真 COSY 签名拉 model/list → adopt_remote
+    // 替换 CN 区缓存；无 settings 键恒开（幂等低风险 + qoder_enabled 默认关时
+    // 池空空转，规避「有配置无 UI」死配置，对齐 qoder-refresh 惯例）
+    SchedTask { key: "qoder-catalog-sync", name: "Qoder 模型目录同步", hhmm: "05:50", kind: "models" },
 ];
 
 /// 启动调度线程（main.rs setup 调用；启动 90s 后首跑，避开启动高峰）
@@ -345,6 +349,9 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
         // Qoder Token 定时刷新：与 `--task-run qoder-refresh` 同款（6h 周期，lazy 7h 惰性门；
         // 有账号刷新失败时返 Err，交由调度器 30 分钟冷却重试）
         "qoder-refresh" => super::qoder_refresh::run_task(st),
+        // Qoder 模型目录同步：与 `--task-run qoder-catalog-sync` 同款（真签名拉
+        // model/list → adopt_remote；空池/无凭证空转，网络失败返 Err 冷却重试）
+        "qoder-catalog-sync" => super::qoder_catalog::run_task(st),
         // 豆包会话每日续期：与 `--task-run doubao-keepalive` 同款
         "doubao-keepalive" => {
             let sink = crate::switcher::CliSink::new(&st.data_dir);

@@ -223,6 +223,13 @@ impl AppState {
             || s.proxy_domains == crate::models::legacy_proxy_domains_narrow()
             // F-80：Qoder 域追加前的历届默认（含上一版 9 域默认），未自定义过则补上 qoder.com.cn
             || s.proxy_domains == crate::models::legacy_proxy_domains_without_qoder()
+            // p3-2：Qoder chat 抓包需要 qoder.sh/qoder.cn/qoder.ai（worker 模型端点
+            // api2-v2.qoder.sh），未自定义过则从旧 10 域默认迁移到新默认
+            || s.proxy_domains == crate::models::legacy_proxy_domains_with_qoder_cn()
+            // p3-2e 遗漏版：三 Qoder 域默认（qoder.com.cn + qoder.cn + qoder.com，
+            // F-80 扩展版），p3-2b 迁移列表漏了它，被误判为自定义导致 qoder.sh/
+            // qoder.ai 始终未进解密白名单（运行时横幅实测确认），补上
+            || s.proxy_domains == crate::models::legacy_proxy_domains_qoder_com()
         {
             s.proxy_domains = crate::models::default_proxy_domains();
         }

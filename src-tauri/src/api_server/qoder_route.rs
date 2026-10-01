@@ -1,0 +1,811 @@
+//! Qoder 上游路由执行层（p3-3-wire）。
+//!
+//! 请求流程（wb_route 的 Qoder 侧镜像，v1 精简）：
+//! 1. 目录条目解析（`qoder_upstream::resolve` → upstreamKey/config，执行时再查
+//!    ——调度与执行之间目录可能刷新，条目为准）；
+//! 2. 请求体构造（`prepare_qoder_body`：OpenAI body → agent 固定信封，
+//!    session 由账号 uid + 下游种子派生）；
+//! 3. 取号（qoder_pool 调度，Key 白名单/专一约束同构适用）→ identity 回调解析
+//!    凭证（PAT 换 24h 作业令牌 / 刷新链路在回调闭包内走全防护）→
+//!    `make_qoder_request`（COSY 19 头签名）；
+//! 4. 分级重试：HTTP 层走 `retry_plan`（429/5xx/502 同号退避、401/403 换号）；
+//!    **排队（业务码 10605）不冷却不换号**——按上游建议时长同号退避重试
+//!    （≤3 次，超限放回调度轮换，防止占死并发槽）；其余流内错误按
+//!    ErrMeta 分类映射 ErrKind 后换号；
+//! 5. 流式：首字超时 10s（`open_qoder_stream`）→ QoderTranslate 翻译为标准
+//!    OpenAI chunk → `wb_sse::stream_forward_ex`（keep-alive 15s + 断连三层
+//!    检测同构）；非流式：`aggregate_qoder` → 协议投影复用 wb_sse 转换器；
+//! 6. 用量记账（`record_usage_qoder` 独立 qoder 桶）+ 请求级日志。
+//!
+//! 与 wb_route 的差异（v1 精简项）：无会话粘性绑定（上游 session 由请求体
+//! session_seed 派生，粘性收益不同构）、无竞速对冲、无模板清洗、无工具代执行、
+//! 无模型级冷却、无 401 刷新重试（凭证新鲜度由 identity 回调按次解析兜住）。
+//!
+//! 客户端断连：与 wb_route 同款三层检测（轮换/重试入口 tx.is_closed、停滞期
+//! next_event_polling 轮询、活跃流逐事件顶部检测）。
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::body::Body;
+use axum::http::StatusCode;
+use axum::response::Response;
+use serde_json::{json, Value};
+use tokio_stream::wrappers::ReceiverStream;
+
+use super::retry::{retry_plan, RetryAction};
+use super::wb_sse;
+use super::{ApiSharedState, ErrKind, InflightGuard};
+use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
+use crate::tasks::qoder_common::QoderCreds;
+use crate::tasks::qoder_upstream::{self, ErrMeta, UpstreamKind};
+
+/// 排队同号重试上限（10605 按上游建议退避；超限放回调度轮换防占死并发槽）
+const QUEUE_RETRY_LIMIT: u32 = 3;
+/// 排队退避缺省秒数（上游 retryAfterSeconds/waitTime 缺失时）
+const QUEUE_DEFAULT_BACKOFF_SECS: u64 = 5;
+/// 退避上限（上游建议值异常大时钳制）
+const QUEUE_BACKOFF_MAX_SECS: u64 = 30;
+
+/// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
+fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 字符边界安全截断（自抄 wb_route::safe_slice，私有不可复用）：
+/// 字节落点在多字节字符内时回退到前一个边界，避免超长上游响应体
+/// 整段进入错误消息/日志
+fn safe_slice(s: &str, n: usize) -> &str {
+    if let Some(t) = s.get(..n) {
+        return t;
+    }
+    let mut end = n.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+// ==================== 流式入口 ====================
+
+/// Qoder 流式对话（routes.rs 各协议端点 TargetPool::Qoder 分支调用）
+pub fn qoder_stream_chat(
+    state: Arc<ApiSharedState>,
+    body_vec: Vec<u8>,
+    model: String,
+    start_ts: Instant,
+    proto: Protocol,
+    key_id: String,
+    guard: InflightGuard,
+) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+
+    // 批次 D-1 线程隔离：流任务迁入专用阻塞池（同 wb_stream_chat）
+    super::stream_runtime().spawn_blocking(move || {
+        let chat_id = match proto {
+            Protocol::OpenAi => format!("chatcmpl-{}", now_ts()),
+            Protocol::OpenAiText => format!("cmpl-{}", now_ts()),
+            Protocol::Anthropic => format!("msg_{}", now_ts()),
+            Protocol::Responses => format!("resp_{}", now_ts()),
+        };
+
+        // SSE keep-alive 15s：watch + DoneSignal 方案（主任务结束含 panic 展开
+        // 置 done=true，ticker 退出放行流终结）——与 wb_stream_chat 同构
+        let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+        let _done = super::routes::DoneSignal(done_tx);
+        {
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                tick.tick().await; // 首个 tick 立即返回，跳过
+                loop {
+                    tokio::select! {
+                        _ = tick.tick() => {
+                            if tx2
+                                .send(Ok(bytes::Bytes::from(": keep-alive\n\n")))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        _ = done_rx.changed() => break,
+                    }
+                }
+            });
+        }
+
+        run_qoder_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
+    });
+
+    let stream = ReceiverStream::new(rx);
+    Response::builder()
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| internal_error_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qoder_stream(
+    state: &Arc<ApiSharedState>,
+    body_vec: &[u8],
+    model: &str,
+    proto: Protocol,
+    key_id: &str,
+    chat_id: &str,
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    start_ts: Instant,
+    mut guard: InflightGuard,
+) {
+    let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
+    let peek: Value = serde_json::from_slice(body_vec).unwrap_or(json!({}));
+
+    // 目录条目（upstreamKey/config）：调度命中后目录刷新导致条目消失时按 404 透传。
+    // 区域边界（v1）：恒 CN 区解析 + CN 网关执行（QODER_CHAT_URL）——Global 区
+    // 条目仅经 resolve 双区兜底可见，实际请求仍打 gateway.qoder.com.cn；接线
+    // Global 区（api3.qoder.sh）时此处与 dispatch 源判定需一并按账号区域分流
+    let Some(entry) = qoder_upstream::resolve(model, qoder_upstream::QoderRegion::Cn) else {
+        let msg = format!("model {model} not in Qoder catalog");
+        state.logger.log_request(
+            "qoder", "POST", "/v1/chat/completions", model, true, 404, "-",
+            start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
+        );
+        send_stream_error(tx, proto, 404, &msg);
+        return;
+    };
+    let model_key = entry
+        .get("upstreamKey")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let model_source = entry
+        .pointer("/config/source")
+        .and_then(Value::as_str)
+        .unwrap_or("system")
+        .to_string();
+
+    // F-35 子 Key 约束（qoder 池作用域；匿名/无约束 Key 全空 → 走默认调度）
+    let (allowed_set, dedicated) = super::api_keys::constraints_for(&state.data_dir, key_id)
+        .and_then(|k| k.pool_constraints("qoder"))
+        .map_or((None, None), |c| (c.allowed, c.dedicated));
+
+    let mut tried: HashSet<String> = HashSet::new();
+
+    loop {
+        // 客户端断连检测：通道关闭即终止轮换/重试（对齐 run_wb_stream）
+        if tx.is_closed() {
+            return;
+        }
+        let picked = match state
+            .qoder_pool
+            .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+        {
+            Some((p, ev)) => {
+                if let Some(ev) = ev {
+                    state.logger.log_sched_event(&ev);
+                }
+                p
+            }
+            None => {
+                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0);
+                state.logger.log_request(
+                    "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
+                    duration_ms, &key_name, "", Some("no healthy account"),
+                );
+                let _ = tx.blocking_send(Ok(bytes::Bytes::from(
+                    "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
+                )));
+                let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                return;
+            }
+        };
+        tried.insert(picked.uid.clone());
+        // 当前账号排队重试计数（账号局部：换号自然重置）
+        let mut queue_same: u32 = 0;
+        *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+        // F-77 账号级在途计数：取号即绑定（换号时 bind_account 自动解绑旧账号）
+        guard = guard.bind_account(state.qoder_pool.inflight_handle(&picked.uid));
+
+        // 凭证解析：回调缺失（未注入/单测）→ 换号不冷却（配置问题非账号问题）；
+        // 回调报错（PAT 换令牌失败/登录态失效）→ SessionDead 禁用后换号
+        let creds: QoderCreds = match state.qoder_identity.as_ref() {
+            None => {
+                state.logger.log_request(
+                    "qoder", "POST", "/v1/chat/completions", model, true, 503, &picked.uid,
+                    start_ts.elapsed().as_millis() as u64, &key_name,
+                    &state.qoder_pool.name_of(&picked.uid), Some("qoder identity 回调未注入"),
+                );
+                continue;
+            }
+            Some(resolve) => match resolve(&picked.uid) {
+                Ok(c) => c,
+                Err(e) => {
+                    state.qoder_pool.note_error(&picked.uid, ErrKind::SessionDead);
+                    *safe_lock(&state.last_error) =
+                        Some(format!("qoder identity uid={} err={}", picked.uid, e));
+                    state.logger.log_request(
+                        "qoder", "POST", "/v1/chat/completions", model, true, 503, &picked.uid,
+                        start_ts.elapsed().as_millis() as u64, &key_name,
+                        &state.qoder_pool.name_of(&picked.uid), Some("凭证解析失败"),
+                    );
+                    continue;
+                }
+            },
+        };
+
+        // 请求体（agent 信封；依赖账号 uid 派生 session）
+        let converted = match qoder_upstream::prepare_qoder_body(&peek, &entry, &creds.uid) {
+            Ok(b) => b,
+            Err(e) => {
+                state.logger.log_request(
+                    "qoder", "POST", "/v1/chat/completions", model, true, 500, &picked.uid,
+                    start_ts.elapsed().as_millis() as u64, &key_name,
+                    &state.qoder_pool.name_of(&picked.uid), Some(&e),
+                );
+                send_stream_error(tx, proto, 500, &e);
+                return;
+            }
+        };
+
+        let mut same_attempt: u32 = 0;
+        loop {
+            // 断连检测：重试等待/长路径期间离开则终止（guard 随 Drop 释放）
+            if tx.is_closed() {
+                return;
+            }
+            match qoder_upstream::make_qoder_request(
+                &creds,
+                &converted,
+                &model_key,
+                &model_source,
+            ) {
+                Ok(reader) => {
+                    // 首字超时 10s：超时视为上游故障 → 换号（同 run_wb_stream 语义）
+                    let err_slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
+                    let ilines = match qoder_upstream::open_qoder_stream(
+                        reader,
+                        err_slot.clone(),
+                        chat_id,
+                        model,
+                    ) {
+                        Ok(l) => l,
+                        Err(()) => {
+                            state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                            break;
+                        }
+                    };
+                    let (error_info, sent_any, failed_inline, usage) =
+                        wb_sse::stream_forward_ex(ilines, tx, proto, chat_id, model);
+                    let duration_ms = start_ts.elapsed().as_millis() as u64;
+                    let meta = err_slot
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let (pt, ct) = usage
+                        .as_ref()
+                        .map(|u| {
+                            (
+                                u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                                u.get("completion_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                            )
+                        })
+                        .unwrap_or((0, 0));
+                    state.record_usage_qoder(
+                        model,
+                        &picked.uid,
+                        key_id,
+                        error_info.is_none() && !failed_inline,
+                        true,
+                        duration_ms,
+                        pt,
+                        ct,
+                    );
+                    match error_info {
+                        Some((code, msg)) => {
+                            // 流内错误分类以 ErrMeta 为准（translate 写入，含排队/额度信号）
+                            match meta.as_ref().map(|m| m.kind) {
+                                Some(UpstreamKind::Queued) => {
+                                    // 排队：不冷却不换号，按上游建议同号退避重试
+                                    if !sent_any && queue_same < QUEUE_RETRY_LIMIT {
+                                        queue_same += 1;
+                                        let secs = meta
+                                            .as_ref()
+                                            .and_then(|m| m.queue.as_ref())
+                                            .and_then(|q| q.retry_after_secs)
+                                            .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
+                                            .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                        std::thread::sleep(Duration::from_secs(secs));
+                                        continue;
+                                    }
+                                    break; // 超限：放回调度轮换
+                                }
+                                Some(kind) => {
+                                    let ek = kind.to_err_kind();
+                                    if ek != ErrKind::None {
+                                        state.qoder_pool.note_error(&picked.uid, ek);
+                                    }
+                                    *safe_lock(&state.last_error) = Some(format!(
+                                        "qoder uid={} code={} msg={}",
+                                        picked.uid, code, msg
+                                    ));
+                                }
+                                None => {
+                                    // translate 之外的错误帧（理论不可达）：按 Server 熔断
+                                    state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                                }
+                            }
+                            if !sent_any {
+                                // 流未开始：错误不下发，允许换号重试
+                                break;
+                            }
+                            state.logger.log_request(
+                                "qoder", "POST", "/v1/chat/completions", model, true, 200,
+                                &picked.uid, duration_ms, &key_name,
+                                &state.qoder_pool.name_of(&picked.uid), Some(&msg),
+                            );
+                            return; // 已有数据流出：就地收尾
+                        }
+                        None => {
+                            if failed_inline {
+                                // 流内失败已就地透传客户端：不重试不记账冷却（同 wb_route）
+                                state.logger.log_request(
+                                    "qoder", "POST", "/v1/chat/completions", model, true, 200,
+                                    &picked.uid, duration_ms, &key_name,
+                                    &state.qoder_pool.name_of(&picked.uid),
+                                    Some("流内失败已透传客户端"),
+                                );
+                                return;
+                            }
+                            state.qoder_pool.note_success(&picked.uid);
+                            state.logger.log_request(
+                                "qoder", "POST", "/v1/chat/completions", model, true, 200,
+                                &picked.uid, duration_ms, &key_name,
+                                &state.qoder_pool.name_of(&picked.uid), None,
+                            );
+                            return;
+                        }
+                    }
+                }
+                Err((status, resp_body, retry_after)) => {
+                    // HTTP 层分级重试（429/5xx/502 同号退避；401/403/4xx 换号/终止）
+                    match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                        RetryAction::RetrySame { delay_ms } => {
+                            same_attempt += 1;
+                            std::thread::sleep(Duration::from_millis(delay_ms.min(60_000)));
+                            if tx.is_closed() {
+                                return;
+                            }
+                            continue;
+                        }
+                        RetryAction::SwitchKey => {
+                            // Qoder 业务错误常在 403/200 信封里：按 upstream 分类；
+                            // 排队（10605）不冷却不换号 → 同号退避重试
+                            let classified =
+                                qoder_upstream::classify_upstream_error(status, &resp_body);
+                            if classified.kind == UpstreamKind::Queued
+                                && queue_same < QUEUE_RETRY_LIMIT
+                            {
+                                queue_same += 1;
+                                let secs = classified
+                                    .queue
+                                    .as_ref()
+                                    .and_then(|q| q.retry_after_secs)
+                                    .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
+                                    .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                std::thread::sleep(Duration::from_secs(secs));
+                                continue;
+                            }
+                            let kind = classified.kind.to_err_kind();
+                            if kind != ErrKind::None {
+                                state.qoder_pool.note_error(&picked.uid, kind);
+                            }
+                            *safe_lock(&state.last_error) = Some(format!(
+                                "qoder uid={} status={} body={}",
+                                picked.uid,
+                                status,
+                                safe_slice(&resp_body, 200)
+                            ));
+                            state.logger.log_request(
+                                "qoder", "POST", "/v1/chat/completions", model, true, status,
+                                &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
+                                &state.qoder_pool.name_of(&picked.uid),
+                                Some(&format!("upstream status={status}")),
+                            );
+                            break; // 换号
+                        }
+                        RetryAction::Fatal => {
+                            let msg =
+                                format!("upstream {} error: {}", status, safe_slice(&resp_body, 300));
+                            state.logger.log_request(
+                                "qoder", "POST", "/v1/chat/completions", model, true, status,
+                                &picked.uid, start_ts.elapsed().as_millis() as u64, &key_name,
+                                &state.qoder_pool.name_of(&picked.uid), Some(&msg),
+                            );
+                            send_stream_error(tx, proto, status as i64, &msg);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==================== 非流式（上游只回 SSE → 本地聚合） ====================
+
+/// Qoder 非流式对话：聚合 + 协议投影（routes.rs 各协议端点调用）
+#[allow(clippy::too_many_arguments)]
+pub async fn qoder_aggregate_chat(
+    state: Arc<ApiSharedState>,
+    body_vec: Vec<u8>,
+    model: String,
+    stream: bool,
+    start_ts: Instant,
+    proto: Protocol,
+    key_id: String,
+    guard: InflightGuard,
+) -> Response {
+    let model_out = model.clone();
+    // 聚合含分级重试（同号退避最长 60s×N），迁入 stream_runtime 专用阻塞池
+    //（同 wb_aggregate_chat；长阻塞占主池会饿死鉴权等短任务）
+    let result = super::stream_runtime().spawn_blocking(move || {
+        let mut guard = guard;
+        let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or(json!({}));
+
+        // 区域边界（v1）：恒 CN 区解析，同 run_qoder_stream 注释（Global 区未接线）
+        let Some(entry) = qoder_upstream::resolve(&model, qoder_upstream::QoderRegion::Cn) else {
+            return Err(format!("model {model} not in Qoder catalog"));
+        };
+        let model_key = entry
+            .get("upstreamKey")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let model_source = entry
+            .pointer("/config/source")
+            .and_then(Value::as_str)
+            .unwrap_or("system")
+            .to_string();
+
+        let (allowed_set, dedicated) =
+            super::api_keys::constraints_for(&state.data_dir, &key_id)
+                .and_then(|k| k.pool_constraints("qoder"))
+                .map_or((None, None), |c| (c.allowed, c.dedicated));
+
+        let mut tried: HashSet<String> = HashSet::new();
+
+        loop {
+            let picked = match state.qoder_pool.pick_excluding_constrained_ev(
+                &tried,
+                allowed_set.as_ref(),
+                dedicated.as_deref(),
+            ) {
+                Some((p, ev)) => {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                }
+                None => {
+                    state.record_usage_qoder(
+                        &model,
+                        "none",
+                        &key_id,
+                        false,
+                        stream,
+                        start_ts.elapsed().as_millis() as u64,
+                        0,
+                        0,
+                    );
+                    return Err("no healthy account available".to_string());
+                }
+            };
+            tried.insert(picked.uid.clone());
+            // 当前账号排队重试计数（账号局部：换号自然重置）
+            let mut queue_same: u32 = 0;
+            *safe_lock(&state.active_uid) = Some(picked.uid.clone());
+            guard = guard.bind_account(state.qoder_pool.inflight_handle(&picked.uid));
+
+            let creds: QoderCreds = match state.qoder_identity.as_ref() {
+                None => continue, // 回调未注入：换号（tried 增长自然耗尽后 503）
+                Some(resolve) => match resolve(&picked.uid) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        state.qoder_pool.note_error(&picked.uid, ErrKind::SessionDead);
+                        *safe_lock(&state.last_error) =
+                            Some(format!("qoder identity uid={} err={}", picked.uid, e));
+                        continue;
+                    }
+                },
+            };
+
+            let converted = match qoder_upstream::prepare_qoder_body(&peek, &entry, &creds.uid) {
+                Ok(b) => b,
+                Err(e) => return Err(e),
+            };
+
+            let mut same_attempt: u32 = 0;
+            loop {
+                match qoder_upstream::make_qoder_request(
+                    &creds,
+                    &converted,
+                    &model_key,
+                    &model_source,
+                ) {
+                    Ok(reader) => {
+                        let err_slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
+                        // 首字超时 10s：超时视为上游故障 → 换号
+                        let (resp, error) = match qoder_upstream::aggregate_qoder(
+                            reader,
+                            err_slot.clone(),
+                            &format!("chatcmpl-{}", now_ts()),
+                            &model,
+                        ) {
+                            Ok(pair) => pair,
+                            Err(()) => {
+                                state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                                break;
+                            }
+                        };
+                        let duration_ms = start_ts.elapsed().as_millis() as u64;
+                        match (resp, error) {
+                            (Some(mut r), None) => {
+                                r["model"] = json!(model);
+                                let (pt, ct) = r
+                                    .get("usage")
+                                    .map(|u| {
+                                        (
+                                            u.get("prompt_tokens")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0),
+                                            u.get("completion_tokens")
+                                                .and_then(|v| v.as_u64())
+                                                .unwrap_or(0),
+                                        )
+                                    })
+                                    .unwrap_or((0, 0));
+                                state.record_usage_qoder(
+                                    &model, &picked.uid, &key_id, true, stream, duration_ms, pt, ct,
+                                );
+                                state.qoder_pool.note_success(&picked.uid);
+                                state.logger.log_request(
+                                    "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
+                                    &picked.uid, duration_ms, &key_name,
+                                    &state.qoder_pool.name_of(&picked.uid), None,
+                                );
+                                return Ok(r);
+                            }
+                            (None, Some((code, msg))) => {
+                                let meta = err_slot
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                match meta.as_ref().map(|m| m.kind) {
+                                    Some(UpstreamKind::Queued) => {
+                                        // 排队：不冷却不换号，同号退避重试
+                                        if queue_same < QUEUE_RETRY_LIMIT {
+                                            queue_same += 1;
+                                            let secs = meta
+                                                .as_ref()
+                                                .and_then(|m| m.queue.as_ref())
+                                                .and_then(|q| q.retry_after_secs)
+                                                .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
+                                                .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                            std::thread::sleep(Duration::from_secs(secs));
+                                            continue;
+                                        }
+                                        break; // 超限换号
+                                    }
+                                    Some(kind) => {
+                                        let ek = kind.to_err_kind();
+                                        if ek != ErrKind::None {
+                                            state.qoder_pool.note_error(&picked.uid, ek);
+                                        }
+                                    }
+                                    None => {
+                                        state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                                    }
+                                }
+                                *safe_lock(&state.last_error) = Some(format!(
+                                    "qoder uid={} code={} msg={}",
+                                    picked.uid, code, msg
+                                ));
+                                state.logger.log_request(
+                                    "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
+                                    &picked.uid, duration_ms, &key_name,
+                                    &state.qoder_pool.name_of(&picked.uid), Some(&msg),
+                                );
+                                // 流内错误且未产出内容 → 换号重试
+                                break;
+                            }
+                            _ => {
+                                state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                                state.logger.log_request(
+                                    "qoder", "POST", "/v1/chat/completions", &model, stream, 502,
+                                    &picked.uid, duration_ms, &key_name,
+                                    &state.qoder_pool.name_of(&picked.uid),
+                                    Some("empty response"),
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Err((status, resp_body, retry_after)) => {
+                        match retry_plan(status, &resp_body, same_attempt, retry_after) {
+                            RetryAction::RetrySame { delay_ms } => {
+                                same_attempt += 1;
+                                std::thread::sleep(Duration::from_millis(delay_ms.min(60_000)));
+                                continue;
+                            }
+                            RetryAction::SwitchKey => {
+                                let classified =
+                                    qoder_upstream::classify_upstream_error(status, &resp_body);
+                                if classified.kind == UpstreamKind::Queued
+                                    && queue_same < QUEUE_RETRY_LIMIT
+                                {
+                                    queue_same += 1;
+                                    let secs = classified
+                                        .queue
+                                        .as_ref()
+                                        .and_then(|q| q.retry_after_secs)
+                                        .unwrap_or(QUEUE_DEFAULT_BACKOFF_SECS)
+                                        .clamp(1, QUEUE_BACKOFF_MAX_SECS);
+                                    std::thread::sleep(Duration::from_secs(secs));
+                                    continue;
+                                }
+                                let kind = classified.kind.to_err_kind();
+                                if kind != ErrKind::None {
+                                    state.qoder_pool.note_error(&picked.uid, kind);
+                                }
+                                *safe_lock(&state.last_error) = Some(format!(
+                                    "qoder uid={} status={}",
+                                    picked.uid, status
+                                ));
+                                state.record_usage_qoder(
+                                    &model,
+                                    &picked.uid,
+                                    &key_id,
+                                    false,
+                                    stream,
+                                    start_ts.elapsed().as_millis() as u64,
+                                    0,
+                                    0,
+                                );
+                                state.logger.log_request(
+                                    "qoder", "POST", "/v1/chat/completions", &model, stream,
+                                    status, &picked.uid,
+                                    start_ts.elapsed().as_millis() as u64, &key_name,
+                                    &state.qoder_pool.name_of(&picked.uid),
+                                    Some(&format!("upstream status={status}")),
+                                );
+                                break;
+                            }
+                            RetryAction::Fatal => {
+                                state.logger.log_request(
+                                    "qoder", "POST", "/v1/chat/completions", &model, stream,
+                                    status, &picked.uid,
+                                    start_ts.elapsed().as_millis() as u64, &key_name,
+                                    &state.qoder_pool.name_of(&picked.uid),
+                                    Some(&safe_slice(&resp_body, 300)),
+                                );
+                                return Err(format!(
+                                    "upstream {} error: {}",
+                                    status,
+                                    safe_slice(&resp_body, 300)
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => {
+            let body = match proto {
+                Protocol::Anthropic => wb_sse::completion_to_anthropic(
+                    &resp,
+                    &format!("msg_{}", now_ts()),
+                    &model_out,
+                ),
+                Protocol::OpenAiText => wb_sse::completion_to_text(&resp, &model_out),
+                Protocol::Responses => super::wb_responses::completion_to_responses(
+                    &resp,
+                    &format!("resp_{}", now_ts()),
+                    &model_out,
+                ),
+                Protocol::OpenAi => resp,
+            };
+            Response::builder()
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap_or_else(|_| internal_error_response())
+        }
+        Ok(Err(msg)) => {
+            // 审查修复（对齐 wb_aggregate_chat）：Fatal 错误透传上游状态码——
+            // 上游 400/404/413 等请求级错误不降级 503，避免严格客户端无意义重试；
+            // 401/403/429 属账号/池问题，维持 503 语义
+            let upstream_status = msg
+                .strip_prefix("upstream ")
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|s| s.parse::<u16>().ok());
+            let status = match upstream_status {
+                Some(s) if (400..500).contains(&s) && !matches!(s, 401 | 403 | 429) => {
+                    StatusCode::from_u16(s).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+                }
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            match proto {
+                Protocol::Anthropic => anthropic_error(status, "api_error", &msg),
+                _ => openai_error(status, "upstream_error", &msg),
+            }
+        }
+        Err(e) => openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            &format!("task join error: {}", e),
+        ),
+    }
+}
+
+// ==================== 小工具 ====================
+
+fn now_ts() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 流内错误帧下发（自抄 send_stream_error_wb：私有不可复用；形态同构）
+fn send_stream_error(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    proto: Protocol,
+    code: i64,
+    msg: &str,
+) {
+    match proto {
+        Protocol::Anthropic => {
+            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: error\ndata: {}\n\n",
+                err
+            ))));
+        }
+        Protocol::Responses => {
+            let resp = json!({
+                "id": format!("resp_{}", now_ts()),
+                "object": "response",
+                "status": "failed",
+                "output": [],
+                "error": {"code": code.to_string(), "message": msg},
+            });
+            let body = json!({"type": "response.failed", "response": resp});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: response.failed\ndata: {}\n\n",
+                body
+            ))));
+        }
+        _ => {
+            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        }
+    }
+}
+
+fn internal_error_response() -> Response {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .body(Body::from("{\"error\":{\"message\":\"internal error\"}}"))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}

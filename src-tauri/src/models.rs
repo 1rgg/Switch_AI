@@ -332,13 +332,19 @@ fn default_notify() -> String {
 fn default_retention() -> i32 {
     30
 }
+
+/// 池开关「默认开」的 serde 兜底（Trae 主池历史行为恒可用，字段缺省视为开启）
+fn default_pool_enabled() -> bool {
+    true
+}
 /// 解密域名白名单默认值（Charles SSL Proxying Locations 语义：列表内 MITM 解密，
-/// 其余透明直通）。完整覆盖字节系九组域 + Qoder CN（F-80 M0 抓包支持；
-/// 宽后缀语义下 qoder.com.cn 覆盖 openapi./gateway. 等全部子域）；带证书锁定的
+/// 其余透明直通）。完整覆盖字节系九组域 + Qoder 全系四域（F-80 M0 抓包支持 +
+/// p3-2 chat 抓包：Qoder Work agent worker 的模型端点为 api2-v2.qoder.sh，
+/// 管理面为 qoder.com.cn；宽后缀语义下各域覆盖全部子域）；带证书锁定的
 /// 客户端域（豆包 ttnet 原生栈）由自适应降级兜底：连续 3 次握手被客户端中止
 /// 自动转透明直通（重启代理复位）。
 pub fn default_proxy_domains() -> String {
-    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com,qoder.com.cn".into()
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com,qoder.com.cn,qoder.sh,qoder.cn,qoder.ai".into()
 }
 
 /// 旧版默认域名列表（未含 doubao.com）：用于把升级前已持久化的旧默认无缝迁移到新默认
@@ -362,6 +368,21 @@ pub fn legacy_proxy_domains_narrow() -> String {
 /// 升级后无缝补上 Qoder 域（用户自定义过则不动）
 pub fn legacy_proxy_domains_without_qoder() -> String {
     "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com".into()
+}
+
+/// p3-2 上一版默认域名列表（仅含 qoder.com.cn 单 Qoder 域）：Qoder Work agent
+/// worker 的 chat 流量走 api2-v2.qoder.sh（/model/v1/chat/completions），MCP 走
+/// mcp.qoder.cn——已持久化旧 10 域默认的存量用户升级后无缝补齐 qoder.sh/qoder.cn/
+/// qoder.ai 三域（用户自定义过则不动）
+pub fn legacy_proxy_domains_with_qoder_cn() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com,qoder.com.cn".into()
+}
+
+/// F-80 扩展版默认域名列表（qoder.com.cn + qoder.cn + qoder.com 三 Qoder 域）：
+/// p3-2b 之前某版本的持久化默认。p3-2b 迁移列表漏了它，存量用户被误判为
+/// 「自定义过」导致 qoder.sh/qoder.ai 未进解密白名单（2026-09-30 运行时横幅实测）
+pub fn legacy_proxy_domains_qoder_com() -> String {
+    "trae.cn,trae.com.cn,mchost.guru,zijieapi.com,bytedance.com,volcengine.com,volces.com,treecode.com,doubao.com,qoder.com.cn,qoder.cn,qoder.com".into()
 }
 
 /// 豆包保活端点默认值：GET /info/v2/（通知未读数，轻量、必须登录，200=有效 / 302=过期）。
@@ -504,6 +525,10 @@ pub struct AccountCooldownsFile {
 /// API 池配置文件：api_pool.json
 #[derive(Serialize, Deserialize)]
 pub struct ApiPoolFile {
+    /// Trae 池参与调度开关：默认开（主池历史行为恒可用）；关闭后 Trae 目录模型
+    /// 不路由 Trae 池，仅 Trae 源模型显式报错（WbDisabled/QoderDisabled 同族语义）
+    #[serde(default = "default_pool_enabled")]
+    pub trae_enabled: bool,
     #[serde(default)]
     pub enabled_uids: Vec<String>,
     /// 调度策略：expire_first（默认）/ credit_first / random / weighted / p2c
@@ -554,6 +579,10 @@ pub struct ApiPoolFile {
     /// （未分组账号不参与，对齐 Trae 池 group_ids 的 T10 语义）；空 = 不限分组
     #[serde(default)]
     pub wb_group_ids: Vec<String>,
+    /// Qoder 上游开关（p3-3）：开启后 Qoder 目录模型路由到 Qoder 账号池。
+    /// 默认 false——未部署 Qoder 的环境不产生空池噪音（健康告警/目录徽章）
+    #[serde(default)]
+    pub qoder_enabled: bool,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -580,6 +609,7 @@ fn default_wb_sticky_ttl_secs() -> u64 {
 impl Default for ApiPoolFile {
     fn default() -> Self {
         Self {
+            trae_enabled: true,
             enabled_uids: Vec::new(),
             strategy: String::new(),
             wb_strategy: String::new(),
@@ -595,6 +625,7 @@ impl Default for ApiPoolFile {
             wb_sticky_ttl_secs: default_wb_sticky_ttl_secs(),
             wb_enabled_uids: Vec::new(),
             wb_group_ids: Vec::new(),
+            qoder_enabled: false,
         }
     }
 }

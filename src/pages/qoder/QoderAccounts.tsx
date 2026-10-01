@@ -596,15 +596,6 @@ export default function QoderAccounts() {
               }}
             />
             <button
-              className="btn-outline"
-              onClick={() => {
-                setShowSnapshots(true);
-                void refreshSnapshots();
-              }}
-            >
-              <History size={15} /> 快照管理
-            </button>
-            <button
               className="btn-outline !text-rose-600 hover:!border-rose-300"
               disabled={resetLoading || resetBusy}
               onClick={() => void openEnvReset()}
@@ -614,6 +605,15 @@ export default function QoderAccounts() {
             </button>
             <button onClick={() => setGroupOpen(true)} className="btn-outline" title="管理账号分组">
               <FolderCog size={15} /> 分组管理
+            </button>
+            <button
+              className="btn-outline"
+              onClick={() => {
+                setShowSnapshots(true);
+                void refreshSnapshots();
+              }}
+            >
+              <History size={15} /> 快照管理
             </button>
           </>
         }

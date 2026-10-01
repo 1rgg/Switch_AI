@@ -39,6 +39,9 @@ aes-gcm = "0.10"
 # + ExchangeToken DeviceProof 签名（ECDSA P-256/SHA-256，服务端 20405 Device proof required）
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
+# p3-3：Qoder 网关 COSY 签名（MD5 签名摘要 + RSA PKCS#1 v1.5 模幂，签名层见 tasks/qoder_sign.rs）
+md-5 = "0.10"
+num-bigint = "0.4"
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 # 读 Trae 应用的 state.vscdb（SQLite）——自动发现当前登录账号的 Cloud-IDE uid
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -537,6 +537,8 @@ export interface PoolStatus {
 }
 
 export interface ApiPoolFile {
+  /** Trae 池参与调度开关（默认开）：关闭后 Trae 目录模型不路由 Trae 池 */
+  trae_enabled?: boolean;
   enabled_uids: string[];
   /** 调度策略：expire_first（默认）/ credit_first / random（T10） */
   strategy?: string;
@@ -566,6 +568,8 @@ export interface ApiPoolFile {
   pool_sticky_ttl_secs?: number;
   /** WB 显式会话粘性 TTL 秒（F-76②） */
   wb_sticky_ttl_secs?: number;
+  /** Qoder 上游开关（p3-3）：开启后 Qoder 目录模型路由到 Qoder 账号池（默认关） */
+  qoder_enabled?: boolean;
 }
 
 /** CC Switch 协同状态（T5.7/F-43） */
