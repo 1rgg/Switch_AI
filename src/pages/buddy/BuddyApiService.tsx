@@ -236,10 +236,16 @@ export default function BuddyApiService() {
   // 新增账号可持续自动入池；显式全量名单会冻结 fail-open）；清空传 []（后端同样 fail-open）；
   // F-76②/③/F-77 数值参数随开关一起保存（后端热应用，运行中即时生效）
   const saveFlags = async () => {
+    // 池配置未加载时禁止保存：uids/strategy/groups 原样回传依赖 pool 快照，
+    // pool=null 时保存会把 Trae 池 enabled_uids 清空（与 Qoder 页同款防护）
+    if (!pool) {
+      pushToast('error', '池配置未加载，无法保存（请先刷新重试）');
+      return;
+    }
     setSaving(true);
     try {
       await withMinDelay(
-        api.apiServer.poolSet(pool?.enabled_uids ?? [], pool?.strategy, pool?.group_ids, {
+        api.apiServer.poolSet(pool.enabled_uids, pool.strategy, pool.group_ids, {
           ...wbFlags,
           wbUids,
           wbGroupIds: [...wbPoolGroups],
@@ -395,7 +401,7 @@ export default function BuddyApiService() {
                     </button>
                   </>
                 )}
-                <button className="btn-outline" onClick={() => void saveFlags()} disabled={saving}>
+                <button className="btn-outline" onClick={() => void saveFlags()} disabled={saving || !pool}>
                   {saving ? <Spinner /> : <Save size={15} />} 保存
                 </button>
               </div>

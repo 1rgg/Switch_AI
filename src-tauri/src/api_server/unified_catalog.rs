@@ -277,6 +277,9 @@ pub struct UnifiedModel {
     pub display: String,
     /// 供应商：自定义模型用户填写值优先；否则按模型名系列推断（未知为空串，前端显示 —）
     pub vendor: String,
+    /// 地区归属（Qoder 双区特有 cn|global，qoder_upstream::list 注入；非 Qoder 源恒 None）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     /// 实际生效倍率 = 当前调度策略命中的来源侧（§3.1），非"最优值"
     pub rate: Option<f64>,
     /// 思考档位（双语义合并展示，§3.1 注：仅 Buddy 池作为请求参数下发）
@@ -435,6 +438,7 @@ pub fn unified_models_ex(
                 id: t.id.clone(),
                 display: t.display.clone(),
                 vendor: String::new(),
+                region: None,
                 rate: t.rate,
                 efforts: t.efforts.clone(),
                 max_mode: super::efforts::trae_max_mode_supported(&canonical),
@@ -506,6 +510,7 @@ pub fn unified_models_ex(
                             m.display.clone()
                         },
                         vendor: String::new(),
+                        region: None,
                         rate: wrate,
                         efforts: m.supported_efforts.clone(),
                         max_mode: false,
@@ -569,6 +574,7 @@ pub fn unified_models_ex(
                         id: m.name.clone(),
                         display: m.name.clone(),
                         vendor: m.vendor.clone(),
+                        region: None,
                         rate: crate_rate,
                         efforts: Vec::new(),
                         max_mode: false,
@@ -629,8 +635,12 @@ pub fn unified_models_ex(
                         .collect()
                 })
                 .unwrap_or_default();
+            // 地区归属（cn|global）：qoder_upstream::list 为每条目注入 region 键；
+            // 双区同名去重（global 优先）后单条目单 region，多源条目同样带 Qoder 侧 region
+            let qregion = m.get("region").and_then(Value::as_str).map(str::to_string);
             match acc.get_mut(&canonical) {
                 Some(u) => {
+                    u.region = qregion;
                     u.sources.push(UnifiedSource {
                         pool: "qoder",
                         rate: qrate,
@@ -660,12 +670,20 @@ pub fn unified_models_ex(
                 }
                 None => {
                     order.push(canonical.clone());
+                    // vendor：条目厂商标注优先（qoder_upstream::MODEL_VENDORS，
+                    // 如 Step 5 Preview → 阶跃星辰），未命中回落 Qoder
+                    let qvendor = m
+                        .get("vendor")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Qoder");
                     acc.insert(
                         canonical.clone(),
                         UnifiedModel {
                             id: id.to_string(),
                             display,
-                            vendor: "Qoder".to_string(),
+                            vendor: qvendor.to_string(),
+                            region: qregion,
                             rate: qrate,
                             efforts: qefforts,
                             max_mode: false,

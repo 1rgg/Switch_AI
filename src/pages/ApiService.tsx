@@ -91,13 +91,14 @@ export default function ApiService() {
     }
   }, []);
 
-  // 统一模型目录：过滤 sources 含 Trae 池的条目（§6.1，聚合视图实时派生）
+  // 统一模型目录：过滤 sources 含 Trae 或 Qoder 池的条目（§5.5，聚合视图实时派生；
+  // Qoder 与 Trae 共用本页模型目录视图，Qoder 页管理其上游开关与目录同步）
   const loadModels = useCallback(
     async (manual = false) => {
       setLoadingModels(true);
       try {
         const list = await withMinDelay(api.apiServer.unifiedModels(), 250);
-        setModels(list.filter((m) => m.sources.some((s) => s.pool === 'trae')));
+        setModels(list.filter((m) => m.sources.some((s) => s.pool === 'trae' || s.pool === 'qoder')));
       } catch {
         // 初始化失败静默保留空列表；手动点击刷新失败需给出提示
         if (manual) toast('error', '加载模型目录失败，请重试');
@@ -688,7 +689,9 @@ export default function ApiService() {
                 <thead>
                   <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
                     <th className="pb-2 pr-3 font-medium">模型 ID</th>
+                    <th className="pb-2 pr-3 font-medium">来源</th>
                     <th className="pb-2 pr-3 font-medium">展示名</th>
+                    <th className="pb-2 pr-3 font-medium">厂商</th>
                     <th className="pb-2 pr-3 text-right font-medium">积分倍率</th>
                     <th className="pb-2 pr-3 font-medium">思考档位</th>
                     <th className="pb-2 pr-3 text-right font-medium">上下文</th>
@@ -705,6 +708,27 @@ export default function ApiService() {
                       <td className="py-2 pr-3 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
                         {m.id}
                       </td>
+                      <td className="py-2 pr-3">
+                        {/* §5.5 来源徽标：展示该模型全部池来源（多源同名并列；本页行
+                            范围 = trae/qoder，buddy/custom 仅作来源展示不在此维护） */}
+                        <div className="flex gap-0.5">
+                          {m.sources.map((s) => {
+                            const tag =
+                              s.pool === 'trae'
+                                ? { label: 'Trae', tone: 'blue' as const }
+                                : s.pool === 'buddy'
+                                  ? { label: 'Buddy', tone: 'green' as const }
+                                  : s.pool === 'qoder'
+                                    ? { label: 'Qoder', tone: 'violet' as const }
+                                    : { label: '自定义', tone: 'slate' as const };
+                            return (
+                              <Badge key={s.pool} tone={tag.tone} className="!px-1.5 !text-[10px]">
+                                {tag.label}
+                              </Badge>
+                            );
+                          })}
+                        </div>
+                      </td>
                       <td className="py-2 pr-3 text-slate-600 dark:text-zinc-300">
                         {m.display || '—'}
                         {m.manual && (
@@ -715,6 +739,10 @@ export default function ApiService() {
                             *
                           </span>
                         )}
+                      </td>
+                      {/* §6.2 厂商列：条目标注优先（如 Step 5 Preview → 阶跃星辰），未命中显示 — */}
+                      <td className="py-2 pr-3 text-xs text-slate-500 dark:text-zinc-400">
+                        {m.vendor || '—'}
                       </td>
                       <td className="py-2 pr-3 text-right tabular-nums text-amber-600 dark:text-amber-400">
                         {m.rate != null ? m.rate.toFixed(2) : '—'}

@@ -63,7 +63,7 @@ pub struct ResolvedKey {
     /// 专一模式绑定的上游账号 uid（空 = allowed_accounts 首个）；混合白名单时
     /// 同样可带池前缀（专一锁定其归属池，排除另一池）
     pub dedicated_account: String,
-    /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy"
+    /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder"
     pub bind_pool: String,
 }
 
@@ -190,6 +190,7 @@ pub fn parse_bind_pool(s: &str) -> Option<&'static str> {
     match s.trim().to_lowercase().as_str() {
         "trae" => Some("trae"),
         "buddy" => Some("buddy"),
+        "qoder" => Some("qoder"),
         _ => None,
     }
 }
@@ -684,6 +685,14 @@ mod tests {
         assert!(rk.constrains_pool("buddy"));
         assert!(!rk.constrains_pool("trae"));
 
+        // 绑定 qoder：约束仅作用 qoder 池（qoder_route 以 pool_constraints("qoder") 取约束）
+        e.bind_pool = "Qoder".into();
+        rk = constraints_of(&e);
+        assert_eq!(rk.bind_pool(), Some("qoder"));
+        assert!(rk.constrains_pool("qoder"));
+        assert!(!rk.constrains_pool("trae"));
+        assert!(!rk.constrains_pool("buddy"));
+
         // 非法值视为未绑定
         e.bind_pool = "openai".into();
         assert_eq!(parse_bind_pool(&e.bind_pool), None);
@@ -846,6 +855,7 @@ mod tests {
         assert_eq!(split_pool_tagged("trae:t1"), (Some("trae"), "t1"));
         assert_eq!(split_pool_tagged("Trae:t1"), (Some("trae"), "t1"));
         assert_eq!(split_pool_tagged("buddy:b1"), (Some("buddy"), "b1"));
+        assert_eq!(split_pool_tagged("qoder:q1"), (Some("qoder"), "q1"));
         // 裸 uid / 非法前缀（"openai:x" 中 openai 非法 → 整串视为裸 uid）
         assert_eq!(split_pool_tagged("t1"), (None, "t1"));
         assert_eq!(split_pool_tagged("openai:x"), (None, "openai:x"));

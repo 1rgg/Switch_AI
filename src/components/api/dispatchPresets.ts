@@ -3,6 +3,8 @@
  * 从 ResourceSummary.tsx 抽出：预设定义 + 当前配置 → 预设命中判定。
  * 匹配规则：池间策略一致 + Trae 池策略一致（空串语义等同 expire_first 默认）
  * + Buddy 池策略一致（空 = 跟随 Trae 池生效值）。
+ * 注意：Qoder 池不参与预设匹配——Qoder 无池内策略可配，且池间调度始终尾部
+ * 接管（多源同名模型的兜底序），不受预设影响。
  */
 import type { ApiPoolFile, DispatchPolicy } from '../../types';
 

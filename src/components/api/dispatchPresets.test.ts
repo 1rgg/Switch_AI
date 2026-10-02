@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import type { ApiPoolFile } from '../../types';
 import { DISPATCH_PRESETS, matchPreset } from './dispatchPresets';
 
 describe('matchPreset（调度策略收口：预设匹配）', () => {
@@ -50,6 +51,22 @@ describe('matchPreset（调度策略收口：预设匹配）', () => {
     expect(
       matchPreset({ strategy: 'random', wb_strategy: 'random' }, { strategy: 'smart' }),
     ).toBeUndefined();
+  });
+
+  it('Qoder 维度不参与匹配也不阻断（qoder-dispatch-alignment-plan §5.2）：qoder_enabled 开关任意取值，命中只看 inter/trae/buddy', () => {
+    // Qoder 池无独立池内策略且恒为池间尾部接管：其字段变化不得影响 preset 识别
+    expect(
+      matchPreset(
+        { strategy: 'weighted', wb_strategy: 'weighted', qoder_enabled: true } as ApiPoolFile,
+        { strategy: 'smart' },
+      )?.key,
+    ).toBe('balanced');
+    expect(
+      matchPreset(
+        { strategy: 'expire_first', wb_strategy: 'expire_first', qoder_enabled: false } as ApiPoolFile,
+        { strategy: 'smart' },
+      )?.key,
+    ).toBe('fresh');
   });
 
   it('预设定义完整：5 组且互不重复、均含名称与说明', () => {

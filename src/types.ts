@@ -25,6 +25,7 @@ export type ViewKey =
   | 'qoder-accounts'
   | 'qoder-checkin'
   | 'qoder-credits'
+  | 'qoder-api-service'
   | 'qoder-settings';
 
 /** 侧边栏应用切换（左下角 Tab）：Trae 当前菜单 / Buddy / Qoder（F-80）/ 豆包 */
@@ -426,7 +427,7 @@ export interface ApiServiceStatus {
 // ---- 统一网关（unified-api-gateway-design §3.1/§8.1）----
 /** 统一模型目录来源池标记（enabled 为运行时派生，不落盘） */
 export interface UnifiedModelSource {
-  pool: 'trae' | 'buddy' | 'custom';
+  pool: 'trae' | 'buddy' | 'qoder' | 'custom';
   rate: number | null;
   enabled: boolean;
 }
@@ -437,6 +438,8 @@ export interface UnifiedModel {
   display: string;
   /** 供应商：自定义模型用户填写值优先，否则按模型名系列推断（空串 = 未知） */
   vendor: string;
+  /** 地区归属（Qoder 双区特有 cn|global；非 Qoder 源缺省，展示 —） */
+  region?: string | null;
   /** 实际生效倍率 = 当前调度策略命中的来源侧 */
   rate: number | null;
   /** 思考档位（双语义合并展示，仅 Buddy 池作为请求参数下发） */

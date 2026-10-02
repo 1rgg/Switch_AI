@@ -25,6 +25,7 @@ import BuddySettings from './pages/buddy/BuddySettings';
 import QoderOverview from './pages/qoder/QoderOverview';
 import QoderAccounts from './pages/qoder/QoderAccounts';
 import QoderCheckin from './pages/qoder/QoderCheckin';
+import QoderApiService from './pages/qoder/QoderApiService';
 import QoderSettings from './pages/qoder/QoderSettings';
 import ApiManagerModal from './components/api/ApiManagerModal';
 
@@ -72,6 +73,8 @@ function renderView(view: string) {
       return <QoderCheckin />;
     case 'qoder-credits':
       return <CreditsDashboard key="qoder" platform="qoder" />;
+    case 'qoder-api-service':
+      return <QoderApiService key="qoder-api-service" />;
     case 'qoder-settings':
       return <QoderSettings />;
     default:

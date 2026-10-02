@@ -207,6 +207,8 @@ fn main() {
             commands::api_server::pool_set,
             commands::api_server::pool_status,
             commands::api_server::wb_pool_status,
+            commands::api_server::qoder_pool_status,
+            commands::api_server::qoder_catalog_sync,
             commands::api_server::api_logs_list,
             commands::api_server::api_logs_detail,
             commands::api_server::api_logs_search,

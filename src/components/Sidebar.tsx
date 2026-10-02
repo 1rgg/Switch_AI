@@ -50,12 +50,13 @@ const BUDDY_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'buddy-settings', label: '环境配置', icon: Settings },
 ];
 
-/** Qoder 应用菜单（F-80：IDE / Work / CLI 三端共用五页子导航） */
+/** Qoder 应用菜单（F-80：IDE / Work / CLI 三端共用六页子导航，P1 对齐 Buddy） */
 const QODER_NAV: { key: ViewKey; label: string; icon: typeof Users }[] = [
   { key: 'qoder-overview', label: '概述', icon: LayoutDashboard },
   { key: 'qoder-accounts', label: '账号管理', icon: Users },
   { key: 'qoder-checkin', label: '每日签到', icon: PlayCircle },
   { key: 'qoder-credits', label: '积分看板', icon: Coins },
+  { key: 'qoder-api-service', label: '资源调度', icon: Server },
   { key: 'qoder-settings', label: '环境配置', icon: Settings },
 ];
 

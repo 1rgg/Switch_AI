@@ -1,24 +1,27 @@
 /**
  * 全局 API 管理 · 资源总览与调度策略中心（unified-api-gateway-design §5.2/§5.3）
  * 「调度策略中心」卡集中三块（任务7，从资源角度整体设计）：
- *  ① 最佳组合预设：5 组专家组合（池间 + Trae 池 + Buddy 池）一键应用，当前命中组合高亮；
+ *  ① 最佳组合预设：5 组专家组合（池间 + Trae 池 + Buddy 池）一键应用，当前命中组合高亮
+ *     （Qoder 池始终尾部接管，不受预设影响）；
  *  ② 池间调度策略：smart / priority + 优先级序编辑 + 跨池回退（dispatch_policy_get/set 即时生效）；
  *  ③ 各资源池池内调度：Trae（strategy）/ Buddy（wb_strategy，空 = 跟随 Trae 池）下拉编辑，
- *     自定义模型命中即直达、无池内调度（只读展示）。
- * 下方为 Trae / Buddy / 自定义 三池摘要卡；前两者详情引导至各应用「资源调度」页，
+ *     自定义模型命中即直达；Qoder 池无池内策略可配（fail-open 全量入池），
+ *     仅暴露「启用 Qoder 上游」开关（poolSet 第四参，qoder-dispatch-alignment-plan §5.1）。
+ * 下方为 Trae / Buddy / Qoder / 自定义 四池摘要卡；前三者详情引导至各应用「资源调度」页，
  * 自定义池详情引导至「自定义模型」Tab。
  * 数据源：pool_list / accounts_list（Trae 池）、pool_list.wb_enabled / workbuddy_accounts_list
- * （Buddy 池）、custom_models_list（自定义模型池）。
+ * （Buddy 池）、pool_list.qoder_enabled / qoder_accounts_list（Qoder 池）、custom_models_list
+ * （自定义模型池）。
  */
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { ArrowDown, ArrowUp, Blocks, Bot, Layers, Server, SlidersHorizontal, Star } from 'lucide-react';
+import { ArrowDown, ArrowUp, Blocks, Bot, Boxes, Layers, Server, SlidersHorizontal, Star } from 'lucide-react';
 import { Badge } from '../ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
 import { fmtCredits } from '../../lib/format';
 import { DISPATCH_PRESETS, matchPreset } from './dispatchPresets';
 import { computePoolMetrics } from './poolMetrics';
-import type { AccountView, ApiPoolFile, CustomModel, DispatchPolicy, WorkBuddyAccountView } from '../../types';
+import type { AccountView, ApiPoolFile, CustomModel, DispatchPolicy, QoderAccountView, WorkBuddyAccountView } from '../../types';
 
 function Row({ label, value }: { label: string; value: ReactNode }) {
   return (
@@ -44,6 +47,7 @@ const STRATEGY_LABELS: Record<string, string> = {
 const POOL_LABELS: Record<string, string> = {
   buddy: 'Buddy 池',
   trae: 'Trae 池',
+  qoder: 'Qoder 池',
 };
 
 const selectCls =
@@ -92,6 +96,27 @@ function DispatchCenterCard({
       toast('success', '调度策略已保存，运行中网关即时生效');
     } catch (e) {
       toast('error', `调度策略保存失败：${String(e).slice(0, 120)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /** Qoder 上游开关（qoder-dispatch-alignment-plan §5.1）：读写走 poolSet 第四参
+   *  （与 Buddy wb 开关同链路）；uids/strategy/groups 原样回传（本卡不改池成员/分组） */
+  const saveQoder = async (next: boolean) => {
+    if (!pool) return;
+    setSaving(true);
+    try {
+      await api.apiServer.poolSet(pool.enabled_uids, pool.strategy ?? '', pool.group_ids, {
+        qoderEnabled: next,
+      });
+      onPoolChanged({ ...pool, qoder_enabled: next });
+      toast(
+        'success',
+        next ? 'Qoder 上游已启用，运行中网关即时生效' : 'Qoder 上游已关闭：仅 Qoder 源模型将显式报错',
+      );
+    } catch (e) {
+      toast('error', `Qoder 开关保存失败：${String(e).slice(0, 120)}`);
     } finally {
       setSaving(false);
     }
@@ -165,12 +190,16 @@ function DispatchCenterCard({
         <p className="mt-1.5 text-[11px] text-slate-400 dark:text-zinc-500">
           {activePreset ? activePreset.desc : '当前为手动组合；选择预设可一键对齐推荐配置'}
         </p>
+        <p className="mt-1 text-[11px] text-slate-400 dark:text-zinc-500">
+          Qoder 池始终尾部接管（多源同名模型的兜底序），不受预设影响。
+        </p>
       </div>
 
       {/* ② 池间调度策略 */}
       <div className="border-t border-slate-100 pt-3 dark:border-zinc-800">
         <div className="mb-1.5 text-[11px] font-medium text-slate-500 dark:text-zinc-400">
-          池间调度（仅作用于双源模型 Trae/Buddy 同名；自定义模型命中即直达不受影响）
+          池间调度（仅作用于多源同名模型 Trae/Buddy/Qoder；自定义模型命中即直达不受影响；
+          Qoder 池恒为兜底序尾部）
         </div>
         <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs">
           <label className="flex items-center gap-2">
@@ -268,6 +297,18 @@ function DispatchCenterCard({
           <span className="text-slate-400 dark:text-zinc-500">
             自定义模型：<span className="text-slate-700 dark:text-zinc-200">命中即直达</span>（上游自有计费，无池内调度）
           </span>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={pool?.qoder_enabled ?? false}
+              disabled={!pool || saving}
+              onChange={(e) => void saveQoder(e.target.checked)}
+            />
+            <span className="text-slate-400 dark:text-zinc-500">启用 Qoder 上游</span>
+            <span className="text-slate-700 dark:text-zinc-200">
+              （fail-open 全量入池，无池内策略可配）
+            </span>
+          </label>
         </div>
       </div>
     </div>
@@ -278,6 +319,7 @@ export default function ResourceSummary() {
   const [pool, setPool] = useState<ApiPoolFile | null>(null);
   const [accounts, setAccounts] = useState<AccountView[]>([]);
   const [wbAccounts, setWbAccounts] = useState<WorkBuddyAccountView[]>([]);
+  const [qoderAccounts, setQoderAccounts] = useState<QoderAccountView[]>([]);
   const [customModels, setCustomModels] = useState<CustomModel[]>([]);
 
   useEffect(() => {
@@ -299,6 +341,12 @@ export default function ResourceSummary() {
       .catch(() => {
         /* 保留空摘要 */
       });
+    api.qoder
+      .accountsList()
+      .then(setQoderAccounts)
+      .catch(() => {
+        /* 保留空摘要 */
+      });
     api.apiServer
       .customModelsList()
       .then(setCustomModels)
@@ -307,8 +355,8 @@ export default function ResourceSummary() {
       });
   }, []);
 
-  // 三池摘要指标（池内成员与积分口径的纯计算见 poolMetrics.ts，含单测）
-  const metrics = computePoolMetrics(pool, accounts, wbAccounts, customModels);
+  // 四池摘要指标（池内成员与积分口径的纯计算见 poolMetrics.ts，含单测）
+  const metrics = computePoolMetrics(pool, accounts, wbAccounts, customModels, qoderAccounts);
   // Buddy 池内策略文案：空 = 跟随 Trae 池（展示 Trae 当前生效策略）
   const buddyStrategyText = pool?.wb_strategy
     ? (STRATEGY_LABELS[pool.wb_strategy] ?? pool.wb_strategy)
@@ -397,6 +445,43 @@ export default function ResourceSummary() {
         <p className="mt-3 border-t border-slate-100 pt-2 text-[11px] text-slate-400 dark:border-zinc-800 dark:text-zinc-500">
           <Layers size={11} className="mr-1 inline" />
           详情（上游开关 / 模型目录 / 账号池）见 Buddy「资源调度」页
+        </p>
+      </div>
+
+      {/* Qoder 资源池摘要 */}
+      <div className="card p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <Boxes size={16} className="text-emerald-500" />
+          <span className="text-sm font-medium text-slate-800 dark:text-zinc-100">Qoder 资源池</span>
+          <Badge tone={metrics.qoderEnabled ? 'green' : 'slate'}>
+            {metrics.qoderEnabled ? '上游已启用' : '上游未启用'}
+          </Badge>
+        </div>
+        <div className="space-y-1.5">
+          <Row label="池内账号数" value={metrics.qoderPoolCount} />
+          <Row
+            label="可用积分"
+            value={
+              <span className="font-semibold text-amber-600 dark:text-amber-400">
+                {metrics.qoderPoolCredits != null ? fmtCredits(metrics.qoderPoolCredits) : '未知'}
+              </span>
+            }
+          />
+          <Row label="账号总数" value={metrics.qoderAccountTotal} />
+          <Row
+            label="积分总余额"
+            value={
+              <span className="font-semibold text-amber-600 dark:text-amber-400">
+                {metrics.qoderTotalCredits != null ? fmtCredits(metrics.qoderTotalCredits) : '未知'}
+              </span>
+            }
+          />
+          <Row label="池内调度策略" value="fail-open 全量入池" />
+          <Row label="消耗口径" value="Qoder 通用 credits" />
+        </div>
+        <p className="mt-3 border-t border-slate-100 pt-2 text-[11px] text-slate-400 dark:border-zinc-800 dark:text-zinc-500">
+          <Layers size={11} className="mr-1 inline" />
+          详情（上游开关 / 模型目录 / 账号清单）见 Qoder「资源调度」页
         </p>
       </div>
 

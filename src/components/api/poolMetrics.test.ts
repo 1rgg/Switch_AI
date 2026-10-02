@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { computePoolMetrics } from './poolMetrics';
-import type { AccountView, ApiPoolFile, CustomModel, WorkBuddyAccountView } from '../../types';
+import type { AccountView, ApiPoolFile, CustomModel, QoderAccountView, WorkBuddyAccountView } from '../../types';
 
 /** 最小 Trae 账号（仅单测所需字段，池键 = user_id） */
 const trae = (user_id: string, general_credits: number | null) =>
@@ -11,10 +11,14 @@ const trae = (user_id: string, general_credits: number | null) =>
 const wb = (id: string, has_credential: boolean, credits_balance: number | null) =>
   ({ id, has_credential, credits_balance }) as WorkBuddyAccountView;
 
+/** 最小 Qoder 账号（仅单测所需字段，fail-open = 全部含凭证账号入池） */
+const qoder = (id: string, has_credential: boolean, credits_balance: number | null) =>
+  ({ id, has_credential, credits_balance }) as QoderAccountView;
+
 /** 最小自定义模型 */
 const model = (enabled: boolean) => ({ enabled }) as CustomModel;
 
-describe('computePoolMetrics（资源总览三池摘要口径）', () => {
+describe('computePoolMetrics（资源总览多池摘要口径）', () => {
   it('Trae 池：池内账号数 = enabled_uids；可用积分只累计池内账号；积分总余额累计全部账号', () => {
     const accounts = [trae('u1', 100), trae('u2', 50), trae('u3', 10)];
     const pool = { enabled_uids: ['u1', 'u2'] } as ApiPoolFile;
@@ -87,8 +91,39 @@ describe('computePoolMetrics（资源总览三池摘要口径）', () => {
       buddyPoolCredits: null,
       buddyTotalCredits: null,
       buddyAccountTotal: 0,
+      qoderEnabled: false,
+      qoderPoolCount: 0,
+      qoderPoolCredits: null,
+      qoderTotalCredits: null,
+      qoderAccountTotal: 0,
       customEnabledCount: 0,
       customModelTotal: 0,
     });
+  });
+
+  it('Qoder 池：fail-open = 全部含凭证账号入池（无独立白名单），无凭证账号永不入池', () => {
+    const qoderAccounts = [
+      qoder('q-a', true, 10),
+      qoder('q-b', true, 20),
+      qoder('q-c', false, 999), // 无凭证 → 永不入池
+    ];
+    const pool = { enabled_uids: [], qoder_enabled: true } as ApiPoolFile;
+    const m = computePoolMetrics(pool, [], [], [], qoderAccounts);
+    expect(m.qoderEnabled).toBe(true);
+    expect(m.qoderPoolCount).toBe(2);
+    expect(m.qoderPoolCredits).toBe(30);
+    expect(m.qoderTotalCredits).toBe(30);
+    expect(m.qoderAccountTotal).toBe(3);
+  });
+
+  it('Qoder 池：全部余额未知 → credits 为 null（上层展示「未知」）；部分未知按 0 计入；开关缺失 = 未启用', () => {
+    const unknown = [qoder('q-a', true, null), qoder('q-b', true, null)];
+    const m1 = computePoolMetrics({ enabled_uids: [] }, [], [], [], unknown);
+    expect(m1.qoderPoolCredits).toBeNull();
+    expect(m1.qoderTotalCredits).toBeNull();
+    expect(m1.qoderEnabled).toBe(false); // qoder_enabled 缺失 = 未启用
+    const mixed = [qoder('q-a', true, null), qoder('q-b', true, 20)];
+    const m2 = computePoolMetrics({ enabled_uids: [], qoder_enabled: true }, [], [], [], mixed);
+    expect(m2.qoderPoolCredits).toBe(20);
   });
 });

@@ -16,6 +16,9 @@
 //! ── 分层（§定稿管线）─────────────────────────────────────
 //! ① catalog：双区（Global/CN）兜底表 + 远程清单采纳（`adopt_remote`），
 //!    `list()` 并集去重供聚合目录，`resolve()` 请求时定位 upstreamKey；
+//!    产品决策：Auto/Ultimate/Performance/Efficient/Sonus/Cantus 六模型下线
+//!    （`REMOVED_MODEL_IDS`，兜底表已删 + 远程带回过滤）；`Step 5 Preview`
+//!    为阶跃星辰（StepFun）模型，厂商标注见 `MODEL_VENDORS`；
 //! ② 协议常量：对话 URL / Agent 超时（connect 10s + read 300s + write 30s）；
 //! ③ 错误分类：`classify_upstream_error`（排队→业务码→额度→状态码判定链），
 //!    `to_err_kind` 映射到账号池 `ErrKind`；
@@ -97,6 +100,45 @@ pub const MAX_OUTPUT_TOKENS: i64 = 32_768;
 /// 目录条目没给上下文长度时的兜底
 const DEFAULT_CONTEXT_WINDOW: i64 = 200_000;
 
+/// 模型标识归一（下线名单 / 厂商匹配 / 目录去重 共用口径）：
+/// 去空白 + 去连字符 + 小写。蓝本 toModelId 只去空白（对外 id 形态不变，
+/// 见 `parse_catalog`），匹配层额外折叠连字符——远程 display_name 风格漂移
+/// （如 `Step-5-Preview`）仍能命中厂商映射与下线过滤。
+fn norm_model_id(s: &str) -> String {
+    s.chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '-')
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// 产品决策下线的模型（不进目录、不参与路由）：远程清单带回也丢弃。
+///
+/// 匹配规则：目录 id 经 [`norm_model_id`] 归一后**全等**——按全等而非前缀，
+/// 避免误伤名称漂移后的其它模型（如 `Auto Coder` 之类）。
+const REMOVED_MODEL_IDS: &[&str] = &[
+    "auto", "cantus", "efficient", "performance", "sonus", "ultimate",
+];
+
+/// 模型厂商标注（id 经 [`norm_model_id`] 归一 → 厂商；目录展示用，不参与路由）。
+///
+/// 来源：产品确认 —— `Step 5 Preview` 为阶跃星辰（StepFun）公司的模型，
+/// 并非 Qoder 自研；目录条目经 `entry()` 注入 `vendor` 键，未命中不给键
+/// （前端未命中显示 `—`）。
+const MODEL_VENDORS: &[(&str, &str)] = &[
+    ("step5preview", "阶跃星辰"),
+    // 其余按需补充：Qwen 系→阿里 / GLM 系→智谱 / Kimi 系→月之暗面 /
+    // DeepSeek 系→深度求索 / MiniMax 系→MiniMax
+];
+
+/// 模型 id → 厂商标注（未命中返回 None）
+fn vendor_of(id: &str) -> Option<&'static str> {
+    let normalized = norm_model_id(id);
+    MODEL_VENDORS
+        .iter()
+        .find(|(name, _)| *name == normalized)
+        .map(|(_, vendor)| *vendor)
+}
+
 /// 内置兜底清单（蓝本静态快照）：(id, key, reasoning, supports_effort, efforts,
 /// vision, enabled, price_factor)。
 ///
@@ -109,12 +151,8 @@ fn fallback(region: QoderRegion) -> Vec<Value> {
     let global: &[(&str, &str, bool, bool, &[&str], bool, bool, &str)] = &[
         ("Qwen3.8-Flash", "qfmodel", true, true, &["low", "medium", "xhigh"], true, true, "0.1"),
         ("Qwen3.8-Max", "qmodel_38max", true, true, &["low", "medium", "xhigh"], true, true, "0.5"),
-        ("Auto", "auto", true, false, &[], true, false, "1"),
-        ("Ultimate", "ultimate", true, true, &[], true, false, "1.6"),
-        ("Performance", "performance", true, true, &[], true, false, "1.1"),
-        ("Efficient", "efficient", false, false, &[], true, false, "0.3"),
-        ("Sonus", "smodel", true, true, &[], true, false, "3.2"),
-        ("Cantus", "cmodel", true, true, &[], true, false, "3.2"),
+        // 产品决策下线的模型（Auto/Ultimate/Performance/Efficient/Sonus/Cantus）
+        // 不进兜底表——远程清单带回也会被 `REMOVED_MODEL_IDS` 过滤（parse_catalog）
         ("Qwen3.7-Max", "qmodel_latest", true, true, &[], true, false, "0.5"),
         // `Qwen3.7-Plus` 带连字符：上游 display_name 就是这个形态（远程刷新走
         // display_name 去空白）；少连字符会让同一模型产出两种 id
@@ -131,13 +169,13 @@ fn fallback(region: QoderRegion) -> Vec<Value> {
     // CN 表对齐 2026-10-01 model/list 全量实抓（temp/qoder_model_list_full.json，
     // 67856B 真签名直通）——倍率/名称/efforts/is_vl 全按上游实抓值：
     // GLM-5.3 0.6→0.8、Kimi-K3 0.8→1.4、Kimi-K2.8 0.3→0.8、dmodel 0.8→0.5、
-    // dfmodel 0.2→0.1、qfmodel 0.1→0.0（免费）、auto 1→0.5；MiniMax-M3 实为
+    // dfmodel 0.2→0.1、qfmodel 0.1→0.0（免费）；MiniMax-M3 实为
     // MiniMax-M2.7；补 Qwen3.7-Flash(q37fmodel)/GLM-5.2(gm51model)。
+    // Auto(auto 1→0.5) 已按产品决策下线（见 REMOVED_MODEL_IDS）。
     // thinking 档位白名单：Qwen3.8 [xhigh,low,medium]、GLM-5.3 系 [high,low,max]、
     // DeepSeek 系 [high,max(,low)]、Kimi 系 [high,low,max]；Qwen3.7 系 tc 有但
     // efforts 空 = 不支持档位；MiniMax-M2.7 无 thinking_config。
     let cn: &[(&str, &str, bool, bool, &[&str], bool, bool, &str)] = &[
-        ("Auto", "auto", true, false, &[], true, false, "0.5"),
         ("Qwen3.8-Max", "qmodel_38max", true, true, &["xhigh", "low", "medium"], true, false, "0.5"),
         ("Qwen3.8-Flash", "qfmodel", true, true, &["xhigh", "low", "medium"], true, false, "0.0"),
         ("Qwen3.7-Max", "qmodel_latest", true, false, &[], true, false, "0.5"),
@@ -264,6 +302,12 @@ fn entry(
     if !credits.is_empty() {
         if let Some(object) = model.as_object_mut() {
             object.insert("credits".to_string(), Value::String(credits.to_string()));
+        }
+    }
+    // 厂商标注只在命中映射时插入（如 Step 5 Preview → 阶跃星辰）
+    if let Some(vendor) = vendor_of(id) {
+        if let Some(object) = model.as_object_mut() {
+            object.insert("vendor".to_string(), Value::String(vendor.to_string()));
         }
     }
     model
@@ -512,7 +556,11 @@ fn parse_catalog(payload: &Value) -> Vec<Value> {
         if id.is_empty() {
             continue;
         }
-        let lowered = id.to_lowercase();
+        let lowered = norm_model_id(&id);
+        // 产品决策下线的模型：远程清单带回也丢弃（不进目录、不参与路由）
+        if REMOVED_MODEL_IDS.contains(&lowered.as_str()) {
+            continue;
+        }
         if seen.iter().any(|known| known == &lowered) {
             continue;
         }
@@ -2471,7 +2519,8 @@ mod tests {
 
     /// p3-2d 真实样本回归（#[ignore]：依赖本地实抓文件）：
     /// parse_catalog 吃 2026-10-01 model/list 全量实抓 JSON（真 COSY 签名直通
-    /// 探针落盘，67856B）→ 14 条目 + MiniMax-M2.7/GLM-5.3 倍率关键字段验证。
+    /// 探针落盘，67856B）→ 13 条目（实抓 14 条减去产品决策下线的 Auto）+
+    /// MiniMax-M2.7/GLM-5.3 倍率关键字段验证。
     /// 运行：cargo test parse_catalog_eats_real -- --ignored --nocapture
     #[test]
     #[ignore]
@@ -2482,7 +2531,11 @@ mod tests {
             .expect("实抓文件缺失（temp/qoder_model_list_full.json）");
         let payload: Value = serde_json::from_str(&raw).expect("实抓 JSON 解析失败");
         let models = parse_catalog(&payload);
-        assert_eq!(models.len(), 14, "chat 数组应解析出 14 个模型");
+        assert_eq!(models.len(), 13, "chat 数组 14 条减下线的 Auto 应解析出 13 个模型");
+        assert!(
+            models.iter().all(|m| text_of(m, "id").to_lowercase() != "auto"),
+            "下线模型 Auto 不得出现在解析结果" 
+        );
         let minimax = models
             .iter()
             .find(|m| text_of(m, "id") == "MiniMax-M2.7")
@@ -2575,6 +2628,88 @@ mod tests {
         .is_err());
         // 空目录 → Err
         assert!(adopt_remote(QoderRegion::Cn, &json!({"chat": []})).is_err());
+    }
+
+    /// 产品决策下线模型回归（REMOVED_MODEL_IDS）：兜底表已删 + 远程带回过滤，
+    /// 目录 / 解析全链路不可再出现 Auto/Sonus/Cantus/Ultimate/Performance/Efficient
+    #[test]
+    fn removed_models_filtered_from_catalog_and_resolve() {
+        // 持测试锁：resolve/list 会读进程级目录（含并行 adopt_remote 注入态）
+        let _catalog = catalog_test_guard();
+        // 远程清单带回下线模型（含带空白/大小写漂移形态）→ 全部丢弃
+        let payload = json!({
+            "statusCodeValue": 200,
+            "chat": [
+                {"key": "auto", "display_name": "Auto", "enable": true, "price_factor": 0.5},
+                {"key": "smodel", "display_name": " Sonus ", "enable": true, "price_factor": 3.2},
+                {"key": "cmodel", "display_name": "CANTUS", "enable": true, "price_factor": 3.2},
+                {"key": "ultimate", "display_name": "Ultimate", "enable": true, "price_factor": 1.6},
+                {"key": "performance", "display_name": "Performance", "enable": true, "price_factor": 1.1},
+                {"key": "efficient", "display_name": "Efficient", "enable": true, "price_factor": 0.3},
+                {"key": "keep_key", "display_name": "Keep Model", "enable": true, "price_factor": 0.1},
+            ],
+        });
+        let models = parse_catalog(&payload);
+        assert_eq!(models.len(), 1, "6 个下线模型必须全部过滤");
+        assert_eq!(text_of(&models[0], "id"), "KeepModel");
+        // 兜底表已删：resolve 双区都解析不到
+        for removed in ["Auto", "auto", "Sonus", "Cantus", "Ultimate", "Performance", "Efficient"] {
+            assert!(
+                resolve(removed, QoderRegion::Cn).is_none(),
+                "{removed} 不应再可解析"
+            );
+            assert!(
+                resolve(removed, QoderRegion::Global).is_none(),
+                "{removed} 不应再可解析"
+            );
+        }
+        // 并集目录也不含
+        let items = list();
+        assert!(
+            items
+                .iter()
+                .all(|m| !REMOVED_MODEL_IDS.contains(&text_of(m, "id").to_lowercase().as_str())),
+            "list() 不得包含下线模型"
+        );
+    }
+
+    /// 厂商标注回归：Step 5 Preview（阶跃星辰，产品确认）注入 vendor 键；
+    /// 未命中映射的模型不给 vendor 键（前端未命中显示 —）；
+    /// 连字符风格 display_name（Step-5-Preview）经 norm_model_id 折叠后仍命中
+    #[test]
+    fn vendor_annotation_for_step5_preview() {
+        let payload = json!({
+            "statusCodeValue": 200,
+            "chat": [
+                {"key": "step5model", "display_name": "Step 5 Preview", "enable": true, "price_factor": 1.0},
+                {"key": "qfmodel", "display_name": "Qwen3.8-Flash", "enable": true, "price_factor": 0.1},
+            ],
+        });
+        let models = parse_catalog(&payload);
+        let step = models
+            .iter()
+            .find(|m| text_of(m, "id") == "Step5Preview")
+            .expect("缺 Step 5 Preview");
+        assert_eq!(text_of(step, "vendor"), "阶跃星辰", "Step 5 Preview 为阶跃星辰模型");
+        let qwen = models
+            .iter()
+            .find(|m| text_of(m, "id") == "Qwen3.8-Flash")
+            .expect("缺 Qwen3.8-Flash");
+        assert!(qwen.get("vendor").is_none(), "未命中映射不给 vendor 键");
+
+        // 连字符风格漂移：对外 id 保留连字符（toModelId 只去空白），匹配层折叠命中
+        let hyphen = json!({
+            "statusCodeValue": 200,
+            "chat": [
+                {"key": "step5model", "display_name": "Step-5-Preview", "enable": true, "price_factor": 1.0},
+            ],
+        });
+        let models = parse_catalog(&hyphen);
+        let step = models
+            .iter()
+            .find(|m| text_of(m, "id") == "Step-5-Preview")
+            .expect("缺 Step-5-Preview（对外 id 保留连字符）");
+        assert_eq!(text_of(step, "vendor"), "阶跃星辰", "连字符风格 id 仍命中厂商映射");
     }
 
     /// P2 前缀误匹配回归：数字形态码必须做后随字符边界校验——

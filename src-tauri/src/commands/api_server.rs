@@ -804,6 +804,45 @@ pub fn wb_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Ve
     }
 }
 
+/// 返回运行中 Qoder 池的实时状态（Qoder「资源调度」页可观测，含 per-account
+/// inflight 在途计数）；服务未运行时返回空数组
+#[tauri::command]
+pub fn qoder_pool_status(runtime: State<'_, Mutex<Option<ApiServerRuntime>>>) -> Vec<PoolStatus> {
+    let guard = safe_lock(&runtime);
+    match guard.as_ref() {
+        Some(rt) => rt.shared.qoder_pool.status_list(),
+        None => vec![],
+    }
+}
+
+/// 手动同步 Qoder 模型目录（Qoder「资源调度」页；复用每日调度任务入口
+/// qoder_catalog::run_task，按池序逐可用账号拉取 CN 区 model/list 并原子采纳）。
+/// 返回采纳的模型数；无账号/无凭证返回 Ok(0) 语义的信息（与调度器静默跳过一致）
+#[tauri::command]
+pub async fn qoder_catalog_sync(state: State<'_, AppState>) -> Result<usize, String> {
+    // AppState 可 Clone 语义的字段快照（Arc 锁与真实状态共享，token 刷新互斥不失效）
+    let st = AppState {
+        data_dir: state.data_dir.clone(),
+        jwt_refresh_lock: state.inner().jwt_refresh_lock.clone(),
+        qoder_pool_lock: state.inner().qoder_pool_lock.clone(),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        // run_task 返回 json：{ok:true, models:n} 或 {ok:true, skipped:...}
+        let out = crate::tasks::qoder_catalog::run_task(&st)?;
+        if let Some(n) = out.get("models").and_then(serde_json::Value::as_u64) {
+            Ok(n as usize)
+        } else {
+            Err(out
+                .get("skipped")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("目录未更新")
+                .to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("同步任务执行失败: {e}"))?
+}
+
 /// 列出 API 日志可用日期列表
 #[tauri::command]
 pub fn api_logs_list(state: State<'_, AppState>) -> Vec<String> {

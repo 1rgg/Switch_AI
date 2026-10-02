@@ -1814,14 +1814,15 @@ mod tests {
         );
     }
 
-    /// 仅 Qoder 源模型（Sonus 为 Qoder 目录独有）+ 池健康 → Qoder 接管
+    /// 仅 Qoder 源模型（MiniMax-M2.7 为 Qoder 目录独有；Sonus 已按产品决策
+    /// 下线，见 qoder_upstream::REMOVED_MODEL_IDS）+ 池健康 → Qoder 接管
     #[test]
     fn t40_qoder_only_model_goes_qoder() {
         let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
         seed_qoder(&f);
-        let r = f.resolve("Sonus").unwrap();
+        let r = f.resolve("MiniMax-M2.7").unwrap();
         assert_eq!(r.pool, TargetPool::Qoder);
-        assert_eq!(r.model, "Sonus", "final model = 目录归一化 id");
+        assert_eq!(r.model, "MiniMax-M2.7", "final model = 目录归一化 id");
         assert!(r.fallback_from.is_none());
     }
 
@@ -1830,7 +1831,7 @@ mod tests {
     fn t41_qoder_only_disabled_errors() {
         let f = fixture(&["glm-5.3"], Some(&["hy4"]), Some(&policy_default()));
         assert_eq!(
-            f.resolve("Sonus").unwrap_err(),
+            f.resolve("MiniMax-M2.7").unwrap_err(),
             DispatchError::QoderDisabled
         );
     }
@@ -1844,7 +1845,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         // 池空 = 无健康账号（单源不跨池回退）
         assert_eq!(
-            f.resolve("Sonus").unwrap_err(),
+            f.resolve("MiniMax-M2.7").unwrap_err(),
             DispatchError::NoHealthy(TargetPool::Qoder)
         );
     }
