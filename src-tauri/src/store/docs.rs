@@ -214,12 +214,66 @@ pub fn sticky_bindings_load(s: &Store) -> Value {
     json!({ "version": 1, "bindings": rows })
 }
 
-/// 整表替换（save 的落库等价物；过期项由调用方 evict 后传入）
+/// 整表替换（save 的落库等价物；过期项由调用方 evict 后传入）。
+/// 多池并存时请用 [sticky_bindings_save_ns]（本函数仅遗留种子/单池场景使用）。
 pub fn sticky_bindings_save(s: &Store, root: &Value) -> Result<(), String> {
     let empty = Vec::new();
     let arr = root.get("bindings").and_then(Value::as_array).unwrap_or(&empty);
     s.with_conn(|c| {
         c.execute_batch("BEGIN; DELETE FROM sticky_bindings;")?;
+        {
+            let mut stmt = c.prepare(
+                "INSERT INTO sticky_bindings(key, uid, conv_id, last_seen, explicit, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, datetime('now','localtime'))",
+            )?;
+            for b in arr {
+                stmt.execute(rusqlite::params![
+                    b.get("key").and_then(Value::as_str).unwrap_or(""),
+                    b.get("uid").and_then(Value::as_str).unwrap_or(""),
+                    b.get("conv_id").and_then(Value::as_str).unwrap_or(""),
+                    b.get("last_seen").and_then(Value::as_i64).unwrap_or(0),
+                    (b.get("explicit").and_then(Value::as_bool).unwrap_or(false)) as i64,
+                ])?;
+            }
+        }
+        c.execute_batch("COMMIT;")?;
+        Ok(())
+    })
+    .or_else(|e| {
+        let _ = s.with_conn(|c| c.execute_batch("ROLLBACK;"));
+        Err(e)
+    })
+}
+
+/// 命名空间范围替换（F-80-余 v2 多池共用 sticky_bindings 表）：
+/// 仅删除并写入归属 `ns` 的键，其他命名空间（`other_ns`）的行原样保留——
+/// 多池 StickyStore 并存时整表替换会互删对方运行期新增的绑定（审查 P1）。
+/// 归属规则与 wb_sticky::owns_key 一致：ns 非空 = key 以 ns 前缀开头；
+/// ns 空 = key 不以任何 other_ns 前缀开头（other_ns 为空时退化为整表删除，
+/// 与 [sticky_bindings_save] 等价）。LIKE 模式由常量前缀经参数绑定构造，
+/// ns 不得含 LIKE 通配符 %/_（当前登记命名空间均满足）。
+pub fn sticky_bindings_save_ns(
+    s: &Store,
+    root: &Value,
+    ns: &str,
+    other_ns: &[&str],
+) -> Result<(), String> {
+    let empty = Vec::new();
+    let arr = root.get("bindings").and_then(Value::as_array).unwrap_or(&empty);
+    s.with_conn(|c| {
+        c.execute_batch("BEGIN;")?;
+        if ns.is_empty() && other_ns.is_empty() {
+            c.execute_batch("DELETE FROM sticky_bindings;")?;
+        } else if ns.is_empty() {
+            // 无前缀键（WB/遗留）：删除不属于任何已登记命名空间的行
+            let conds: Vec<String> = other_ns.iter().map(|_| "key LIKE ?".to_string()).collect();
+            let sql = format!("DELETE FROM sticky_bindings WHERE {}", conds.join(" AND "));
+            let mut stmt = c.prepare(&sql)?;
+            let patterns: Vec<String> = other_ns.iter().map(|p| format!("{}%", p)).collect();
+            stmt.execute(rusqlite::params_from_iter(patterns.iter()))?;
+        } else {
+            let mut stmt = c.prepare("DELETE FROM sticky_bindings WHERE key LIKE ?")?;
+            stmt.execute(rusqlite::params![format!("{}%", ns)])?;
+        }
         {
             let mut stmt = c.prepare(
                 "INSERT INTO sticky_bindings(key, uid, conv_id, last_seen, explicit, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, datetime('now','localtime'))",

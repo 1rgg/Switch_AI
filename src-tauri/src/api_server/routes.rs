@@ -2247,6 +2247,9 @@ mod tests {
             qoder_pool: super::super::pool::ApiPool::new(),
             qoder_enabled: std::sync::atomic::AtomicBool::new(true),
             qoder_identity: None,
+            qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_sticky: super::super::wb_sticky::StickyStore::default(),
         });
         WlFixture { dir, state }
     }

@@ -18,11 +18,14 @@
 //!    检测同构）；非流式：`aggregate_qoder` → 协议投影复用 wb_sse 转换器；
 //! 6. 用量记账（`record_usage_qoder` 独立 qoder 桶）+ 请求级日志。
 //!
-//! 与 wb_route 的差异（v1 精简项）：无会话粘性绑定（上游 session 由请求体
-//! session_seed 派生，粘性收益不同构）、无竞速对冲、无模板清洗、无工具代执行、
-//! 无 401 刷新重试（凭证新鲜度由 identity 回调按次解析兜住）。模型级冷却已
-//! 补齐（审查修复）：排队/超限类错误记录 model → 冷却截止，dispatch 预检
-//! 快速回退、执行路径跳过同号退避（见下方「模型级冷却」节）。
+//! 与 wb_route 的差异（v2）：**会话粘性**（F-80-余 v2，开关默认关）与**竞速对冲**
+//! （F-80-余 v2，阈值热参数默认 8s）已按 WB 同构补齐——粘性命中锁定账号（busy
+//! 且有空闲候选时让位，F-77④），同账号 + 同种子派生同一上游 session_id 保住
+//! 会话侧复用；对冲在原始行源层竞速，胜者行源统一经 QoderTranslate 翻译。仍无
+//! 模板清洗、无工具代执行、无 401 刷新重试（凭证新鲜度由 identity 回调按次解析
+//! 兜住）。模型级冷却已补齐（审查修复）：排队/超限类错误记录 model → 冷却截止，
+//! dispatch 预检快速回退、执行路径跳过同号退避（见下方「模型级冷却」节）。
+//! 对冲接管后排队同号退避不适用（重试凭证/请求体属主账号，与生效账号不一致）。
 //!
 //! 客户端断连：与 wb_route 同款三层检测（轮换/重试入口 tx.is_closed、停滞期
 //! next_event_polling 轮询、活跃流逐事件顶部检测）。
@@ -39,6 +42,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use super::retry::{retry_plan, RetryAction};
 use super::wb_sse;
+use super::wb_sticky::SessionKey;
+use super::wb_upstream::{lines_with_first_byte_hedged, lines_with_first_byte_timeout, InterruptibleLines};
 use super::{ApiSharedState, ErrKind, InflightGuard};
 use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
 use crate::tasks::qoder_common::QoderCreds;
@@ -177,6 +182,147 @@ fn safe_slice(s: &str, n: usize) -> &str {
     &s[..end]
 }
 
+// ==================== F-80-余 v2 慢请求竞速对冲（取号侧编排，wb_route 同构） ====================
+
+/// 对冲账号在途计数租约（镜像 wb_route::HedgeLease）：构造即 +1（竞速窗口
+/// 占用），Drop 即 -1——建连/凭证解析失败（闭包内提前返回）、双败、竞速胜出
+/// 三类退出路径均恰好释放一次，杜绝计数泄漏导致的账号永久 busy
+struct QoderHedgeLease {
+    uid: String,
+    counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl QoderHedgeLease {
+    fn acquire(state: &ApiSharedState, uid: &str) -> Self {
+        let counter = state.qoder_pool.inflight_handle(uid);
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self { uid: uid.to_string(), counter }
+    }
+}
+
+impl Drop for QoderHedgeLease {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 首字竞速胜者信息：**原始未翻译**上游行源（Qoder 双层信封翻译在竞速落定后
+/// 统一进行，胜者行源经 QoderTranslate 转换）+ 生效账号 + 对冲计数租约
+struct QoderRaceWin {
+    lines: Box<dyn std::iter::Iterator<Item = String> + Send>,
+    uid: String,
+    hedge: Option<QoderHedgeLease>,
+    takeover: bool,
+}
+
+/// 首字竞速（F-80-余 v2，镜像 wb_route::race_first_byte）：对冲关闭（阈值 0）
+/// 时与纯首字超时语义完全一致；开启时主请求首字节超阈值 → 从池内取第二账号
+/// （走同一 busy 过滤——主账号已 inflight 天然让位，受 F-77 并发上限约束）
+/// 发对冲请求，先出首字者胜。对冲请求独立解析凭证（identity 回调）并按对冲
+/// 账号 uid 重建 agent 信封（session 派生依赖 uid）。
+#[allow(clippy::too_many_arguments)]
+fn race_qoder_first_byte(
+    state: &Arc<ApiSharedState>,
+    primary_uid: &str,
+    primary_reader: Box<dyn std::io::Read + Send>,
+    peek: &Value,
+    entry: &Value,
+    model_key: &str,
+    model_source: &str,
+    tried: &HashSet<String>,
+    allowed: Option<&HashSet<String>>,
+    dedicated: Option<&str>,
+) -> Result<QoderRaceWin, ()> {
+    let hedge_ms = state
+        .qoder_hedge_threshold_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if hedge_ms == 0 {
+        let lines = lines_with_first_byte_timeout(primary_reader)?;
+        return Ok(QoderRaceWin {
+            lines,
+            uid: primary_uid.to_string(),
+            hedge: None,
+            takeover: false,
+        });
+    }
+    let state2 = state.clone();
+    let tried2 = tried.clone();
+    let allowed2 = allowed.cloned();
+    let dedicated2 = dedicated.map(str::to_string);
+    let peek2 = peek.clone();
+    let entry2 = entry.clone();
+    let mk2 = model_key.to_string();
+    let ms2 = model_source.to_string();
+    let spawn_backup = move || -> Option<(Box<dyn std::io::Read + Send>, QoderHedgeLease)> {
+        let (picked2, ev) = state2
+            .qoder_pool
+            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref())?;
+        // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
+        if let Some(ev) = ev {
+            state2.logger.log_sched_event(&ev);
+        }
+        // 租约先于凭证解析获取：失败路径随闭包局部变量 Drop 自动 -1
+        let lease = QoderHedgeLease::acquire(&state2, &picked2.uid);
+        let creds2 = (state2.qoder_identity.as_ref()? )(&picked2.uid).ok()?;
+        let converted2 = qoder_upstream::prepare_qoder_body(&peek2, &entry2, &creds2.uid).ok()?;
+        let reader2 = qoder_upstream::make_qoder_request(&creds2, &converted2, &mk2, &ms2).ok()?;
+        Some((reader2, lease))
+    };
+    match lines_with_first_byte_hedged(primary_reader, hedge_ms, spawn_backup) {
+        Ok(out) => {
+            let uid = if out.takeover {
+                out.hedge
+                    .as_ref()
+                    .map(|l| l.uid.clone())
+                    .unwrap_or_else(|| primary_uid.to_string())
+            } else {
+                primary_uid.to_string()
+            };
+            Ok(QoderRaceWin { lines: out.lines, uid, hedge: out.hedge, takeover: out.takeover })
+        }
+        Err(()) => Err(()),
+    }
+}
+
+/// 竞速结束后处理对冲计数与日志（镜像 wb_route::settle_hedge）：
+/// 释放对冲账号竞速窗口占用；接管时 guard 重绑到对冲账号；[SCHED] 日志记录
+/// hedge_takeover / hedge_lost
+fn settle_qoder_hedge(
+    state: &ApiSharedState,
+    win: &mut QoderRaceWin,
+    mut guard: InflightGuard,
+    primary_uid: &str,
+) -> InflightGuard {
+    let Some(lease) = win.hedge.take() else {
+        return guard;
+    };
+    let hedge_uid = lease.uid.as_str();
+    if win.takeover {
+        state
+            .logger
+            .log_sched_event(&format!("hedge_takeover primary={} hedge={}", primary_uid, hedge_uid));
+        guard = guard.bind_account(lease.counter.clone());
+    } else {
+        state
+            .logger
+            .log_sched_event(&format!("hedge_lost primary={} hedge={}", primary_uid, hedge_uid));
+    }
+    drop(lease);
+    guard
+}
+
+/// 竞速胜者原始行源 → 翻译为 OpenAI chunk 行 → 可中断行源（对冲开启路径）。
+/// 对冲关闭时 run_* 直接走 open_qoder_stream（等价实现，少一层迭代器包装）
+fn translate_race_lines(
+    win: QoderRaceWin,
+    err_slot: Arc<Mutex<Option<ErrMeta>>>,
+    chat_id: &str,
+    model: &str,
+) -> InterruptibleLines {
+    let translated = qoder_upstream::QoderTranslate::new(win.lines, err_slot, chat_id, model);
+    InterruptibleLines::from_iterator(Box::new(translated))
+}
+
 // ==================== 流式入口 ====================
 
 /// Qoder 流式对话（routes.rs 各协议端点 TargetPool::Qoder 分支调用）
@@ -296,6 +442,48 @@ fn run_qoder_stream(
         .and_then(|k| k.pool_constraints("qoder"))
         .map_or((None, None), |c| (c.allowed, c.dedicated));
 
+    // F-80-余 v2 会话粘性（开关关闭时恒 None，v1 轮换行为零变化）：粘性命中且
+    // 账号在池 → 首选粘住账号（busy 且有空闲候选时让位，F-77④ 同构）；子 Key
+    // 限定上游不含粘性账号时忽略粘性。同账号 + 同种子派生同一上游 session_id
+    //（prepare_qoder_body session_id_for），粘住账号即保住上游会话侧复用
+    let sticky_key = SessionKey::from_body(&peek);
+    let sticky0: Option<String> = if state
+        .qoder_sticky_enabled
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        state
+            .qoder_sticky
+            .resolve(&sticky_key, now_ts())
+            .and_then(|b| {
+                if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
+                    return None;
+                }
+                state.qoder_pool.pick_by_uid(&b.uid).map(|_| b.uid)
+            })
+    } else {
+        None
+    };
+    // 绑定回写用会话种子（仅落库留档；session 由 body 构造时按 uid+seed 派生）
+    let sticky_seed: String = peek
+        .get("session_id")
+        .and_then(Value::as_str)
+        .or_else(|| peek.get("user").and_then(Value::as_str))
+        .unwrap_or("-")
+        .to_string();
+
+    // 首选：粘性 > 调度策略（F-77④：粘性账号 busy 且有空闲候选时让位）
+    let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
+        state
+            .qoder_pool
+            .pick_sticky_yield(u, allowed_set.as_ref())
+            .map(|(p, ev)| {
+                if let Some(ev) = ev {
+                    state.logger.log_sched_event(&ev);
+                }
+                p
+            })
+    });
+
     let mut tried: HashSet<String> = HashSet::new();
 
     loop {
@@ -303,29 +491,33 @@ fn run_qoder_stream(
         if tx.is_closed() {
             return;
         }
-        let picked = match state
-            .qoder_pool
-            .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
-        {
-            Some((p, ev)) => {
-                if let Some(ev) = ev {
-                    state.logger.log_sched_event(&ev);
+        // ── 取号：粘性命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
+        let picked = match first_pick.take() {
+            Some(p) => p,
+            None => match state
+                .qoder_pool
+                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+            {
+                Some((p, ev)) => {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
                 }
-                p
-            }
-            None => {
-                let duration_ms = start_ts.elapsed().as_millis() as u64;
-                state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0);
-                state.logger.log_request(
-                    "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
-                    duration_ms, &key_name, "", Some("no healthy account"),
-                );
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from(
-                    "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
-                )));
-                let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
-                return;
-            }
+                None => {
+                    let duration_ms = start_ts.elapsed().as_millis() as u64;
+                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0);
+                    state.logger.log_request(
+                        "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
+                        duration_ms, &key_name, "", Some("no healthy account"),
+                    );
+                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(
+                        "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
+                    )));
+                    let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                    return;
+                }
+            },
         };
         tried.insert(picked.uid.clone());
         // 当前账号排队重试计数（账号局部：换号自然重置）
@@ -376,6 +568,11 @@ fn run_qoder_stream(
         };
 
         let mut same_attempt: u32 = 0;
+        // 对冲接管标记（本轮尝试内有效）：接管后排队同号退避不再适用——
+        // 退避重试走主账号 creds/converted，与生效（对冲）账号不一致。
+        // 初值在 Ok 分支必然先赋值后读取，lint 对初值误报，显式允许
+        #[allow(unused_assignments)]
+        let mut hedge_taken = false;
         loop {
             // 断连检测：重试等待/长路径期间离开则终止（guard 随 Drop 释放）
             if tx.is_closed() {
@@ -388,20 +585,34 @@ fn run_qoder_stream(
                 &model_source,
             ) {
                 Ok(reader) => {
-                    // 首字超时 10s：超时视为上游故障 → 换号（同 run_wb_stream 语义）
+                    // 首字超时 10s：超时视为上游故障 → 换号（同 run_wb_stream 语义）；
+                    // F-80-余 v2 慢请求竞速对冲：首字超阈值向第二账号发对冲请求，
+                    // 先出首字者胜（对冲关闭时与纯首字超时语义一致）
                     let err_slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
-                    let ilines = match qoder_upstream::open_qoder_stream(
+                    let mut race = match race_qoder_first_byte(
+                        state,
+                        &picked.uid,
                         reader,
-                        err_slot.clone(),
-                        chat_id,
-                        model,
+                        &peek,
+                        &entry,
+                        &model_key,
+                        &model_source,
+                        &tried,
+                        allowed_set.as_ref(),
+                        dedicated.as_deref(),
                     ) {
-                        Ok(l) => l,
+                        Ok(w) => w,
                         Err(()) => {
                             state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
                             break;
                         }
                     };
+                    // 对冲计数落定 + guard 重绑（接管时生效账号 = 对冲账号）
+                    guard = settle_qoder_hedge(state, &mut race, guard, &picked.uid);
+                    hedge_taken = race.takeover;
+                    let win_uid = race.uid.clone();
+                    // 竞速胜者行源（原始上游行）统一翻译后喂 stream_forward_ex
+                    let ilines = translate_race_lines(race, err_slot.clone(), chat_id, model);
                     let (error_info, sent_any, failed_inline, usage) =
                         wb_sse::stream_forward_ex(ilines, tx, proto, chat_id, model);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
@@ -422,7 +633,7 @@ fn run_qoder_stream(
                         .unwrap_or((0, 0));
                     state.record_usage_qoder(
                         model,
-                        &picked.uid,
+                        &win_uid,
                         key_id,
                         error_info.is_none() && !failed_inline,
                         true,
@@ -435,9 +646,11 @@ fn run_qoder_stream(
                             // 流内错误分类以 ErrMeta 为准（translate 写入，含排队/额度信号）
                             match meta.as_ref().map(|m| m.kind) {
                                 Some(UpstreamKind::Queued) => {
-                                    // 排队：同号退避重试为主；若该模型已被并发
-                                    // 请求记入冷却，则下方直接 break 换号（快速失败）
-                                    if !sent_any && queue_same < QUEUE_RETRY_LIMIT {
+                                    // 排队：同号退避重试为主（对冲接管后不适用——重试
+                                    // 凭证/请求体属主账号，与生效账号不一致，直接换号）；
+                                    // 若该模型已被并发请求记入冷却，则直接 break 换号
+                                    //（快速失败）
+                                    if !sent_any && !hedge_taken && queue_same < QUEUE_RETRY_LIMIT {
                                         let secs = meta
                                             .as_ref()
                                             .and_then(|m| m.queue.as_ref())
@@ -462,16 +675,16 @@ fn run_qoder_stream(
                                 Some(kind) => {
                                     let ek = kind.to_err_kind();
                                     if ek != ErrKind::None {
-                                        state.qoder_pool.note_error(&picked.uid, ek);
+                                        state.qoder_pool.note_error(&win_uid, ek);
                                     }
                                     *safe_lock(&state.last_error) = Some(format!(
                                         "qoder uid={} code={} msg={}",
-                                        picked.uid, code, msg
+                                        win_uid, code, msg
                                     ));
                                 }
                                 None => {
                                     // translate 之外的错误帧（理论不可达）：按 Server 熔断
-                                    state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                                    state.qoder_pool.note_error(&win_uid, ErrKind::Server);
                                 }
                             }
                             if !sent_any {
@@ -480,8 +693,8 @@ fn run_qoder_stream(
                             }
                             state.logger.log_request(
                                 "qoder", "POST", "/v1/chat/completions", model, true, 200,
-                                &picked.uid, duration_ms, &key_name,
-                                &state.qoder_pool.name_of(&picked.uid), Some(&msg),
+                                &win_uid, duration_ms, &key_name,
+                                &state.qoder_pool.name_of(&win_uid), Some(&msg),
                             );
                             return; // 已有数据流出：就地收尾
                         }
@@ -490,18 +703,27 @@ fn run_qoder_stream(
                                 // 流内失败已就地透传客户端：不重试不记账冷却（同 wb_route）
                                 state.logger.log_request(
                                     "qoder", "POST", "/v1/chat/completions", model, true, 200,
-                                    &picked.uid, duration_ms, &key_name,
-                                    &state.qoder_pool.name_of(&picked.uid),
+                                    &win_uid, duration_ms, &key_name,
+                                    &state.qoder_pool.name_of(&win_uid),
                                     Some("流内失败已透传客户端"),
                                 );
                                 return;
                             }
                             clear_model_cooldown(model); // 审查修复：成功即清模型级冷却
-                            state.qoder_pool.note_success(&picked.uid);
+                            state.qoder_pool.note_success(&win_uid);
+                            // F-80-余 v2：绑定粘性会话（开关开启时；Mutex 内 re-check
+                            // 防 TOCTOU 由 StickyStore::bind 保证）
+                            if state
+                                .qoder_sticky_enabled
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                            {
+                                state.qoder_sticky.bind(&sticky_key, &win_uid, &sticky_seed, now_ts());
+                                state.qoder_sticky.save(&state.data_dir);
+                            }
                             state.logger.log_request(
                                 "qoder", "POST", "/v1/chat/completions", model, true, 200,
-                                &picked.uid, duration_ms, &key_name,
-                                &state.qoder_pool.name_of(&picked.uid), None,
+                                &win_uid, duration_ms, &key_name,
+                                &state.qoder_pool.name_of(&win_uid), None,
                             );
                             return;
                         }
@@ -635,33 +857,74 @@ pub async fn qoder_aggregate_chat(
                 .and_then(|k| k.pool_constraints("qoder"))
                 .map_or((None, None), |c| (c.allowed, c.dedicated));
 
-        let mut tried: HashSet<String> = HashSet::new();
-
-        loop {
-            let picked = match state.qoder_pool.pick_excluding_constrained_ev(
-                &tried,
-                allowed_set.as_ref(),
-                dedicated.as_deref(),
-            ) {
-                Some((p, ev)) => {
+        // F-80-余 v2 会话粘性（同 run_qoder_stream；开关关闭恒 None 保持 v1 行为）
+        let sticky_key = SessionKey::from_body(&peek);
+        let sticky0: Option<String> = if state
+            .qoder_sticky_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            state
+                .qoder_sticky
+                .resolve(&sticky_key, now_ts())
+                .and_then(|b| {
+                    if allowed_set.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
+                        return None;
+                    }
+                    state.qoder_pool.pick_by_uid(&b.uid).map(|_| b.uid)
+                })
+        } else {
+            None
+        };
+        let sticky_seed: String = peek
+            .get("session_id")
+            .and_then(Value::as_str)
+            .or_else(|| peek.get("user").and_then(Value::as_str))
+            .unwrap_or("-")
+            .to_string();
+        // 首选：粘性 > 调度策略（F-77④：粘性账号 busy 且有空闲候选时让位）
+        let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
+            state
+                .qoder_pool
+                .pick_sticky_yield(u, allowed_set.as_ref())
+                .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
                     }
                     p
-                }
-                None => {
-                    state.record_usage_qoder(
-                        &model,
-                        "none",
-                        &key_id,
-                        false,
-                        stream,
-                        start_ts.elapsed().as_millis() as u64,
-                        0,
-                        0,
-                    );
-                    return Err("no healthy account available".to_string());
-                }
+                })
+        });
+
+        let mut tried: HashSet<String> = HashSet::new();
+
+        loop {
+            // ── 取号：粘性命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
+            let picked = match first_pick.take() {
+                Some(p) => p,
+                None => match state.qoder_pool.pick_excluding_constrained_ev(
+                    &tried,
+                    allowed_set.as_ref(),
+                    dedicated.as_deref(),
+                ) {
+                    Some((p, ev)) => {
+                        if let Some(ev) = ev {
+                            state.logger.log_sched_event(&ev);
+                        }
+                        p
+                    }
+                    None => {
+                        state.record_usage_qoder(
+                            &model,
+                            "none",
+                            &key_id,
+                            false,
+                            stream,
+                            start_ts.elapsed().as_millis() as u64,
+                            0,
+                            0,
+                        );
+                        return Err("no healthy account available".to_string());
+                    }
+                },
             };
             tried.insert(picked.uid.clone());
             // 当前账号排队重试计数（账号局部：换号自然重置）
@@ -688,6 +951,9 @@ pub async fn qoder_aggregate_chat(
             };
 
             let mut same_attempt: u32 = 0;
+            // 对冲接管标记：接管后排队同号退避不适用（重试凭证/请求体属主账号）
+            #[allow(unused_assignments)]
+            let mut hedge_taken = false;
             loop {
                 match qoder_upstream::make_qoder_request(
                     &creds,
@@ -697,19 +963,36 @@ pub async fn qoder_aggregate_chat(
                 ) {
                     Ok(reader) => {
                         let err_slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
-                        // 首字超时 10s：超时视为上游故障 → 换号
-                        let (resp, error) = match qoder_upstream::aggregate_qoder(
+                        // 首字超时 10s + F-80-余 v2 竞速对冲（对冲关闭时与纯首字
+                        // 超时语义一致）：超时/双败视为上游故障 → 换号
+                        let mut race = match race_qoder_first_byte(
+                            &state,
+                            &picked.uid,
                             reader,
-                            err_slot.clone(),
-                            &format!("chatcmpl-{}", now_ts()),
-                            &model,
+                            &peek,
+                            &entry,
+                            &model_key,
+                            &model_source,
+                            &tried,
+                            allowed_set.as_ref(),
+                            dedicated.as_deref(),
                         ) {
-                            Ok(pair) => pair,
+                            Ok(w) => w,
                             Err(()) => {
                                 state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
                                 break;
                             }
                         };
+                        // 对冲计数落定 + guard 重绑（接管时生效账号 = 对冲账号）
+                        guard = settle_qoder_hedge(&state, &mut race, guard, &picked.uid);
+                        hedge_taken = race.takeover;
+                        let win_uid = race.uid.clone();
+                        // 竞速胜者原始行源 → 翻译 → 聚合（tool_calls 合并/usage 收集）；
+                        // 首字超时已在 race 内裁定，聚合阶段无失败通道
+                        let agg_chat_id = format!("chatcmpl-{}", now_ts());
+                        let translated =
+                            qoder_upstream::QoderTranslate::new(race.lines, err_slot.clone(), &agg_chat_id, &model);
+                        let (resp, error) = wb_sse::aggregate(translated, &agg_chat_id);
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error) {
                             (Some(mut r), None) => {
@@ -728,14 +1011,22 @@ pub async fn qoder_aggregate_chat(
                                     })
                                     .unwrap_or((0, 0));
                                 state.record_usage_qoder(
-                                    &model, &picked.uid, &key_id, true, stream, duration_ms, pt, ct,
+                                    &model, &win_uid, &key_id, true, stream, duration_ms, pt, ct,
                                 );
                                 clear_model_cooldown(&model); // 审查修复：成功即清模型级冷却
-                                state.qoder_pool.note_success(&picked.uid);
+                                state.qoder_pool.note_success(&win_uid);
+                                // F-80-余 v2：绑定粘性会话（开关开启时；同流式路径）
+                                if state
+                                    .qoder_sticky_enabled
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    state.qoder_sticky.bind(&sticky_key, &win_uid, &sticky_seed, now_ts());
+                                    state.qoder_sticky.save(&state.data_dir);
+                                }
                                 state.logger.log_request(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
-                                    &picked.uid, duration_ms, &key_name,
-                                    &state.qoder_pool.name_of(&picked.uid), None,
+                                    &win_uid, duration_ms, &key_name,
+                                    &state.qoder_pool.name_of(&win_uid), None,
                                 );
                                 return Ok(r);
                             }
@@ -746,9 +1037,10 @@ pub async fn qoder_aggregate_chat(
                                     .clone();
                                 match meta.as_ref().map(|m| m.kind) {
                                     Some(UpstreamKind::Queued) => {
-                                        // 排队：同号退避重试为主；模型已在冷却中
+                                        // 排队：同号退避重试为主（对冲接管后不适用，
+                                        // 同流式路径——直接换号）；模型已在冷却中
                                         // 则 break 换号（快速失败，见下方冷却检查）
-                                        if queue_same < QUEUE_RETRY_LIMIT {
+                                        if !hedge_taken && queue_same < QUEUE_RETRY_LIMIT {
                                             let secs = meta
                                                 .as_ref()
                                                 .and_then(|m| m.queue.as_ref())
@@ -770,31 +1062,31 @@ pub async fn qoder_aggregate_chat(
                                     Some(kind) => {
                                         let ek = kind.to_err_kind();
                                         if ek != ErrKind::None {
-                                            state.qoder_pool.note_error(&picked.uid, ek);
+                                            state.qoder_pool.note_error(&win_uid, ek);
                                         }
                                     }
                                     None => {
-                                        state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                                        state.qoder_pool.note_error(&win_uid, ErrKind::Server);
                                     }
                                 }
                                 *safe_lock(&state.last_error) = Some(format!(
                                     "qoder uid={} code={} msg={}",
-                                    picked.uid, code, msg
+                                    win_uid, code, msg
                                 ));
                                 state.logger.log_request(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
-                                    &picked.uid, duration_ms, &key_name,
-                                    &state.qoder_pool.name_of(&picked.uid), Some(&msg),
+                                    &win_uid, duration_ms, &key_name,
+                                    &state.qoder_pool.name_of(&win_uid), Some(&msg),
                                 );
                                 // 流内错误且未产出内容 → 换号重试
                                 break;
                             }
                             _ => {
-                                state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                                state.qoder_pool.note_error(&win_uid, ErrKind::Server);
                                 state.logger.log_request(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream, 502,
-                                    &picked.uid, duration_ms, &key_name,
-                                    &state.qoder_pool.name_of(&picked.uid),
+                                    &win_uid, duration_ms, &key_name,
+                                    &state.qoder_pool.name_of(&win_uid),
                                     Some("empty response"),
                                 );
                                 break;

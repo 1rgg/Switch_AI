@@ -575,6 +575,10 @@ export interface ApiPoolFile {
   wb_sticky_ttl_secs?: number;
   /** Qoder 上游开关（p3-3）：开启后 Qoder 目录模型路由到 Qoder 账号池（默认关） */
   qoder_enabled?: boolean;
+  /** Qoder 竞速对冲阈值毫秒（F-80-余 v2）：首字节超阈值向第二账号发对冲请求；0 = 关闭 */
+  qoder_hedge_threshold_ms?: number;
+  /** Qoder 会话粘性开关（F-80-余 v2）：同会话 TTL 内绑定同一 Qoder 账号（默认关） */
+  qoder_sticky_enabled?: boolean;
 }
 
 /** CC Switch 协同状态（T5.7/F-43） */
@@ -1265,6 +1269,8 @@ export interface QoderPoolImportResult {
   with_credentials: number;
   /** 被拒绝的条目（id + 原因），非空时前端需提示 */
   rejected?: { id: string; reason: string }[];
+  /** F-80-余 v2 迁移提示：true = 历史明文含凭证文件，建议重新以加密格式导出归档 */
+  plaintext_credentials?: boolean;
 }
 
 /** 环境重置清单项（M4：8 项语义块，与 WbResetItem 同构） */
@@ -1329,6 +1335,8 @@ export interface QoderCheckinRecord {
   status: string;
   message: string;
   reward?: number;
+  /** 逐活动明细（F-80-余 v2 档期日历；历史记录无此字段） */
+  campaigns?: { id?: string; name?: string; kind?: string; reward?: number | null }[];
 }
 
 export interface QoderCreditPackage {

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { CheckCircle2, Gift, PlayCircle, RefreshCw, XCircle } from 'lucide-react';
+import { CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, Gift, PlayCircle, RefreshCw, XCircle } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
@@ -82,15 +82,23 @@ export default function QoderCheckin() {
   const [checkinMap, setCheckinMap] = useState<Map<string, QoderCheckinRecord[]>>(new Map());
   const [refreshing, setRefreshing] = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
+  // F-80-余 v2 档期日历：90 天签到结果 + 月份切换 + 选中日详情
+  const [history, setHistory] = useState<QoderCheckinRecord[]>([]);
+  const [calMonth, setCalMonth] = useState(() => {
+    const d = new Date();
+    return { y: d.getFullYear(), m: d.getMonth() };
+  });
+  const [selectedDay, setSelectedDay] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
       const [accs, recs] = await Promise.all([
         api.qoder.accountsList().catch(() => [] as QoderAccountView[]),
-        api.qoder.checkinResults(1).catch(() => [] as QoderCheckinRecord[]),
+        api.qoder.checkinResults(90).catch(() => [] as QoderCheckinRecord[]),
       ]);
       setAccounts(accs);
+      setHistory(recs);
       const today = new Date();
       const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
       const m = new Map<string, QoderCheckinRecord[]>();
@@ -190,6 +198,93 @@ export default function QoderCheckin() {
 
   const earned = Math.round(lines.reduce((s, l) => s + (l.reward ?? 0), 0) * 100) / 100;
 
+  // ── 档期日历聚合（F-80-余 v2）：按日聚合账号状态 / 逐活动状态 / 奖励合计 ──
+  const calCells = useMemo(() => {
+    const first = new Date(calMonth.y, calMonth.m, 1);
+    const daysInMonth = new Date(calMonth.y, calMonth.m + 1, 0).getDate();
+    const cells: { day: number; date: string }[] = [];
+    for (let d = 1; d <= daysInMonth; d++) {
+      cells.push({
+        day: d,
+        date: `${calMonth.y}-${String(calMonth.m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`,
+      });
+    }
+    return { lead: first.getDay(), cells };
+  }, [calMonth]);
+
+  const dayStats = useMemo(() => {
+    const byDay = new Map<string, QoderCheckinRecord[]>();
+    for (const r of history) {
+      const arr = byDay.get(r.date) ?? [];
+      arr.push(r);
+      byDay.set(r.date, arr);
+    }
+    const stats = new Map<
+      string,
+      { total: number; ok: number; fail: number; reward: number; camps: Map<string, { ok: number; fail: number }> }
+    >();
+    for (const [date, recs] of byDay) {
+      const ok = recs.filter((r) => r.status === 'success' || r.status === 'already').length;
+      const fail = recs.filter((r) => r.status === 'fail').length;
+      // 逐活动聚合（仅升级后记录带 campaigns；历史记录按整体状态渲染）。
+      // auth（401 登录态中断）为瞬态条目：不计入活动状态点（避免 ok=0/fail=0
+      // 被误渲染为「已领」绿点），明细视图单独标注
+      const camps = new Map<string, { ok: number; fail: number }>();
+      for (const r of recs) {
+        for (const c of r.campaigns ?? []) {
+          if (c.kind === 'auth') continue;
+          const key = c.name || c.id || '活动';
+          const cur = camps.get(key) ?? { ok: 0, fail: 0 };
+          if (c.kind === 'success' || c.kind === 'already') cur.ok += 1;
+          else if (c.kind === 'fail') cur.fail += 1;
+          camps.set(key, cur);
+        }
+      }
+      // 奖励合计：与「今日获得」同口径，但按账号分桶去重——跨账号同额
+      //（双活动均 100）的 already 不得误杀他账号的真实入账（审查 #5）
+      const byAccount = new Map<string, QoderCheckinRecord[]>();
+      for (const r of recs) {
+        const arr = byAccount.get(r.user_id) ?? [];
+        arr.push(r);
+        byAccount.set(r.user_id, arr);
+      }
+      let reward = 0;
+      for (const recsA of byAccount.values()) {
+        const real = recsA.filter((r) => r.status !== 'already' && r.reward != null);
+        const realAmts = new Set(real.map((r) => r.reward));
+        reward += real.reduce((s, r) => s + (r.reward ?? 0), 0);
+        const seenAlready = new Set<number>();
+        for (const r of recsA) {
+          if (r.status !== 'already' || r.reward == null) continue;
+          if (realAmts.has(r.reward) || seenAlready.has(r.reward)) continue;
+          seenAlready.add(r.reward);
+          reward += r.reward;
+        }
+      }
+      stats.set(date, { total: recs.length, ok, fail, reward: Math.round(reward * 100) / 100, camps });
+    }
+    return stats;
+  }, [history]);
+
+  const monthBounds = useMemo(() => {
+    const now = new Date();
+    const earliest = new Date(now.getTime() - 90 * 86400000);
+    return { minY: earliest.getFullYear(), minM: earliest.getMonth(), maxY: now.getFullYear(), maxM: now.getMonth() };
+  }, []);
+  const canPrev = calMonth.y > monthBounds.minY || calMonth.m > monthBounds.minM;
+  const canNext = calMonth.y < monthBounds.maxY || calMonth.m < monthBounds.maxM;
+  const shiftMonth = (delta: number) => {
+    setCalMonth(({ y, m }) => {
+      const nm = m + delta;
+      return { y: y + Math.floor(nm / 12), m: ((nm % 12) + 12) % 12 };
+    });
+  };
+  const selectedRecords = selectedDay ? history.filter((r) => r.date === selectedDay) : [];
+
+  /** 日格状态点颜色：绿=全部已领 / 琥珀=部分失败 / 红=全部失败 / 灰=无有效活动数据 */
+  const dotToneOf = (ok: number, fail: number): string =>
+    fail === 0 ? (ok > 0 ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-zinc-600') : ok > 0 ? 'bg-amber-500' : 'bg-rose-500';
+
   return (
     <div className="animate-fade-in">
       <PageHeader title="Qoder · 每日签到" desc="每天自动领取「签到」与「登录」两项奖励，重复执行不重复领" />
@@ -218,6 +313,131 @@ export default function QoderCheckin() {
           调度默认每天 10:15 自动执行一次（此时两项活动都已开放）；支持应用内定时与 Windows
           计划任务双轨，时刻可在环境配置修改。已领过的账号自动跳过，重复执行不会重复领取。
         </p>
+      </div>
+
+      {/* 活动档期日历（F-80-余 v2）：双活动领取结果按日可视化，辅助校验排期决策 */}
+      <div className="mt-4 card p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <CalendarDays size={16} className="text-violet-500" />
+            <span className="text-sm font-medium">活动档期日历</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <button className="btn-outline px-2 py-1" onClick={() => shiftMonth(-1)} disabled={!canPrev}>
+              <ChevronLeft size={14} />
+            </button>
+            <span className="min-w-[88px] text-center text-sm tabular-nums">
+              {calMonth.y} 年 {calMonth.m + 1} 月
+            </span>
+            <button className="btn-outline px-2 py-1" onClick={() => shiftMonth(1)} disabled={!canNext}>
+              <ChevronRight size={14} />
+            </button>
+          </div>
+        </div>
+        <div className="grid grid-cols-7 gap-1">
+          {['日', '一', '二', '三', '四', '五', '六'].map((w) => (
+            <div key={w} className="pb-1 text-center text-[11px] text-slate-400">
+              {w}
+            </div>
+          ))}
+          {Array.from({ length: calCells.lead }).map((_, i) => (
+            <div key={`lead-${i}`} />
+          ))}
+          {calCells.cells.map(({ day, date }) => {
+            const st = dayStats.get(date);
+            const campList = [...(st?.camps.entries() ?? [])];
+            const isToday = date === new Date().toLocaleDateString('sv-SE');
+            return (
+              <button
+                key={date}
+                onClick={() => setSelectedDay(selectedDay === date ? null : date)}
+                className={`flex min-h-[52px] flex-col items-center justify-between rounded-lg border px-1 py-1 transition ${
+                  selectedDay === date
+                    ? 'border-brand-400 bg-brand-50/60 dark:border-brand-500/60 dark:bg-brand-500/10'
+                    : 'border-slate-100 hover:border-slate-300 dark:border-zinc-800 dark:hover:border-zinc-600'
+                }`}
+              >
+                <span
+                  className={`text-[11px] tabular-nums ${
+                    isToday ? 'font-bold text-brand-600 dark:text-brand-400' : 'text-slate-500 dark:text-zinc-400'
+                  }`}
+                >
+                  {day}
+                </span>
+                <span className="flex items-center gap-0.5">
+                  {st && campList.length > 0
+                    ? campList.slice(0, 2).map(([name, c]) => (
+                        <span
+                          key={name}
+                          title={`${name}：${c.fail > 0 ? `${c.ok} 成功 / ${c.fail} 失败` : `${c.ok} 账号全部已领`}`}
+                          className={`h-1.5 w-1.5 rounded-full ${dotToneOf(c.ok, c.fail)}`}
+                        />
+                      ))
+                    : st
+                    ? <span className={`h-1.5 w-1.5 rounded-full ${dotToneOf(st.ok, st.fail)}`} />
+                    : null}
+                </span>
+                <span className="text-[10px] tabular-nums text-emerald-600 dark:text-emerald-400">
+                  {st && st.reward > 0 ? `+${st.reward}` : ''}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-400">
+          <span className="flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />全部账号已领</span>
+          <span className="flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-amber-500" />部分失败</span>
+          <span className="flex items-center gap-1"><span className="h-1.5 w-1.5 rounded-full bg-rose-500" />全部失败</span>
+          <span>档期：0:00 每日签到刷新 · 10:00 登录奖励开窗 · 10:15 应用内调度</span>
+        </div>
+        {selectedDay && (
+          <div className="mt-3 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+            <div className="mb-2 text-xs font-medium text-slate-500 dark:text-zinc-300">{selectedDay} 明细</div>
+            {selectedRecords.length === 0 ? (
+              <div className="text-xs text-slate-400">当日无签到记录</div>
+            ) : (
+              <div className="space-y-1">
+                {selectedRecords.map((r, i) => (
+                  <div key={`${r.user_id}-${i}`} className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="min-w-0 max-w-[180px] truncate font-medium text-slate-600 dark:text-zinc-300">
+                      {r.name || r.user_id}
+                    </span>
+                    <Badge tone={r.status === 'success' ? 'green' : r.status === 'already' ? 'blue' : 'red'}>
+                      {r.status === 'success' ? '已领' : r.status === 'already' ? '此前已领' : '失败'}
+                    </Badge>
+                    {(r.campaigns ?? []).map((c, j) => (
+                      <span
+                        key={j}
+                        className={`rounded px-1.5 py-0.5 text-[10px] ${
+                          c.kind === 'fail'
+                            ? 'bg-rose-50 text-rose-600 dark:bg-rose-500/10 dark:text-rose-300'
+                            : 'bg-slate-100 text-slate-500 dark:bg-zinc-800 dark:text-zinc-400'
+                        }`}
+                      >
+                        {c.name || c.id || '活动'}：
+                        {c.kind === 'success'
+                          ? '已领'
+                          : c.kind === 'already'
+                          ? '此前已领'
+                          : c.kind === 'fail'
+                          ? '失败'
+                          : c.kind === 'auth'
+                          ? '登录态中断'
+                          : c.kind}
+                      </span>
+                    ))}
+                    {r.reward != null && (
+                      <span className="tabular-nums text-emerald-600 dark:text-emerald-400">+{r.reward}</span>
+                    )}
+                    {r.message && r.status === 'fail' && (
+                      <span className="min-w-0 flex-1 truncate text-slate-400" title={r.message}>{r.message}</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* 一键签到卡 */}

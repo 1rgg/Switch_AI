@@ -6,7 +6,7 @@
  *  ② 池间调度策略：smart / priority + 优先级序编辑 + 跨池回退（dispatch_policy_get/set 即时生效）；
  *  ③ 各资源池池内调度：Trae（strategy）/ Buddy（wb_strategy，空 = 跟随 Trae 池）下拉编辑，
  *     自定义模型命中即直达；Qoder 池无池内策略可配（fail-open 全量入池），
- *     仅暴露「启用 Qoder 上游」开关（poolSet 第四参，qoder-dispatch-alignment-plan §5.1）。
+ *     仅暴露「启用 Qoder 上游」开关（poolSet 第四参，对齐方案 §5.1，已交付归档）。
  * 下方为 Trae / Buddy / Qoder / 自定义 四池摘要卡；前三者详情引导至各应用「资源调度」页，
  * 自定义池详情引导至「自定义模型」Tab。
  * 数据源：pool_list / accounts_list（Trae 池）、pool_list.wb_enabled / workbuddy_accounts_list
@@ -101,7 +101,7 @@ function DispatchCenterCard({
     }
   };
 
-  /** Qoder 上游开关（qoder-dispatch-alignment-plan §5.1）：读写走 poolSet 第四参
+  /** Qoder 上游开关（对齐方案 §5.1）：读写走 poolSet 第四参
    *  （与 Buddy wb 开关同链路）；uids/strategy/groups 原样回传（本卡不改池成员/分组） */
   const saveQoder = async (next: boolean) => {
     if (!pool) return;

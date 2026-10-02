@@ -301,6 +301,13 @@ pub async fn do_start(
                 Ok(creds)
             })
         }),
+        // F-80-余 v2：Qoder 竞速对冲阈值 + 会话粘性（开关默认关，粘性绑定
+        // 落 sticky_bindings 表 "q:" 命名空间，与 WB 互不串绑）
+        qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(
+            pool_file.qoder_hedge_threshold_ms,
+        ),
+        qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(pool_file.qoder_sticky_enabled),
+        qoder_sticky: crate::api_server::wb_sticky::StickyStore::load_ns(&state.data_dir, "q:"),
     });
 
     // F-76②/F-77 热参数：池并发上限（三池同构生效；审查修复：qoder_pool
@@ -616,6 +623,8 @@ fn merge_pool_set(
     wb_sticky_ttl_secs: Option<u64>,
     wb_uids: Option<Vec<String>>,
     qoder_enabled: Option<bool>,
+    qoder_hedge_threshold_ms: Option<u64>,
+    qoder_sticky_enabled: Option<bool>,
     trae_enabled: Option<bool>,
 ) -> ApiPoolFile {
     // Trae 池白名单剥离 wb- 前缀条目：WB 账号归属独立白名单 wb_enabled_uids，
@@ -659,6 +668,9 @@ fn merge_pool_set(
         wb_sticky_ttl_secs: wb_sticky_ttl_secs.unwrap_or(existing.wb_sticky_ttl_secs),
         wb_enabled_uids,
         qoder_enabled: qoder_enabled.unwrap_or(existing.qoder_enabled),
+        qoder_hedge_threshold_ms: qoder_hedge_threshold_ms
+            .unwrap_or(existing.qoder_hedge_threshold_ms),
+        qoder_sticky_enabled: qoder_sticky_enabled.unwrap_or(existing.qoder_sticky_enabled),
     }
 }
 
@@ -690,6 +702,10 @@ pub fn pool_set(
     wb_uids: Option<Vec<String>>,
     // Qoder 上游开关（p3-3）；None = 保留原值
     qoder_enabled: Option<bool>,
+    // Qoder 竞速对冲阈值毫秒（F-80-余 v2，0 = 关闭）；None = 保留原值
+    qoder_hedge_threshold_ms: Option<u64>,
+    // Qoder 会话粘性开关（F-80-余 v2）；None = 保留原值
+    qoder_sticky_enabled: Option<bool>,
     // Trae 池参与调度开关（默认开）；None = 保留原值
     trae_enabled: Option<bool>,
 ) -> Result<(), String> {
@@ -712,6 +728,8 @@ pub fn pool_set(
         wb_sticky_ttl_secs,
         wb_uids,
         qoder_enabled,
+        qoder_hedge_threshold_ms,
+        qoder_sticky_enabled,
         trae_enabled,
     );
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
@@ -774,6 +792,15 @@ pub fn pool_set(
         // Qoder 上游开关热应用（p3-3）
         rt.shared.qoder_enabled.store(
             pool_file.qoder_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // Qoder 竞速对冲阈值 + 会话粘性热应用（F-80-余 v2）
+        rt.shared.qoder_hedge_threshold_ms.store(
+            pool_file.qoder_hedge_threshold_ms,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        rt.shared.qoder_sticky_enabled.store(
+            pool_file.qoder_sticky_enabled,
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -1320,6 +1347,8 @@ mod pool_merge_tests {
             wb_enabled_uids: Vec::new(),
             wb_group_ids: vec!["wg1".into()],
             qoder_enabled: true,
+            qoder_hedge_threshold_ms: 4000,
+            qoder_sticky_enabled: true,
         }
     }
 
@@ -1330,7 +1359,7 @@ mod pool_merge_tests {
             &existing(),
             vec!["u2".into()],
             None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         assert_eq!(m.enabled_uids, vec!["u2".to_string()]);
         assert_eq!(m.strategy, "weighted");
@@ -1348,8 +1377,11 @@ mod pool_merge_tests {
         assert_eq!(m.account_concurrency_limit, 2);
         assert_eq!(m.pool_sticky_ttl_secs, 600);
         assert_eq!(m.wb_sticky_ttl_secs, 3600);
-        // Qoder 开关未传 → 保留原值（p3-3）；Trae 开关未传 → 保留原值（默认开）
+        // Qoder 开关未传 → 保留原值（p3-3）；Qoder v2 参数未传 → 保留原值；
+        // Trae 开关未传 → 保留原值（默认开）
         assert!(m.qoder_enabled);
+        assert_eq!(m.qoder_hedge_threshold_ms, 4000);
+        assert!(m.qoder_sticky_enabled);
         assert!(m.trae_enabled);
     }
 
@@ -1364,7 +1396,7 @@ mod pool_merge_tests {
             &legacy,
             vec!["1001".into(), "wb-abc".into(), "1002".into(), "wb-def".into()],
             None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         // Trae 白名单剥离 wb- 条目
         assert_eq!(m.enabled_uids, vec!["1001".to_string(), "1002".to_string()]);
@@ -1433,6 +1465,8 @@ mod pool_merge_tests {
             Some(vec!["wb-new".into()]),
             None,
             None,
+            None,
+            None,
         );
         assert_eq!(m.wb_enabled_uids, vec!["wb-new".to_string()]);
         assert_eq!(m.enabled_uids, vec!["u1".to_string()]);
@@ -1494,6 +1528,8 @@ mod pool_merge_tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert_eq!(m.strategy, "p2c");
         assert_eq!(m.wb_strategy, "");
@@ -1518,7 +1554,7 @@ mod pool_merge_tests {
             &existing(),
             vec!["u1".into(), "u3".into()],
             None, None, Some(vec!["g2".into()]), None, None, None, None,
-            None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -1535,7 +1571,7 @@ mod pool_merge_tests {
             &ApiPoolFile::default(),
             vec!["u1".into()],
             None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         assert_eq!(m.strategy, "");
         assert_eq!(m.wb_strategy, "");

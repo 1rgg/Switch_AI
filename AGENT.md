@@ -150,7 +150,7 @@ ai-work-assistant/
 | 设备 | `device_reset(userId)` | 删 `device_map.json[ uid ]` |
 | JWT | `jwt_parse(jwt)` / `refresh_jwt(userId)` | 解析 / 自动刷新（需 refresh_token） |
 | API | `api_server_start()` / `api_server_stop()` / `api_server_status()` | API 网关启停（端口/默认模型由设置页提供；鉴权统一走 API Keys 列表） |
-| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理；`pool_set` 扩展 `strategy`（expire_first/credit_first/random/**weighted/p2c**）/ `group_ids` / `wb_enabled`（T2.1 WB 上游开关）/ `wb_default_thinking`（T5.3）/ `wb_tool_exec`（T5.5，默认开）/ `wb_bg_downgrade`（T5.6③）/ `qoder_enabled`（p3-3 Qoder 上游开关，默认关，Qoder 环境配置页·网关上游）/ `trae_enabled`（Trae 池开关，默认开，Trae 资源调度页）——未传字段保留原值；三池三页各自管理自己的开关 |
+| API | `pool_list` / `pool_set` / `pool_status` | 账号池管理；`pool_set` 扩展 `strategy`（expire_first/credit_first/random/**weighted/p2c**）/ `group_ids` / `wb_enabled`（T2.1 WB 上游开关）/ `wb_default_thinking`（T5.3）/ `wb_tool_exec`（T5.5，默认开）/ `wb_bg_downgrade`（T5.6③）/ `qoder_enabled`（p3-3 Qoder 上游开关，默认关，Qoder 环境配置页·网关上游）/ `qoder_hedge_threshold_ms`（F-80-余 v2 Qoder 对冲阈值，默认 8000，0=关）/ `qoder_sticky_enabled`（F-80-余 v2 Qoder 会话粘性，默认关）/ `trae_enabled`（Trae 池开关，默认开，Trae 资源调度页）——未传字段保留原值；三池三页各自管理自己的开关 |
 | API | `api_debug_toggle` / `api_debug_status` | API 请求日志开关 |
 | API | `api_models_list()` / `api_models_sync()` | 模型列表读取（data/api_models.json）/ 官网同步（不消耗积分，最多试 3 账号） |
 | API | `api_logs_list(...)` / `api_logs_detail(...)` / `api_logs_search(...)` | API 请求日志查询 / 详情 / 搜索 |
@@ -239,7 +239,7 @@ ai-work-assistant/
 - **设备指纹（设计文档 §5.10 多账号并发）**：每账号入池即生成稳定 `QoderDeviceProfile`（一次生成永不轮换）；MITM/抓包真实捕获值优先透传，缺失时 `effective_creds` 注入账号绑定 machine_id + 现场随机 machine_token（随机值不落库）。注入唯一出口 = `effective_creds` / ensure_fresh 合并层。
 - **expires_at 域钳制**：store 读入的过期时间超 (0, now+10y) 一律视为无过期信息（防脏数据溢出/千年展示）；`refresh_expires_at_ms` 随设备流/refresh 响应解析落库留档。
 - **调度四任务**：每日签到（默认 10:15，覆盖 0 点签到 + 10:00 登录奖励；失败返 Err → 调度器 30min 冷却重试；启动补签 60s 延迟 + 轮次锁互斥，empty_campaigns 不推送打扰）/ 积分快照（qoder_credits_sync_hhmm）/ 凭证 6h 兜底刷新（lazy 7h 窗口，暂态失败返 Err 重试，永久失败落日志提示人工）/ 模型目录同步（qoder-catalog-sync，每日 05:50，真 COSY 签名拉 model/list → adopt_remote 替换 CN 区缓存；空池/无凭证静默跳过，恒开无 settings 键）。轮次锁 `QODER_ROUND_LOCK`：调度器/启动补签/UI 三路互斥，抢不到锁幂等跳过。
-- **网关上游（p3-3，v1 仅 CN 区）**：`qoder_enabled` 开关（Qoder 环境配置页·网关上游，运行中热应用）→ Qoder 目录模型路由专用 `qoder_pool`（fail-open 全量入池，needs_relogin 即禁用；池内 access_token 仅入池门槛，请求期真凭证由 `qoder_identity` 回调按次 `ensure_fresh` 解析）。执行链 = `prepare_qoder_body` agent 固定信封 → `encode_body` → COSY 19 头签名（qoder_sign.rs，RSA 内置公钥）→ `gateway.qoder.com.cn` agent_chat_generation SSE → 双层信封翻译（qoder_upstream.rs）。错误四分类：10605 排队（不冷却不换号，同号退避≤3 次）/ 105 鉴权 / 110~122 额度 / 裸 403 Forbidden；用量独立 `qoder_days` 桶（`api_qoder_usage_stats`）。Global 区（api3.qoder.sh）未接线：resolve 双区兜底可命中 Global 条目但请求恒发 CN 网关。
+- **网关上游（p3-3 + F-80-余 v2，仅 CN 区）**：`qoder_enabled` 开关（Qoder 环境配置页·网关上游，运行中热应用）→ Qoder 目录模型路由专用 `qoder_pool`（fail-open 全量入池，needs_relogin 即禁用；池内 access_token 仅入池门槛，请求期真凭证由 `qoder_identity` 回调按次 `ensure_fresh` 解析；并发上限 `account_concurrency_limit` 三池同构热生效）。执行链 = `prepare_qoder_body` agent 固定信封 → `encode_body` → COSY 19 头签名（qoder_sign.rs，RSA 内置公钥）→ `gateway.qoder.com.cn` agent_chat_generation SSE → 双层信封翻译（qoder_upstream.rs）。错误四分类：10605 排队（不冷却不换号，同号退避≤3 次）/ 105 鉴权 / 110~122 额度 / 裸 403 Forbidden；用量独立 `qoder_days` 桶（`api_qoder_usage_stats`）。**F-80-余 v2**：① 慢请求竞速对冲同构 WB（`race_qoder_first_byte` 原始行源层竞速 + `QoderHedgeLease` RAII，`qoder_hedge_threshold_ms` 默认 8s 热参数；对冲接管后排队同号退避不适用——重试凭证/请求体属主账号）；② 会话粘性（`qoder_sticky` 复用 StickyStore，键命名空间 `"q:"` 与 WB 同表隔离；显式 conversationId/指纹双模式 30m/60s；粘住账号 + 同种子派生同一上游 session_id；busy 且有空闲候选让位同 F-77④；`qoder_sticky_enabled` 默认关）；③ Global 区（api3.qoder.sh）**产品决策仅 CN 区**：Global 专属模型仅目录可见、显式 404，Qoder 资源调度页带地区标注说明；接线前置未决项（账号-区域关系 / Global 域 COSY 签名）已留档 backlog。
 - **切换器**：`target_app="Qoder"`（authfile 布局），快照落 `data/profiles_qoder`。
 
 ## 6. Tauri 事件（Rust → 前端）
@@ -258,7 +258,7 @@ ai-work-assistant/
 | `wb-checkin-progress` | `{"type":"start",total,mode?}` / `{"type":"account",index,user_id,name,status,message}` / `{"type":"growth",index,user_id,name,status,travel?,lottery?,tasks?,energy?,streak?}` / `{"type":"done",ok,already,failed,mode?}` / `{"type":"exit",ok}`（WorkBuddy 签到/成长中心独立管线：`mode:"growth"` 标记成长事件，与 Trae checkin-progress 互不串扰） |
 | `wb-oauth-progress` | `{stage:'init'|'browser'|'polling'|'success'|'error', message, auth_url?}`（OAuth 扫码流程进度；auth_url 仅 browser 阶段携带） |
 | `wb-oauth-done` | `{ok, id?, nickname?, message}`（扫码结果；成功已入池，凭证不出 Rust） |
-| `qoder-checkin-progress` | `{"type":"start",total}` / `{"type":"account",index,user_id,name,status,message,reward?}` / `{"type":"done",ok,already,failed,failed_empty_campaigns}`（Qoder 签到管线，与 wb-checkin-progress 前端组件同构；`failed_empty_campaigns` 为活动未开始/不可用类失败计数，启动补签推送按 `failed - failed_empty_campaigns` 判定） |
+| `qoder-checkin-progress` | `{"type":"start",total}` / `{"type":"account",index,user_id,name,status,message,reward?,campaigns?}` / `{"type":"done",ok,already,failed,failed_empty_campaigns}`（Qoder 签到管线，与 wb-checkin-progress 前端组件同构；`failed_empty_campaigns` 为活动未开始/不可用类失败计数，启动补签推送按 `failed - failed_empty_campaigns` 判定；`campaigns` 为 F-80-余 v2 逐活动明细 `[{id,name,kind,reward?}]`，档期日历数据源） |
 | `qoder-oauth-progress` | `{stage:'init'\|'browser'\|'polling'\|'success'\|'error', message, auth_url?}`（Qoder 设备流登录进度；auth_url 仅 browser 阶段携带） |
 | `qoder-oauth-done` | `{ok, id?, nickname?, message}`（设备流结果；成功已入池，凭证不出 Rust） |
 

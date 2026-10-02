@@ -53,7 +53,7 @@ describe('matchPreset（调度策略收口：预设匹配）', () => {
     ).toBeUndefined();
   });
 
-  it('Qoder 维度不参与匹配也不阻断（qoder-dispatch-alignment-plan §5.2）：qoder_enabled 开关任意取值，命中只看 inter/trae/buddy', () => {
+  it('Qoder 维度不参与匹配也不阻断（对齐方案 §5.2）：qoder_enabled 开关任意取值，命中只看 inter/trae/buddy', () => {
     // Qoder 池无独立池内策略且恒为池间尾部接管：其字段变化不得影响 preset 识别
     expect(
       matchPreset(

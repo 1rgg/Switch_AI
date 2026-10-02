@@ -15,7 +15,7 @@ import type {
 } from '../../types';
 
 /**
- * Qoder · 资源调度（qoder-dispatch-alignment-plan.md §4，P1）
+ * Qoder · 资源调度（对齐方案 P1，已交付并归档至 backlog F-80）
  * 参照 Buddy「资源调度」页同构布局，按 Qoder 实际能力裁剪：
  * - 资源开关仅 qoderEnabled 一个（Qoder v1 无路由级 effort/工具代执行等 wb 同构特性）；
  * - 池成员为 fail-open 全量含凭证账号（后端无独立白名单/分组配置），账号清单只读展示；
@@ -30,6 +30,9 @@ export default function QoderApiService() {
   const [status, setStatus] = useState<ApiServiceStatus | null>(null);
   const [pool, setPool] = useState<ApiPoolFile | null>(null);
   const [qoderEnabled, setQoderEnabled] = useState(false);
+  // F-80-余 v2：竞速对冲阈值（0 = 关闭）+ 会话粘性开关（默认关）
+  const [qoderHedgeThresholdMs, setQoderHedgeThresholdMs] = useState(8_000);
+  const [qoderStickyEnabled, setQoderStickyEnabled] = useState(false);
   const [accounts, setAccounts] = useState<QoderAccountView[]>([]);
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [syncing, setSyncing] = useState(false);
@@ -58,6 +61,9 @@ export default function QoderApiService() {
       setModels(cat);
       if (pf) {
         setQoderEnabled(pf.qoder_enabled ?? false);
+        // F-80-余 v2 参数回显（缺省对齐后端 serde default：对冲 8s / 粘性关）
+        setQoderHedgeThresholdMs(pf.qoder_hedge_threshold_ms ?? 8_000);
+        setQoderStickyEnabled(pf.qoder_sticky_enabled ?? false);
       }
     } catch (err) {
       pushToast('error', `读取资源状态失败：${String(err)}`);
@@ -118,10 +124,12 @@ export default function QoderApiService() {
       await withMinDelay(
         api.apiServer.poolSet(pool?.enabled_uids ?? [], pool?.strategy, pool?.group_ids, {
           qoderEnabled,
+          qoderHedgeThresholdMs,
+          qoderStickyEnabled,
         }),
         600,
       );
-      pushToast('success', 'Qoder 上游开关已保存（服务运行中即时生效）');
+      pushToast('success', 'Qoder 上游开关与调度参数已保存（服务运行中即时生效）');
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
     } finally {
@@ -270,6 +278,48 @@ export default function QoderApiService() {
                 三池共用参数（Trae/Buddy/Qoder 同一值，改动影响所有渠道）；如需调整请到
                 Buddy「资源调度」页。
               </p>
+              {/* F-80-余 v2：会话粘性开关（默认关；同账号+同种子派生同一上游 session） */}
+              <label className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-100/60 dark:hover:bg-zinc-800/60">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                  checked={qoderStickyEnabled}
+                  onChange={() => setQoderStickyEnabled((v) => !v)}
+                />
+                <span className="min-w-0">
+                  <span className="block text-xs text-slate-700 dark:text-zinc-200">会话粘性</span>
+                  <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                    显式 conversationId 绑定 30 分钟（滚动续期）、消息指纹 60 秒短窗；
+                    同账号 + 同种子派生同一上游 session_id，保住会话侧复用；账号 busy
+                    且有空闲候选时自动让位（并发优先）。默认关闭（轮换调度）
+                  </span>
+                </span>
+              </label>
+              {/* F-80-余 v2：竞速对冲阈值（0 = 关闭；有效范围 1s–8s 与后端对齐） */}
+              <div className="flex items-center justify-between gap-3 px-1.5 pt-1">
+                <span className="min-w-0">
+                  <span className="block text-xs text-slate-700 dark:text-zinc-200">竞速对冲阈值</span>
+                  <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                    流式/聚合首字节超过该时长即向第二账号发对冲请求，先出首字者胜；
+                    0 = 关闭（有效范围 1s–8s）。适用于上游首字节缓慢（静默排队 /
+                    prefill 等待）；10605 排队通知为即时信封、由同号退避处理
+                  </span>
+                </span>
+                <span className="flex shrink-0 items-center gap-1.5">
+                  <input
+                    type="number"
+                    min={0}
+                    max={8000}
+                    step={500}
+                    value={qoderHedgeThresholdMs}
+                    onChange={(e) =>
+                      setQoderHedgeThresholdMs(Math.max(0, Math.min(8000, Number(e.target.value) || 0)))
+                    }
+                    className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                  />
+                  <span className="text-[11px] text-slate-400">ms</span>
+                </span>
+              </div>
             </div>
 
             {/* 账号清单（只读展示：健康状态 / 在途计数 / credits 余额） */}
@@ -351,7 +401,18 @@ export default function QoderApiService() {
                         <td className="px-3 py-2">{m.display || '—'}</td>
                         <td className="px-3 py-2 text-xs text-slate-500">{m.vendor || '—'}</td>
                         <td className="px-3 py-2 text-center text-xs text-slate-500">
-                          {m.region === 'cn' ? 'CN' : m.region === 'global' ? 'Global' : '—'}
+                          {m.region === 'cn' ? (
+                            'CN'
+                          ) : m.region === 'global' ? (
+                            <span
+                              className="text-amber-600 dark:text-amber-400"
+                              title="目录并集按 global 优先标注；当前仅接入 CN 网关，Global 专属模型不可路由"
+                            >
+                              Global
+                            </span>
+                          ) : (
+                            '—'
+                          )}
                         </td>
                         <td className="px-3 py-2 text-right tabular-nums text-amber-600 dark:text-amber-400">
                           {m.rate != null ? m.rate.toFixed(2) : '—'}
@@ -380,6 +441,14 @@ export default function QoderApiService() {
               倍率为 Qoder 通用 credits 消耗倍率；产品决策下线的模型（Auto / Cantus / Efficient /
               Performance / Sonus / Ultimate）已从目录与路由移除。
             </p>
+            {/* F-80-余 v2 Global 区标记说明：当前仅接入 CN 区（国内版）上游 */}
+            <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50/80 px-3 py-2 text-[11px] leading-4 text-slate-500 dark:border-zinc-800 dark:bg-zinc-800/40 dark:text-zinc-400">
+              <span className="font-medium text-slate-600 dark:text-zinc-300">地区说明：</span>
+              当前仅接入 <span className="font-medium">CN 区（国内版）</span> 网关
+              （gateway.qoder.com.cn）；「地区」列为目录并集标注（global 优先），同名模型两区
+              共享。Global 区（api3.qoder.sh，海外版）尚未接线：Global 专属模型仅目录可见、
+              不可路由，请求将显式返回 404。
+            </div>
           </div>
         </div>
       </div>

@@ -521,6 +521,14 @@ export default function QoderAccounts() {
       const parts = [`新增 ${r.added} 个账号`];
       if (r.updated > 0) parts.push(`更新 ${r.updated} 个`);
       pushToast('success', `导入完成：${parts.join('、')}，带凭证 ${r.with_credentials}`);
+      // F-80-余 v2 迁移提示：历史明文含凭证文件 → 建议重新以加密格式导出归档
+      //（不自动改动用户文件，仅提示）
+      if (r.plaintext_credentials) {
+        pushToast(
+          'warn',
+          '该导出文件为历史明文格式，凭证以明文保存存在泄露风险：建议重新导出并设置导出密码（AES-256-GCM 加密），替换归档文件',
+        );
+      }
       if (r.rejected && r.rejected.length > 0) {
         const head = r.rejected
           .slice(0, 3)

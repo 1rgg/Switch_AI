@@ -532,6 +532,10 @@ export const api = {
         wbGroupIds?: string[] | null;
         /** Qoder 上游开关（p3-3）；null/未传 = 保留原值 */
         qoderEnabled?: boolean;
+        /** Qoder 竞速对冲阈值毫秒（F-80-余 v2，0 = 关闭）；null/未传 = 保留原值 */
+        qoderHedgeThresholdMs?: number;
+        /** Qoder 会话粘性开关（F-80-余 v2）；null/未传 = 保留原值 */
+        qoderStickyEnabled?: boolean;
         /** Trae 池参与调度开关（默认开）；null/未传 = 保留原值 */
         traeEnabled?: boolean;
       },
@@ -553,6 +557,8 @@ export const api = {
         wbStickyTtlSecs: wbFlags?.wbStickyTtlSecs ?? null,
         wbUids: wbFlags?.wbUids ?? null,
         qoderEnabled: wbFlags?.qoderEnabled ?? null,
+        qoderHedgeThresholdMs: wbFlags?.qoderHedgeThresholdMs ?? null,
+        qoderStickyEnabled: wbFlags?.qoderStickyEnabled ?? null,
         traeEnabled: wbFlags?.traeEnabled ?? null,
         wbStrategy: wbStrategy ?? null,
       }),

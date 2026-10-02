@@ -66,7 +66,7 @@ export default function ApiKeysManager({
   const [qoderPoolStatus, setQoderPoolStatus] = useState<PoolStatus[]>([]);
   // 今日按 Key 的 token 用量（「今日已用」列展示）
   const [usage, setUsage] = useState<UsageDayView[]>([]);
-  // Qoder 上游开关（qoder-dispatch-alignment-plan §5.3 警告徽标数据源）：
+  // Qoder 上游开关（对齐方案 §5.3 警告徽标数据源，已交付归档）：
   // Key 绑定 Qoder 池但未启用时显式告警；null = 未知（不告警）
   const [qoderEnabled, setQoderEnabled] = useState<boolean | null>(null);
 

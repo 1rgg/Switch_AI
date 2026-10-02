@@ -152,6 +152,10 @@ fn append_results(state: &AppState, events: &[Value]) {
         if let Some(r) = ev.get("reward").filter(|r| !r.is_null()) {
             rec["reward"] = r.clone();
         }
+        // 逐活动明细（F-80-余 v2 档期日历数据源；历史记录无此字段前端做兼容）
+        if let Some(c) = ev.get("campaigns").filter(|c| c.is_array()) {
+            rec["campaigns"] = c.clone();
+        }
         if let Err(e) = crate::store::docs::qoder_checkin_results_upsert(&store, &rec) {
             fs_utils::app_log(&state.data_dir, &format!("[qoder] 签到结果落库失败: {e}"));
         }
@@ -386,6 +390,8 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
     }
     let urls = urls_for();
     let mut headers = qoder_common::build_auth_headers(&creds);
+    // 逐活动明细（F-80-余 v2 档期日历数据源）：auth 401 重试路径继续累计
+    let mut campaigns_detail: Option<Vec<Value>> = None;
     // 签到前余额（差值兜底数据源；查询失败不阻塞签到。共享 qoder_credits 解析，
     // 端点 R-7 固化为 GET /sash/api/v2/me/usage）
     let pre_balance = super::qoder_credits::fetch_usage_balance(agent, &headers);
@@ -400,8 +406,21 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                 let mut auth_msg = String::new();
                 let mut messages: Vec<String> = Vec::new();
                 let mut reward = None;
+                // 逐活动明细（F-80-余 v2 档期日历数据源）
+                let mut campaigns_log: Vec<Value> = Vec::new();
                 for c in &claimable {
+                    let cid = s_of(fs_utils::dig(c, &["campaignId", "campaign_id"]));
+                    let cname = s_of(fs_utils::dig(
+                        c,
+                        &["name", "title", "campaignName", "campaign_name"],
+                    ));
                     let (k, m, r) = claim_one(agent, &headers, &urls, c);
+                    campaigns_log.push(json!({
+                        "id": cid,
+                        "name": if cname.is_empty() { cid.clone() } else { cname },
+                        "kind": k,
+                        "reward": r,
+                    }));
                     if k == "auth" {
                         kind = "auth".into();
                         auth_msg = m;
@@ -419,6 +438,7 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                         reward = Some(reward.unwrap_or(0.0) + r);
                     }
                 }
+                campaigns_detail = if campaigns_log.is_empty() { None } else { Some(campaigns_log) };
                 if kind == "auth" {
                     (kind, auth_msg, reward)
                 } else {
@@ -456,8 +476,21 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                             let mut kind = String::new();
                             let mut messages: Vec<String> = Vec::new();
                             let mut reward = None;
+                            // 重试路径同样累计逐活动明细（合并进首次已收部分）
+                            let mut retry_log: Vec<Value> = Vec::new();
                             for c in &claimable {
+                                let cid = s_of(fs_utils::dig(c, &["campaignId", "campaign_id"]));
+                                let cname = s_of(fs_utils::dig(
+                                    c,
+                                    &["name", "title", "campaignName", "campaign_name"],
+                                ));
                                 let (k, m, r) = claim_one(agent, &headers, &urls, c);
+                                retry_log.push(json!({
+                                    "id": cid,
+                                    "name": if cname.is_empty() { cid.clone() } else { cname },
+                                    "kind": k,
+                                    "reward": r,
+                                }));
                                 // kind 优先级归并（P2）：与首次路径同口径（success > fail > already）
                                 kind = merge_claim_kind(&kind, &k);
                                 if !m.is_empty() {
@@ -471,6 +504,13 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                             if kind.is_empty() {
                                 kind = "fail".into();
                             }
+                            campaigns_detail = match campaigns_detail.take() {
+                                Some(mut prev) => {
+                                    prev.extend(retry_log);
+                                    Some(prev)
+                                }
+                                None => if retry_log.is_empty() { None } else { Some(retry_log) },
+                            };
                             (kind, messages.join("；"), reward)
                         }
                     }
@@ -517,6 +557,10 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
     let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": status_txt, "message": message });
     if let Some(r) = reward {
         ev["reward"] = json!(r);
+    }
+    // 逐活动明细（F-80-余 v2 档期日历数据源；仅在确有领取动作时携带）
+    if let Some(camps) = campaigns_detail.filter(|c| !c.is_empty()) {
+        ev["campaigns"] = Value::Array(camps);
     }
     if kind == "success" && note == "refreshed" {
         ev["message"] = json!(format!("{}（凭证已续期）", ev["message"].as_str().unwrap_or("")));

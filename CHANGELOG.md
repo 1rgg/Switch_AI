@@ -15,6 +15,9 @@
 - **积分看板三平台化（阶段 1）**：`qoder-credits` 路由复用 CreditsDashboard（旧 QoderCredits 页下线），KPI 卡/积分趋势/日热度/到期日历全落地；消耗 = 本地快照差分，7 天到期窗口含 Plan 订阅重置额度；Token 页诚实空态（本地 usage 恒 0 实测，可靠出路在网关侧落库）。
 - **四桶用量基建**：`UsageBucket` 增 Qoder 桶（旧文件 serde 兼容）+ `api_qoder_usage_stats` 命令 + 前端三池并行拉取——网关用量管道已铺，上游转发接入即点亮。
 - **每池自管开关**：Trae/Buddy/Qoder 三页各自管理 `trae_enabled`/`wb_enabled`/`qoder_enabled`（默认 开/开/关；pool_set 热应用、未传字段保留原值；`/v1/models` 源徽章联动置灰）。
+- **Qoder 网关通路 v2（F-80-余）**：① 慢请求竞速对冲 WB 同构——原始行源层首字竞速（胜者统一信封翻译），对冲账号独立解凭证 + 重建 agent 信封，`qoder_hedge_threshold_ms` 热参数（默认 8s，0=关），上游首字节缓慢（静默排队/prefill 等待）场景收益直接；10605 排队通知为即时信封、仍由同号退避处理；② 会话粘性——conversationId/消息指纹双模式绑定账号（busy 让位同 F-77④），同账号 + 同种子派生同一上游 session_id，键命名空间与 WB 粘性同表隔离，`qoder_sticky_enabled` 开关默认关；③ Global 区产品决策**仅 CN 区（国内版）**，Global 专属模型标注说明（资源调度页地区卡 + 目录地区列）。
+- **Qoder 导出文件迁移提示（F-80-余）**：导入历史明文凭证导出文件时识别明文形态（结果 `plaintext_credentials: true`），前端提示重新以加密格式导出归档（不自动改动用户文件）。
+- **Qoder 签到活动档期日历（F-80-余）**：签到结果补 `campaigns` 逐活动明细，签到页新增月历卡——逐日双活动状态点 + 奖励合计 + 选中日逐账号逐活动明细 + 静态档期标注（0:00 签到刷新 / 10:00 登录奖励开窗 / 10:15 调度），辅助校验「10:15 双活动均已开放」类排期决策。
 
 ### 修复
 
@@ -26,7 +29,7 @@
 
 ### 测试
 
-- `cargo test` 664 passed / 0 failed；`cargo check` 零警告；`tsc --noEmit` 全绿。
+- `cargo test` 684 passed / 0 failed；`cargo check` 零警告；`tsc --noEmit` 全绿；`vitest` 35 passed。
 
 ---
 

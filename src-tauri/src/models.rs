@@ -583,6 +583,16 @@ pub struct ApiPoolFile {
     /// 默认 false——未部署 Qoder 的环境不产生空池噪音（健康告警/目录徽章）
     #[serde(default)]
     pub qoder_enabled: bool,
+    /// Qoder 慢请求竞速对冲阈值毫秒（F-80-余 v2）：流式首字节超阈值且有其他
+    /// 健康账号时向第二账号发对冲请求，先出首字者胜；0 = 关闭。
+    /// 默认 8000 与 WB 对冲阈值同默认（运行时 clamp 1s–8s）
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub qoder_hedge_threshold_ms: u64,
+    /// Qoder 会话粘性开关（F-80-余 v2）：开启后同会话（显式 conversationId /
+    /// 消息指纹）在 TTL 内绑定同一 Qoder 账号——同账号 + 同种子派生同一上游
+    /// session_id，保住上游会话侧复用；默认 false（v1 轮换行为）
+    #[serde(default)]
+    pub qoder_sticky_enabled: bool,
 }
 
 fn default_hedge_threshold_ms() -> u64 {
@@ -626,6 +636,8 @@ impl Default for ApiPoolFile {
             wb_enabled_uids: Vec::new(),
             wb_group_ids: Vec::new(),
             qoder_enabled: false,
+            qoder_hedge_threshold_ms: default_hedge_threshold_ms(),
+            qoder_sticky_enabled: false,
         }
     }
 }

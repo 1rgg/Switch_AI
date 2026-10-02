@@ -122,6 +122,16 @@ pub struct ApiSharedState {
     /// None（单测/未启用 Qoder）时 Qoder 池不参与路由
     pub qoder_identity:
         Option<std::sync::Arc<dyn Fn(&str) -> Result<crate::tasks::qoder_common::QoderCreds, String> + Send + Sync>>,
+    /// Qoder 慢请求竞速对冲阈值毫秒（F-80-余 v2，0 = 关闭；默认 8000，
+    /// 运行时 clamp 1s–8s 同 WB）：流式/聚合首字节超阈值且池内有其他健康账号时
+    /// 向第二账号发对冲请求，先出首字者胜
+    pub qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64,
+    /// Qoder 会话粘性开关（F-80-余 v2，默认关）：开启后同会话（conversationId /
+    /// 消息指纹）TTL 内绑定同一 Qoder 账号；同账号 + 同种子派生同一上游 session_id
+    pub qoder_sticky_enabled: std::sync::atomic::AtomicBool,
+    /// Qoder 会话粘性存储（F-80-余 v2）：与 wb_sticky 共用 sticky_bindings 表，
+    /// 键命名空间 "q:" 隔离，互不串绑
+    pub qoder_sticky: wb_sticky::StickyStore,
 }
 
 impl ApiSharedState {
@@ -580,6 +590,9 @@ mod inflight_tests {
             qoder_pool: pool::ApiPool::new(),
             qoder_enabled: std::sync::atomic::AtomicBool::new(true),
             qoder_identity: None,
+            qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
+            qoder_sticky: wb_sticky::StickyStore::default(),
         };
         {
             let _g = state.inflight_guard();

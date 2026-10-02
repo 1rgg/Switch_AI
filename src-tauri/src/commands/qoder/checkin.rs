@@ -76,6 +76,10 @@ pub struct QoderCheckinRecord {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reward: Option<f64>,
+    /// 逐活动明细（F-80-余 v3 档期日历）：[{id, name, kind, reward?}]；
+    /// 历史数据（升级前）无此字段 → None，前端按整体状态渲染
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub campaigns: Option<Value>,
 }
 
 /// 签到日志（90 天存储，UI 默认展示 30 天）
@@ -104,6 +108,7 @@ pub fn qoder_checkin_results(
                 status: r.get("status").and_then(|v| v.as_str()).unwrap_or("").into(),
                 message: r.get("message").and_then(|v| v.as_str()).unwrap_or("").into(),
                 reward: r.get("reward").and_then(|v| v.as_f64()),
+                campaigns: r.get("campaigns").filter(|v| v.is_array()).cloned(),
             });
         }
     }

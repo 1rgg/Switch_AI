@@ -239,10 +239,35 @@ fn merge_account(pool: &mut Vec<QoderAccount>, a: &Value) -> MergeResult {
     Ok((id, true))
 }
 
+/// 明文含凭证检测（F-80-余 v2 迁移提示）：任一账号 credential 含非空
+/// access_token / pat 即视为明文凭证文件（与导入回写落库判据同口径）
+fn has_plaintext_credentials(payload: &Value) -> bool {
+    payload
+        .get("accounts")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter().any(|a| {
+                a.get("credential")
+                    .filter(|c| c.is_object())
+                    .map(|c| {
+                        !c.get("access_token")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .is_empty()
+                            || !c.get("pat").and_then(Value::as_str).unwrap_or("").is_empty()
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// 账号池导入：解析导出文件 → 逐账号幂等入池 + 凭证回写 token store
 /// （含凭证时按生效 id 写回，与池条目对齐）。
 /// 加密信封（AIWQENC1 魔数）必须提供 password 解密后再走统一校验链路；
 /// 无魔数走原明文路径（旧明文导出文件向后兼容，password 提供了也忽略）。
+/// 明文含凭证文件导入成功时结果带 `plaintext_credentials: true`（F-80-余 v2
+/// 迁移提示：前端提醒重新以加密格式导出归档；不自动改动用户文件）
 #[tauri::command(async)]
 pub fn qoder_accounts_import(
     state: State<AppState>,
@@ -250,6 +275,7 @@ pub fn qoder_accounts_import(
     password: Option<String>,
 ) -> Result<Value, String> {
     // 加密信封解包（审查 P1-1）：识别在 kind 校验之前——信封外层无 accounts 字段
+    let mut plaintext_credentials = false;
     let payload = match envelope_data_of(&payload) {
         Some(sealed) => {
             let pwd = password.filter(|p| !p.trim().is_empty()).ok_or(
@@ -259,7 +285,10 @@ pub fn qoder_accounts_import(
             serde_json::from_slice::<Value>(&plain)
                 .map_err(|e| format!("解密后内容解析失败: {e}"))?
         }
-        None => payload,
+        None => {
+            plaintext_credentials = has_plaintext_credentials(&payload);
+            payload
+        }
     };
     if payload.get("kind").and_then(Value::as_str) != Some("aiwork-qoder-pool") {
         return Err("文件格式无法识别（缺少 aiwork-qoder-pool 标记）".into());
@@ -319,8 +348,9 @@ pub fn qoder_accounts_import(
     fs_utils::app_log(
         &state.data_dir,
         &format!(
-            "qoder: 账号池导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 拒绝 {}",
-            rejected.len()
+            "qoder: 账号池导入 新增 {added} / 更新 {updated} / 带凭证 {with_cred} / 拒绝 {}{}",
+            rejected.len(),
+            if plaintext_credentials { " / 明文凭证文件（迁移提示）" } else { "" },
         ),
     );
     Ok(serde_json::json!({
@@ -329,14 +359,31 @@ pub fn qoder_accounts_import(
         "skipped": 0,
         "with_credentials": with_cred,
         "rejected": rejected,
+        // F-80-余 v2 迁移提示：true = 历史明文含凭证文件，前端提醒重新加密导出归档
+        "plaintext_credentials": plaintext_credentials,
     }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{envelope_data_of, merge_account, EXPORT_MAGIC, NONCE_LEN, SALT_LEN};
+    use super::{envelope_data_of, has_plaintext_credentials, merge_account, EXPORT_MAGIC, NONCE_LEN, SALT_LEN};
     use crate::commands::qoder::common::QoderAccount;
     use crate::tasks::qoder_device::QoderDeviceProfile;
+
+    /// F-80-余 v2 迁移提示判据：任一账号 credential 含非空 access_token/pat
+    #[test]
+    fn plaintext_credential_detection() {
+        let with = serde_json::json!({"accounts":[{"id":"a","credential":{"access_token":"pt-x"}}]});
+        assert!(has_plaintext_credentials(&with));
+        let with_pat = serde_json::json!({"accounts":[{"id":"a","credential":{"pat":"jt-x"}}]});
+        assert!(has_plaintext_credentials(&with_pat));
+        let without = serde_json::json!({"accounts":[{"id":"a"}]});
+        assert!(!has_plaintext_credentials(&without));
+        let empty_cred = serde_json::json!({"accounts":[{"id":"a","credential":{"access_token":""}}]});
+        assert!(!has_plaintext_credentials(&empty_cred));
+        let empty = serde_json::json!({"other": 1});
+        assert!(!has_plaintext_credentials(&empty));
+    }
 
     fn acct(id: &str, uid: &str, nickname: &str) -> QoderAccount {
         QoderAccount {
