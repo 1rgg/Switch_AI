@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { listen } from '@tauri-apps/api/event';
 import {
+  AppWindow,
   Archive,
   ArchiveRestore,
   DatabaseBackup,
@@ -8,6 +10,7 @@ import {
   ExternalLink,
   Fingerprint,
   FolderCog,
+  Globe,
   HelpCircle,
   History,
   KeyRound,
@@ -18,6 +21,7 @@ import {
   ScanSearch,
   ShieldAlert,
   Terminal,
+  TerminalSquare,
   Trash2,
   Upload,
   UserPlus,
@@ -126,6 +130,9 @@ export default function QoderAccounts() {
   const [fpViewing, setFpViewing] = useState<QoderAccountView | null>(null);
   // OAuth 设备流登录（进度弹窗；事件契约对齐 BuddyAccounts wb-oauth 模式）
   const [oauthRunning, setOauthRunning] = useState(false);
+  // OAuth 兼容模式开关（2026-10-02 审查预案）：上次授权超时后置 true，下一次点击
+  // 改用不带 client_id 的授权 URL；成功后复位。ref 而非 state：不触发重渲染
+  const oauthCompatRef = useRef(false);
   const [oauthCanceling, setOauthCanceling] = useState(false);
   const [oauthMsg, setOauthMsg] = useState('');
   const [oauthUrl, setOauthUrl] = useState<string | null>(null);
@@ -141,6 +148,9 @@ export default function QoderAccounts() {
   // 破坏性操作确认弹框（禁 window.confirm，红线）：移除账号 / 恢复快照 / 删除快照
   const [confirmTarget, setConfirmTarget] = useState<QoderConfirm>(null);
   const [confirmBusy, setConfirmBusy] = useState(false);
+  // 目标应用选择菜单（复刻 BuddyAccounts appMenu）：切换/保存登录态前先选
+  // Qoder Work / Qoder IDE（两套独立登录态：electron-root / icube 布局）
+  const [appMenu, setAppMenu] = useState<{ id: string; kind: 'switch' | 'save'; x: number; y: number } | null>(null);
   // 导出/导入账号池（M4，对照 BuddyAccounts F-46 扩展）
   const [exportOpen, setExportOpen] = useState(false);
   const [exportWithCreds, setExportWithCreds] = useState(false);
@@ -243,6 +253,14 @@ export default function QoderAccounts() {
       setOauthRunning(false);
       setOauthCanceling(false);
       setOauthMsg(d.message);
+      // 兼容模式切换（2026-10-02 审查预案）：授权超时且可能因官方 client_id 被轮换
+      // 导致授权页「参数无效」→ 下一次点击自动改用兼容模式（不带 client_id）；
+      // 成功即复位回常规模式
+      if (!d.ok && d.message.includes('超时')) {
+        oauthCompatRef.current = true;
+      } else if (d.ok) {
+        oauthCompatRef.current = false;
+      }
       if (d.ok) {
         pushToast('success', d.message);
         void refresh();
@@ -289,11 +307,14 @@ export default function QoderAccounts() {
   const startOauth = async () => {
     setOauthRunning(true);
     setOauthCanceling(false);
-    setOauthMsg('正在打开 Qoder 授权页…');
+    // 兼容模式（上次授权超时后自动切换）：授权 URL 不带 client_id（预案见 qoder_oauth.rs）
+    const compat = oauthCompatRef.current;
+    setOauthMsg(compat ? '正在打开 Qoder 授权页（兼容模式）…' : '正在打开 Qoder 授权页…');
+    if (compat) pushToast('info', '本次 OAuth 使用兼容模式（不带 client_id），用于绕过授权页「参数无效」');
     setOauthUrl(null);
     setShowOauth(true);
     try {
-      await api.qoder.oauthLogin();
+      await api.qoder.oauthLogin(compat);
     } catch (err) {
       setOauthRunning(false);
       setOauthCanceling(false);
@@ -386,15 +407,26 @@ export default function QoderAccounts() {
     setConfirmTarget({ kind: 'remove-account', account: a });
   };
 
-  const backupSnapshot = async (a: QoderAccountView) => {
+  const backupSnapshot = async (a: QoderAccountView, targetApp: 'Qoder' | 'QoderWork') => {
     setSnapBusy(a.id);
     try {
-      await api.profiles.backup(a.id, 'Qoder');
-      pushToast('info', `正在备份「${a.nickname || a.id}」的登录态快照…`);
+      await api.profiles.backup(a.id, targetApp);
+      pushToast('info', `正在备份「${a.nickname || a.id}」的登录态快照（${targetApp === 'Qoder' ? 'Qoder IDE' : 'Qoder Work'}）…`);
     } catch (err) {
       setSnapBusy(null);
       pushToast('error', `备份失败：${String(err)}`);
     }
+  };
+
+  // 打开目标应用选择菜单（复刻 BuddyAccounts openAppMenu 定位/开关逻辑）：
+  // 选中 Qoder Work / Qoder IDE 后才真正发起 switchTo / backupSnapshot
+  const openAppMenu = (a: QoderAccountView, kind: 'switch' | 'save', e: MouseEvent<HTMLButtonElement>) => {
+    if (kind === 'switch' && a.needs_relogin) {
+      pushToast('warn', '该账号标记需重新登录，请先重新登录客户端并保存登录态');
+      return;
+    }
+    const r = e.currentTarget.getBoundingClientRect();
+    setAppMenu(appMenu?.id === a.id && appMenu.kind === kind ? null : { id: a.id, kind, x: r.right, y: r.bottom });
   };
 
   // I19：改为按槽位 id 操作——快照目录名即账号 id，账号已移除的孤儿快照仍可恢复/清理
@@ -611,19 +643,19 @@ export default function QoderAccounts() {
             </button>
             <button
               className="btn-outline"
-              disabled={scanningIde || oauthRunning}
-              onClick={() => void scanIde()}
-              title="解密 IDE 本地存储（Local State → state.vscdb secret://）发现并导入当前登录账号"
-            >
-              {scanningIde ? <Loader2 size={15} className="animate-spin" /> : <ScanSearch size={15} />} 扫描 IDE 登录态
-            </button>
-            <button
-              className="btn-outline"
               disabled={oauthRunning}
               onClick={() => void startOauth()}
               title="模拟客户端设备流：浏览器授权后自动获取 dt- 凭证入池"
             >
-              {oauthRunning ? <Loader2 size={15} className="animate-spin" /> : <KeyRound size={15} />} OAuth登录
+              {oauthRunning ? <Loader2 size={15} className="animate-spin" /> : <Globe size={15} />} OAuth登录
+            </button>
+            <button
+              className="btn-outline"
+              disabled={scanningIde || oauthRunning}
+              onClick={() => void scanIde()}
+              title="解密 IDE 本地存储（Local State → state.vscdb secret://）发现并导入当前登录账号"
+            >
+              {scanningIde ? <Loader2 size={15} className="animate-spin" /> : <ScanSearch size={15} />} 扫描本地账号
             </button>
             <button className="btn-outline" disabled={importing} onClick={() => setShowImport(true)}>
               <UserPlus size={15} /> 导入 PAT
@@ -711,7 +743,7 @@ export default function QoderAccounts() {
             <EmptyState
               icon={<Users size={26} />}
               title="暂无 Qoder 账号"
-              hint="三种方式入池：导入 PAT（qoder.com.cn → Integrations 创建）/ OAuth 设备流登录 / 扫描 IDE 登录态（本机已登录 Qoder CN IDE 时一键导入）。"
+              hint="三种方式入池：导入 PAT（qoder.com.cn → Integrations 创建）/ OAuth 设备流登录 / 扫描本地账号（本机已登录 Qoder CN IDE 时一键导入）。"
             />
           )}
         </div>
@@ -771,17 +803,17 @@ export default function QoderAccounts() {
                       <div className="flex justify-end gap-1">
                         <button
                           className="btn-ghost !p-2 text-emerald-600"
-                          title="切换到此账号（备份当前 IDE 登录态 → 恢复该账号快照并注入绑定指纹）"
+                          title="切换此账号到…（Qoder Work / Qoder IDE 双目标）"
                           disabled={busy}
-                          onClick={() => void switchTo(a.id, 'Qoder')}
+                          onClick={(e) => openAppMenu(a, 'switch', e)}
                         >
                           {switchingTo === a.id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
                         </button>
                         <button
                           className="btn-ghost !p-2"
-                          title="备份当前 IDE 登录态到该账号槽位"
+                          title="保存当前登录态到该账号槽位（Qoder Work / Qoder IDE 双目标）"
                           disabled={snapBusy != null || busy}
-                          onClick={() => void backupSnapshot(a)}
+                          onClick={(e) => openAppMenu(a, 'save', e)}
                         >
                           {snapBusy === a.id ? <Loader2 size={14} className="animate-spin" /> : <DatabaseBackup size={14} />}
                         </button>
@@ -812,6 +844,58 @@ export default function QoderAccounts() {
           </table>
         </div>
       )}
+
+      {/* 目标应用选择菜单（复刻 BuddyAccounts appMenu）：Portal + fixed 定位，避免被表格容器
+          overflow 裁剪或被后续行遮盖；双目标 Qoder Work（electron-root 布局）/ Qoder IDE
+          （icube 布局）。切换/保存执行期间隐藏菜单，防止重复发起 */}
+      {appMenu &&
+        !busy &&
+        createPortal(
+          <div
+            className="fixed z-50 w-[420px] overflow-hidden rounded-lg border border-slate-200 bg-white text-slate-700 shadow-lg dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200"
+            style={{
+              left: Math.max(8, appMenu.x - 420),
+              top: (() => {
+                const MENU_H = 150;
+                const below = appMenu.y + 4 + MENU_H;
+                return below > window.innerHeight ? appMenu.y - MENU_H - 8 : appMenu.y + 4;
+              })(),
+            }}
+            onMouseLeave={() => setAppMenu(null)}
+          >
+            <div className="px-4 pb-1 pt-3 text-[11px] font-semibold text-slate-400 dark:text-zinc-500">
+              {appMenu.kind === 'switch' ? '切换此账号到…' : '保存当前登录态到…'}
+            </div>
+            <div className="grid grid-cols-2 gap-2 p-3 pt-1.5">
+              {([
+                { app: 'QoderWork' as const, label: 'Qoder Work', desc: 'Qoder Work 桌面客户端', Icon: AppWindow },
+                { app: 'Qoder' as const, label: 'Qoder IDE', desc: 'Qoder CN IDE 桌面客户端', Icon: TerminalSquare },
+              ]).map((opt) => (
+                <button
+                  key={opt.app}
+                  onClick={() => {
+                    const { id, kind } = appMenu;
+                    setAppMenu(null);
+                    const target = accounts.find((x) => x.id === id);
+                    if (kind === 'switch') {
+                      void switchTo(id, opt.app);
+                    } else if (target) {
+                      void backupSnapshot(target, opt.app);
+                    }
+                  }}
+                  className="group flex flex-col items-start gap-1 rounded-lg border border-slate-200 bg-white px-4 py-3 text-left transition hover:border-brand-400 hover:bg-brand-50 hover:shadow-sm dark:border-zinc-700 dark:bg-zinc-800 dark:hover:border-brand-500 dark:hover:bg-brand-500/10"
+                >
+                  <span className="flex items-center gap-2 text-sm font-semibold">
+                    <opt.Icon size={16} className="text-slate-500 transition group-hover:text-brand-500 dark:text-zinc-400" />
+                    {opt.label}
+                  </span>
+                  <span className="text-[11px] text-slate-400 dark:text-zinc-500">{opt.desc}</span>
+                </button>
+              ))}
+            </div>
+          </div>,
+          document.body,
+        )}
 
       {/* M4 CLI 状态桥：~/.qoder-cn/.qoder-app-status.json 白名单只读透传（无凭证，绝不写回） */}
       {cliStatus?.available ? (

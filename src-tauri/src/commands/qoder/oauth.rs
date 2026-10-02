@@ -13,7 +13,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
-use crate::tasks::qoder_oauth::{self, DeviceFlow};
+use crate::tasks::qoder_oauth;
 use crate::tasks::{http_agent, qoder_common};
 
 use super::common::{account_id_of, with_pool_mut, QoderAccount};
@@ -73,14 +73,21 @@ fn emit_done(app: &AppHandle, data_dir: &Path, ok: bool, id: &str, nickname: &st
 /// 发起 Qoder OAuth 设备流登录：
 /// ① 构造 PKCE 会话并打开授权页 → ② 后台线程 1s 轮询（404=pending，200=授权完成）
 /// → ③ dt- 令牌入池（幂等：同 token 稳定同 id）并回填 uid/昵称/套餐。
+/// `compat`（2026-10-02 审查预案）：兼容模式——授权 URL 不带 client_id（社区实现
+/// 验证可用）。官方常量被 Qoder 轮换导致授权页「参数无效」时，前端在授权超时后
+/// 自动改用本模式重试。
 #[tauri::command(async)]
-pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<bool>) -> Result<(), String> {
     if OAUTH_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("已有 OAuth 登录在执行中，请等待完成".into());
     }
     // 复位取消标志（上一轮会话的取消请求不应影响本次登录）
     OAUTH_CANCEL.store(false, Ordering::SeqCst);
-    let flow = DeviceFlow::new();
+    let flow = if compat.unwrap_or(false) {
+        qoder_oauth::DeviceFlow::new_compat()
+    } else {
+        qoder_oauth::DeviceFlow::new()
+    };
     let auth_url = flow.auth_url.clone();
     emit_progress(&app, "init", "正在打开 Qoder 授权页…", Some(&auth_url));
     if let Err(e) = open_in_browser(&auth_url) {
@@ -106,7 +113,14 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>) -> Result<(), S
             loop {
                 if started.elapsed().as_millis() as u64 > qoder_oauth::POLL_TIMEOUT_MS {
                     fs_utils::app_log(&state2.data_dir, "qoder OAuth 登录超时：180s 内未完成授权");
-                    emit_done(&app2, &state2.data_dir, false, "", "", "授权超时：请在浏览器完成授权后重试");
+                    emit_done(
+                        &app2,
+                        &state2.data_dir,
+                        false,
+                        "",
+                        "",
+                        "授权超时：请在浏览器完成授权后重试；若浏览器页面曾提示「参数无效」，再次点击 OAuth登录 将自动改用兼容模式",
+                    );
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(qoder_oauth::POLL_INTERVAL_MS));

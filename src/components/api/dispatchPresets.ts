@@ -4,8 +4,9 @@
  * 匹配规则：池间策略一致 + Trae 池策略一致（空串语义等同 expire_first 默认）
  * + Buddy 池策略一致（空 = 跟随 Trae 池生效值）+ Qoder 池策略一致（空 = 跟随
  * Trae 池生效值，同 Buddy 语义）。
- * 注意：Qoder 池间调度始终尾部接管（多源同名模型的兜底序），不受预设的池间
- * 策略影响；池内策略已纳入匹配（qoder_strategy 可配）。
+ * 注意：Qoder 池与 Trae / Buddy 同等地位参与池间策略调度（默认优先级序位于
+ * 尾部，可在「固定优先级」中上移，smart 重排同样覆盖 Qoder）；池内策略已纳入
+ * 匹配（qoder_strategy 可配）。
  */
 import type { ApiPoolFile, DispatchPolicy } from '../../types';
 
@@ -62,7 +63,7 @@ export const DISPATCH_PRESETS: DispatchPreset[] = [
   {
     key: 'fixed',
     name: '固定优先',
-    desc: '多源模型固定池优先级（可在下方调整顺序，Qoder 恒尾部接管），池内积分先过期优先',
+    desc: '多源模型固定池优先级（可在下方调整顺序，Qoder 默认序尾部、可上移），池内积分先过期优先',
     inter: 'priority',
     trae: 'expire_first',
     buddy: 'expire_first',

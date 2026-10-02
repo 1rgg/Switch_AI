@@ -324,15 +324,32 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
                     .get("message")
                     .and_then(Value::as_str)
                     .is_some_and(|m| m.contains("401"));
-            if row.get("ok").and_then(Value::as_bool) != Some(true) && is_401 {
-                let (new_creds, refreshed, _) = qoder_common::ensure_fresh(state, &agent, aid, i64::MAX);
-                if refreshed && new_creds.access_token != creds.access_token {
-                    // 401 自愈成功：回写池过期时间/登录态（原自愈路径只刷新不回写，
-                    // 池内 token_expires_at 仍是旧值，到期看板会误报「已过期」）
-                    qoder_common::sync_pool_expiry(state, aid, &new_creds);
-                    return fetch_account(&agent, a, &new_creds);
-                }
-            }
+            let (creds, mut row) =
+                if row.get("ok").and_then(Value::as_bool) != Some(true) && is_401 {
+                    let (new_creds, refreshed, _) =
+                        qoder_common::ensure_fresh(state, &agent, aid, i64::MAX);
+                    if refreshed && new_creds.access_token != creds.access_token {
+                        // 401 自愈成功：回写池过期时间/登录态（原自愈路径只刷新不回写，
+                        // 池内 token_expires_at 仍是旧值，到期看板会误报「已过期」）
+                        qoder_common::sync_pool_expiry(state, aid, &new_creds);
+                        let retry_row = fetch_account(&agent, a, &new_creds);
+                        (new_creds, retry_row)
+                    } else {
+                        (creds, row)
+                    }
+                } else {
+                    (creds, row)
+                };
+            // 套餐档位回填（余额刷新顺带拉 /api/v2/user/plan）。门控决策在
+            // qoder_common::need_plan_fetch（含单测）：行成功且池内无套餐/存量值
+            // 待归一时才发起查询，已归一账号零额外 HTTP 往返
+            let row_ok = row.get("ok").and_then(Value::as_bool) == Some(true);
+            let stored_plan = a.get("plan").and_then(Value::as_str).unwrap_or("").to_string();
+            row["plan_tier"] = json!(if qoder_common::need_plan_fetch(row_ok, &stored_plan) {
+                qoder_common::fetch_plan(&agent, &creds).0.unwrap_or_default()
+            } else {
+                stored_plan
+            });
             row
         })
         .collect();
@@ -379,6 +396,17 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
             };
             a["credits_balance"] = row.get("total").cloned().unwrap_or(Value::Null);
             a["credits_fetched_at"] = json!(fs_utils::now_iso());
+            // 套餐档位回填（v3.7.x）：行内 plan_tier 非空且与池内不同才更新（幂等，
+            // 顺带把存量账号空套餐补齐、旧值如 "Pro Trial" 归一为展示名）
+            if let Some(tier) = row
+                .get("plan_tier")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                if a.get("plan").and_then(Value::as_str) != Some(tier) {
+                    a["plan"] = json!(tier);
+                }
+            }
             changed = true;
         }
     }

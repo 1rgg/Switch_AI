@@ -76,16 +76,20 @@ pub fn mask_secret(s: &str) -> String {
     format!("{}****{}", head, tail)
 }
 
-/// user_id / 账号 id 作文件系统路径段时的安全校验（审查 P0-1 全仓统一入口）。
-/// 只做字符集白名单（字母数字 - _），杜绝 `..`、绝对路径、分隔符注入导致的目录逃逸；
+/// user_id / 账号 id / 快照槽位作文件系统路径段时的安全校验（审查 P0-1 全仓统一入口）。
+/// 只做字符集白名单（字母数字 - _ .），杜绝 `..`、绝对路径、分隔符注入导致的目录逃逸；
 /// 池内存在性校验由各调用方按各自账号池补充（wb_chat_uid_guard 模式）。
+/// 注：`.` 用于快照槽位轮转后缀（<slot>.bak / <slot>.bak2，switcher/copy.rs），
+/// `..` 与裸 `.` 仍被显式拒绝——后者 join 后退化为目录本身，而 profile_delete 对
+/// 校验后的槽位整目录删除（remove_dir_all），放行裸 `.` 等于放行整目录清除。
 pub fn ensure_uid_safe(uid: &str) -> Result<(), String> {
     if uid.is_empty()
         || uid.len() > 64
         || !uid
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
         || uid.contains("..")
+        || uid == "."
     {
         return Err(format!("非法账号标识: {}", &uid.chars().take(24).collect::<String>()));
     }
@@ -202,6 +206,33 @@ fn dig_key<'a>(v: &'a serde_json::Value, key: &str, depth: usize) -> Option<&'a 
             .iter()
             .find_map(|item| dig_key(item, key, depth + 1)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 账号 id / 快照槽位白名单（`-` `_` `.`）：
+    /// `.bak`/`.bak2` 为快照轮转槽位合法形态（此前误拒导致快照无法删除）
+    #[test]
+    fn uid_safe_allows_snapshot_bak_suffix() {
+        assert!(ensure_uid_safe("qd-443681d83879").is_ok());
+        assert!(ensure_uid_safe("qd-443681d83879.bak").is_ok());
+        assert!(ensure_uid_safe("qd-443681d83879.bak2").is_ok());
+    }
+
+    /// 路径穿越/分隔符/空串/裸点仍一律拒绝（`..` 防目录逃逸；裸 `.` join 后退化
+    /// 为目录本身，防 profile_delete 类整目录删除误清快照根）
+    #[test]
+    fn uid_safe_rejects_traversal_and_separators() {
+        assert!(ensure_uid_safe("").is_err());
+        assert!(ensure_uid_safe("..").is_err());
+        assert!(ensure_uid_safe(".").is_err());
+        assert!(ensure_uid_safe("a..b").is_err());
+        assert!(ensure_uid_safe("a/b").is_err());
+        assert!(ensure_uid_safe(r"a\b").is_err());
+        assert!(ensure_uid_safe("qd-443681d83879.bak/../../etc").is_err());
     }
 }
 

@@ -272,6 +272,11 @@ pub struct Settings {
     /// Qoder 积分快照调度开关（默认开；无账号时任务内部静默跳过不计失败）
     #[serde(default = "default_true")]
     pub qoder_credits_sync_enabled: bool,
+    /// Qoder 凭证定时续期开关（默认开）：qoder-refresh 任务每 6 小时为全部含
+    /// refresh_token 的账号兜底续期 dt- 凭证（客户端 token 惰性窗 7h > 6h 调度
+    /// 间隔，任一 tick 必落窗内）；关闭后凭证仅在使用时惰性刷新
+    #[serde(default = "default_true")]
+    pub qoder_token_renew_enabled: bool,
 }
 
 fn default_api_port() -> u16 {

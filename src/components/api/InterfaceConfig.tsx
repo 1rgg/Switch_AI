@@ -224,9 +224,21 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
 
   return (
     <div className="card p-4">
-      <div className="mb-3 flex items-center gap-2">
-        <Globe size={16} className="text-brand-500" />
-        <h3 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">接口配置</h3>
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <Globe size={16} className="text-brand-500" />
+          <h3 className="text-sm font-semibold text-slate-800 dark:text-zinc-100">接口配置</h3>
+        </div>
+        {/* 保存配置置于右上角（2026-10-02 评审：原在表单底部，长表单需滚动到底才能保存） */}
+        <button
+          className="btn-secondary flex items-center gap-2"
+          onClick={() => void save()}
+          disabled={saving}
+          title="保存端口 / 监听地址 / 默认模型 / 模型白名单"
+        >
+          <Save size={15} />
+          {saving ? '保存中…' : '保存配置'}
+        </button>
       </div>
 
       <div className="space-y-4">
@@ -327,15 +339,6 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
             </p>
           )}
         </div>
-
-        <button
-          className="btn-secondary flex items-center gap-2"
-          onClick={() => void save()}
-          disabled={saving}
-        >
-          <Save size={15} />
-          {saving ? '保存中…' : '保存配置'}
-        </button>
 
         <div className="rounded-lg bg-slate-50 p-3 text-xs text-slate-500 dark:bg-zinc-800/50 dark:text-zinc-400">
           <div className="mb-2 flex items-center justify-between">

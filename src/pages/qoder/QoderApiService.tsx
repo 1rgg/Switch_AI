@@ -301,10 +301,9 @@ export default function QoderApiService() {
         />
       </div>
 
-      {/* 左列：账号池选择 + 资源开关与调度参数（合并面板）｜右列：模型目录（Qoder），同行两列各占 1/2 */}
-      <div className="mt-4 grid grid-cols-12 items-start gap-4">
-        <div className="col-span-6">
-          <div className="card p-4">
+      {/* 账号池选择（全宽置顶，对齐 Buddy「资源调度」布局）：勾选白名单 + 分组筛选 + 账号清单；
+          「保存」位于面板右上角，一次提交账号池选择/资源开关/调度参数 */}
+      <div className="mt-4 card p-4">
             {/* 面板头＝账号池选择；「保存」位于面板整体右上角，一次保存账号池选择/资源开关/调度参数 */}
             <div className="mb-3 flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
@@ -399,6 +398,58 @@ export default function QoderApiService() {
               </div>
             )}
 
+            {/* 账号清单（勾选白名单：健康状态 / 在途计数 / credits 余额；分组外整行灰显） */}
+            {credAccounts.length === 0 ? (
+              <p className="py-4 text-center text-xs text-slate-400">
+                暂无含凭证账号：请先在「账号管理」PAT 导入或 OAuth 登录入池（凭证写入本地 token store）。
+              </p>
+            ) : (
+              <div className="space-y-1">
+                {credAccounts.map((a) => {
+                  // 可观测：实时在途并发（服务未运行/未匹配时为 0）；PoolStatus.uid 与账号 id 同域
+                  const inflight = qoderPool.find((p) => p.uid === a.id)?.inflight ?? 0;
+                  // 分组筛选激活时，分组外账号不参与调度（整行半透明标记，对齐 Buddy/Trae）
+                  const filteredOut = !inQoderFilter(a.id);
+                  return (
+                    <div
+                      key={a.id}
+                      className={`flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800 ${
+                        filteredOut ? 'opacity-50' : ''
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={qoderSelected.includes(a.id)}
+                        onChange={() => toggleQoderUid(a.id)}
+                      />
+                      <div className="min-w-0 flex-1 truncate font-medium">{a.nickname || a.id}</div>
+                      {filteredOut && <Badge tone="slate">分组外</Badge>}
+                      <Badge tone="slate">{a.plan || a.credential_source || '—'}</Badge>
+                      {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}
+                      {running && inflight > 0 && <Badge tone="amber">在途 {inflight}</Badge>}
+                      <span className="shrink-0 text-right tabular-nums text-xs text-slate-500">
+                        {a.credits_balance != null ? `${a.credits_balance.toFixed(2)} credits` : '余额未知'}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">
+              保存后即时生效；Trae 池的成员/分组与调度策略在 Trae「资源调度」页配置，Buddy 池配置在
+              Buddy「资源调度」页，本页不改动。
+            </p>
+      </div>
+
+      {/* 下方两列：资源开关与调度参数 ｜ 模型目录（Qoder），同行两列各占 1/2 */}
+      <div className="mt-4 grid grid-cols-12 items-start gap-4">
+        <div className="col-span-6">
+          <div className="card p-4">
+            <div className="mb-3 flex items-center gap-2">
+              <Activity size={16} className="text-brand-500" />
+              <span className="text-sm font-medium">资源开关与调度参数</span>
+            </div>
             {/* 资源开关（Qoder v1 仅上游总开关；池成员 fail-open 全量入池，无白名单/分组） */}
             <div className="mb-3 space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
               <label className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-100/60 dark:hover:bg-zinc-800/60">
@@ -484,49 +535,6 @@ export default function QoderApiService() {
                 </span>
               </div>
             </div>
-
-            {/* 账号清单（勾选白名单：健康状态 / 在途计数 / credits 余额；分组外整行灰显） */}
-            {credAccounts.length === 0 ? (
-              <p className="py-4 text-center text-xs text-slate-400">
-                暂无含凭证账号：请先在「账号管理」PAT 导入或 OAuth 登录入池（凭证写入本地 token store）。
-              </p>
-            ) : (
-              <div className="space-y-1">
-                {credAccounts.map((a) => {
-                  // 可观测：实时在途并发（服务未运行/未匹配时为 0）；PoolStatus.uid 与账号 id 同域
-                  const inflight = qoderPool.find((p) => p.uid === a.id)?.inflight ?? 0;
-                  // 分组筛选激活时，分组外账号不参与调度（整行半透明标记，对齐 Buddy/Trae）
-                  const filteredOut = !inQoderFilter(a.id);
-                  return (
-                    <div
-                      key={a.id}
-                      className={`flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800 ${
-                        filteredOut ? 'opacity-50' : ''
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={qoderSelected.includes(a.id)}
-                        onChange={() => toggleQoderUid(a.id)}
-                      />
-                      <div className="min-w-0 flex-1 truncate font-medium">{a.nickname || a.id}</div>
-                      {filteredOut && <Badge tone="slate">分组外</Badge>}
-                      <Badge tone="slate">{a.plan || a.credential_source || '—'}</Badge>
-                      {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}
-                      {running && inflight > 0 && <Badge tone="amber">在途 {inflight}</Badge>}
-                      <span className="shrink-0 text-right tabular-nums text-xs text-slate-500">
-                        {a.credits_balance != null ? `${a.credits_balance.toFixed(2)} credits` : '余额未知'}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">
-              保存后即时生效；Trae 池的成员/分组与调度策略在 Trae「资源调度」页配置，Buddy 池配置在
-              Buddy「资源调度」页，本页不改动。
-            </p>
           </div>
         </div>
 

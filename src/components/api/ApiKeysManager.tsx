@@ -29,7 +29,7 @@ const POOL_TAG: Record<CandidatePool, { label: string; tone: 'blue' | 'green' | 
 };
 /** 绑定池 → 展示文案（空串由调用方处理为跨池文案） */
 const bindPoolLabel = (p: string) =>
-  p === 'trae' ? 'Trae 池' : p === 'buddy' ? 'Buddy 池' : p === 'qoder' ? 'Qoder 池' : 'Trae/Buddy 池';
+  p === 'trae' ? 'Trae 池' : p === 'buddy' ? 'Buddy 池' : p === 'qoder' ? 'Qoder 池' : 'Trae/Buddy/Qoder 池';
 
 export default function ApiKeysManager({
   onSubModalChange,

@@ -126,13 +126,13 @@ interface AppState {
   removeGroup: (id: string) => Promise<void>;
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
   resetDevice: (userId: string) => Promise<void>;
-  switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') => Promise<void>;
+  switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') => Promise<void>;
   /** issue #44：看门狗超时后清空切换/保存进行中状态——解除 spinner/「切换中…」永挂；
       迟到的 done 事件仍会正常提示结果（onSwitchDone 对 null 幂等） */
   clearSwitchLocks: () => void;
   /** C1：一键以账号 X 打开豆包（恢复快照后拉起客户端；代理运行中时注入代理） */
   openDoubaoAs: (userId: string, proxyPort?: number) => Promise<void>;
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') => Promise<void>;
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') => Promise<void>;
   renewJwt: (userId: string) => Promise<void>;
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') => Promise<void>;
   startCheckin: (opts: {
@@ -225,6 +225,7 @@ function defaultSettings(): Settings {
     qoder_checkin_hhmm: '10:15',
     qoder_credits_sync_hhmm: '23:40',
     qoder_credits_sync_enabled: true,
+    qoder_token_renew_enabled: true,
   };
 }
 

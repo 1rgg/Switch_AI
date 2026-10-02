@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshCw, Activity, Eraser, Save, Layers, Pencil, Download } from 'lucide-react';
+import { RefreshCw, Activity, Eraser, Save, Layers, Pencil, Download, ToggleLeft, Gauge } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import { Badge, Modal, Spinner, StatCard } from '../components/ui';
 import { useAppStore } from '../store';
@@ -8,6 +8,7 @@ import { withMinDelay } from '../lib/delay';
 import { RefreshTokenBadge } from './accounts/RefreshTokenBadge';
 import type {
   ApiServiceStatus,
+  ApiPoolFile,
   PoolStatus,
   TraeModelMeta,
   UnifiedModel,
@@ -47,6 +48,8 @@ export default function ApiService() {
   const [poolGroups, setPoolGroups] = useState<Set<string>>(new Set());
   // Trae 池参与调度开关（每池自管开关；默认开 = 历史恒可用行为）
   const [traeEnabled, setTraeEnabled] = useState(true);
+  // 池文件（api_pool.json）：资源开关与调度参数面板的共用热参数只读透传取值源
+  const [poolFile, setPoolFile] = useState<ApiPoolFile | null>(null);
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [savingPool, setSavingPool] = useState(false);
   const [clearingCooldowns, setClearingCooldowns] = useState(false);
@@ -182,6 +185,7 @@ export default function ApiService() {
     setRefreshingPool(true);
     try {
       const pool = await withMinDelay(api.apiServer.poolList());
+      setPoolFile(pool);
       setEnabledUids(new Set(pool.enabled_uids));
       setPoolGroups(new Set(pool.group_ids ?? []));
       setTraeEnabled(pool.trae_enabled ?? true);
@@ -463,26 +467,9 @@ export default function ApiService() {
             </p>
           ) : (
             <>
-              {/* 分组筛选（T10，保存后热重载即时生效）；调度策略已收口至全局 API 管理调度策略中心 */}
+              {/* 分组筛选（T10，保存后热重载即时生效）；本池开关移入下方「资源开关与调度参数」面板；
+                  调度策略已收口至全局 API 管理调度策略中心 */}
               <div className="mb-3 space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
-                {/* 本池开关（每池自管开关：Trae 页管 Trae 池 / Buddy 页管 wb_enabled / Qoder 页管 qoder_enabled） */}
-                <div className="flex items-center gap-2">
-                  <input
-                    id="trae-pool-enabled"
-                    type="checkbox"
-                    checked={traeEnabled}
-                    onChange={(e) => setTraeEnabled(e.target.checked)}
-                  />
-                  <label
-                    htmlFor="trae-pool-enabled"
-                    className="text-xs font-medium text-slate-600 dark:text-zinc-300"
-                  >
-                    启用 Trae 池
-                    <span className="ml-1 font-normal text-slate-400">
-                      （默认开；停用后 Trae 模型不参与调度，仅 Trae 源模型显式报错）
-                    </span>
-                  </label>
-                </div>
                 {groups.length > 0 && (
                   <div className="flex items-start gap-2">
                     <label className="shrink-0 pt-1 text-xs text-slate-500 dark:text-zinc-400">
@@ -608,6 +595,72 @@ export default function ApiService() {
                     </label>
                   );
                 })}
+              </div>
+
+              {/* 资源开关与调度参数（对齐 Buddy：与账号池选择同面板，共用右上角「保存」） */}
+              <div className="mt-4 border-t border-slate-100 pt-3 dark:border-zinc-800">
+                <div className="mb-2 flex items-center gap-2">
+                  <ToggleLeft size={16} className="text-brand-500" />
+                  <span className="text-sm font-medium">资源开关与调度参数</span>
+                </div>
+                <div className="mb-2">
+                  {traeEnabled ? (
+                    <Badge tone="green">上游已启用</Badge>
+                  ) : (
+                    <Badge tone="amber">上游未启用 — Trae 源模型将显式报错</Badge>
+                  )}
+                </div>
+                <div className="space-y-1.5">
+                  {/* 本池开关（自分组筛选盒移入；每池自管：Trae 页管 trae_enabled） */}
+                  <label className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-50 dark:hover:bg-zinc-800/50">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-3.5 w-3.5 rounded border-slate-300 text-brand-600 focus:ring-brand-500"
+                      checked={traeEnabled}
+                      onChange={(e) => setTraeEnabled(e.target.checked)}
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-xs text-slate-700 dark:text-zinc-200">启用 Trae 上游</span>
+                      <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                        Trae 目录模型路由到 Trae 账号池，消耗各账号通用积分；
+                        关闭后仅 Trae 源模型显式报错，Buddy/Qoder 不受影响
+                      </span>
+                    </span>
+                  </label>
+                </div>
+                {/* 调度参数（F-77/F-76② 三池共用热参数，只读透传；编辑入口在 Buddy「资源调度」页） */}
+                <div className="mt-4">
+                  <div className="mb-2 flex items-center gap-2">
+                    <Gauge size={15} className="text-brand-500" />
+                    <span className="text-sm font-medium">调度参数</span>
+                    <span className="text-xs text-slate-400">三池共用 · 本页只读</span>
+                  </div>
+                  <div className="space-y-2 rounded-lg bg-slate-50 p-3 text-[11px] dark:bg-zinc-800/50">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500 dark:text-zinc-400">账号并发上限</span>
+                      <span className="tabular-nums text-slate-600 dark:text-zinc-300">
+                        {poolFile?.account_concurrency_limit
+                          ? `${poolFile.account_concurrency_limit} 并发/账号`
+                          : '不限（默认）'}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-500 dark:text-zinc-400">池粘性 TTL</span>
+                      <span className="tabular-nums text-slate-600 dark:text-zinc-300">
+                        {poolFile?.pool_sticky_ttl_secs
+                          ? `${poolFile.pool_sticky_ttl_secs}s（TTL 内同会话落同账号）`
+                          : '默认'}
+                      </span>
+                    </div>
+                    <p className="text-slate-400 dark:text-zinc-500">
+                      如需调整请到 Buddy「资源调度」页（三池共用，改动影响所有渠道）。
+                    </p>
+                  </div>
+                </div>
+                <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">
+                  上方勾选与分组筛选决定 Trae 池取号范围（保存后即时生效）；
+                  池间 / 池内调度策略在全局 API 管理「调度策略中心」配置。
+                </p>
               </div>
             </>
           )}

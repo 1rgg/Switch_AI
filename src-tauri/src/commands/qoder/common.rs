@@ -163,6 +163,58 @@ pub(crate) fn machine_id_of(state: &AppState, account_id: &str) -> Option<String
         .filter(|m| !m.is_empty())
 }
 
+/// F-80 §5.10 守卫数据源（切换/保存共用，2026-10-02 审查从 switch.rs 内联收编）：
+/// Qoder（icube 布局）当前登录真源 = IDE state.vscdb secret://userInfo（DPAPI 解密，
+/// 与 ide_store 扫描同链路，仅 Windows）→ uid 在池反查账号 id。uid 在池外时原样
+/// 返回（守卫消息如实提示「与标记账号不一致」，uid 与 qd- 池 id 无碰撞）；
+/// 未登录/解密失败 → None（调用方 fail-open：仅跳过回写/守卫放行，不阻断流程）。
+#[cfg(windows)]
+pub(crate) fn live_account_id(state: &AppState) -> Option<String> {
+    let uid = ide_data_dir()
+        .and_then(|dir| super::ide_store::scan_ide_login(&dir).ok())
+        .map(|l| l.uid)
+        .filter(|u| !u.is_empty())?;
+    Some(
+        load_pool(state)
+            .into_iter()
+            .find(|a| a.uid == uid)
+            .map(|a| a.id)
+            .unwrap_or(uid),
+    )
+}
+
+/// 非 Windows：Qoder 守卫无数据源（IDE 登录态解析依赖 Windows DPAPI）
+#[cfg(not(windows))]
+pub(crate) fn live_account_id(_state: &AppState) -> Option<String> {
+    None
+}
+
+/// Qoder Work 守卫数据源（2026-10-02 审查补齐，与 IDE 守卫同权）：Work 客户端
+/// Cookies（根级 Chromium 库）的 qoderuid cookie（uuid，与池账号 uid 同源）→
+/// 池反查账号 id。uid 在池外原样返回；Cookie 缺失/解密失败 → None（fail-open：
+/// 保存守卫放行、切换来源槽不回写）。未登录时该 Cookie 不存在，天然 fail-open。
+#[cfg(windows)]
+pub(crate) fn live_work_account_id(state: &AppState) -> Option<String> {
+    let data_dir =
+        crate::switcher::profile::profile_for(crate::switcher::TargetApp::QoderWork, &state.data_dir)
+            .data_dir;
+    let uid = super::ide_store::read_cookie_value(&data_dir, "qoder.cn", "qoderuid")
+        .filter(|u| !u.is_empty())?;
+    Some(
+        load_pool(state)
+            .into_iter()
+            .find(|a| a.uid == uid)
+            .map(|a| a.id)
+            .unwrap_or(uid),
+    )
+}
+
+/// 非 Windows：Qoder Work 守卫无数据源（Cookie 解密依赖 Windows DPAPI）
+#[cfg(not(windows))]
+pub(crate) fn live_work_account_id(_state: &AppState) -> Option<String> {
+    None
+}
+
 // ── 环境检测（M0 侦察结论固化为候选路径；M0 R-1/R-2 缺口闭合后扩展）─────────
 
 /// 0.4.3+ 拆分形态检测：真 IDE 已独立安装于 `%LOCALAPPDATA%\Programs\Qoder CN IDE\`

@@ -165,6 +165,7 @@ pub fn switch_account(
     let is_trae = matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae"));
     // F-80 §5.10.2：Qoder 切号需携带账号绑定 machine_id 做本地存储指纹覆写
     let is_qoder = target_app.as_deref() == Some("Qoder");
+    let is_qoder_work = target_app.as_deref() == Some("QoderWork");
     let include_idb = is_doubao && state.settings().doubao_snapshot_include_idb;
     // 切换前服务端会话预检（仅豆包）：目标槽位快照里的会话若已被服务端吊销——常见于
     // 在豆包客户端内退出登录/重登该账号（passport logout 吊销旧会话，快照文件却完好）——
@@ -236,26 +237,16 @@ pub fn switch_account(
         // uid 在池反查账号 id。uid 在池外时原样返回（守卫消息如实提示「与标记
         // 账号不一致」，且 uid 与 qd- 池 id 无碰撞）；未登录/解密失败 → 空串
         // fail-open（仅跳过回写，不阻断切换）。此前 Qoder 落入空串兜底：守卫
-        // 每次误报「未识别登录会话」且来源账号槽永不回写（合并审查修复）
-        #[cfg(windows)]
-        {
-            let detected = crate::commands::qoder::ide_data_dir()
-                .and_then(|dir| crate::commands::qoder::scan_ide_login(&dir).ok())
-                .map(|l| l.uid)
-                .filter(|u| !u.is_empty());
-            match detected {
-                Some(uid) => crate::commands::qoder::load_pool(&state)
-                    .into_iter()
-                    .find(|a| a.uid == uid)
-                    .map(|a| a.id)
-                    .unwrap_or(uid),
-                None => String::new(),
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            String::new()
-        }
+        // 每次误报「未识别登录会话」且来源账号槽永不回写（合并审查修复）。
+        // 2026-10-02 审查：逻辑收编为 commands::qoder::live_account_id，与
+        // profile_backup 保存守卫预探测共用同一实现
+        crate::commands::qoder::live_account_id(&state).unwrap_or_default()
+    } else if is_qoder_work {
+        // 2026-10-02 审查补齐：Qoder Work 切换守卫数据源 = 客户端 Cookies qoderuid
+        // cookie 解密（uuid 与池 uid 同源）→ 池反查账号 id；Cookie 缺失/解密失败 →
+        // 空串 fail-open（仅跳过回写，不阻断切换）。非空时 switch_flow 守卫可正常
+        // 把当前登录态回写到来源账号槽（此前 Work 恒空串，来源槽永不回写）
+        crate::commands::qoder::live_work_account_id(&state).unwrap_or_default()
     } else {
         String::new()
     };
@@ -350,11 +341,12 @@ pub fn switch_account(
     let uid_for_dc = user_id.clone();
     let is_doubao2 = is_doubao;
     let is_qoder2 = is_qoder;
+    let is_qoder_work2 = is_qoder_work;
     run_in_background(app2, "switch-progress", "switch-done", args, migrate_job, Some(Box::new(move |_app, dc_dir| {
         // 切换成功后补充该账号的账户中心（icube-dc）id 预留记录（只记录不展示）
         // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过；
-        // Qoder 无 icube-dc 通道（qoder_uid 另行回填），同样跳过
-        if !is_doubao2 && !is_qoder2 {
+        // Qoder/QoderWork 无 icube-dc 通道（qoder_uid 另行回填），同样跳过
+        if !is_doubao2 && !is_qoder2 && !is_qoder_work2 {
             let _ = crate::commands::trae_apps::backfill_dc_id_for(dc_dir, &uid_for_dc);
         }
     })));
@@ -449,13 +441,14 @@ pub fn save_current_login(
     );
     let is_doubao = target_app.as_deref() == Some("Doubao");
     let is_qoder = target_app.as_deref() == Some("Qoder");
+    let is_qoder_work = target_app.as_deref() == Some("QoderWork");
     let app2 = app.clone();
     let uid_for_dc = user_id.clone();
     run_in_background(app2, "save-login-progress", "save-login-done", args, None, Some(Box::new(move |_app, dc_dir| {
         // 保存登录态成功后同样补充 dc id 预留记录（快照刚生成，来源最可靠）
         // 仅 icube 布局（TraeWork/Trae）有意义；豆包快照无 storage.json，跳过；
-        // Qoder 无 icube-dc 通道，同样跳过
-        if !is_doubao && !is_qoder {
+        // Qoder/QoderWork 无 icube-dc 通道，同样跳过
+        if !is_doubao && !is_qoder && !is_qoder_work {
             let _ = crate::commands::trae_apps::backfill_dc_id_for(dc_dir, &uid_for_dc);
         }
     })));

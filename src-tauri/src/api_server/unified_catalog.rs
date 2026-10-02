@@ -146,6 +146,12 @@ fn vendor_of(canonical: &str) -> &'static str {
         ("gpt", "OpenAI"),
         ("o1", "OpenAI"),
         ("o3", "OpenAI"),
+        // 2026-10-02：Qoder 目录新增模型（step-5-preview / step5model 形态、
+        // space-bunny）；Space-Bunny 供应商产品确认为未知，标注「未知」
+        ("step-5", "阶跃星辰"),
+        ("step5", "阶跃星辰"),
+        ("space-bunny", "未知"),
+        ("spacebunny", "未知"),
     ] {
         if canonical.starts_with(prefix) {
             return vendor;

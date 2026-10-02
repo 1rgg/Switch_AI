@@ -545,7 +545,44 @@ pub fn fetch_userinfo(agent: &ureq::Agent, creds: &QoderCreds) -> (Option<String
 
 // ── plan 查询（R-7 抓包固化：GET /api/v2/user/plan → plan_tier_name 等）─────
 
-/// GET /api/v2/user/plan → (plan_tier_name, user_type, end_date_ms)；失败全 None。
+/// 套餐档位展示名映射（2026-10-02 实测两通道取值形态）：
+/// - openapi `/api/v2/user/plan`：`plan_tier_name` 如 "Pro Trial"（R-7 抓包）
+/// - qoder.cn Web `/api/v1/me/userplan`：`plan_tier`/`plan_tier_name` 为枚举，
+///   如 `PLAN_TIER_FREE`（免费）、`PLAN_TIER_PRO`（专业版）、`PLAN_TIER_PRO_PLUS`
+///   （高级版）、`PLAN_TIER_ULTRA`（旗舰版）；定价档位见 `/api/v1/products/pricing/all`
+///   （Pro / Pro+ / Ultra）。
+/// 匹配不分大小写、下划线归一为空格；未识别档位原样透传。
+pub fn plan_display_name(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let l = s.to_ascii_lowercase().replace('_', " ");
+    // 顺序敏感：trial/free 必须先于 pro（"Pro Trial" 属试用档）；pro plus 先于 pro（子串包含）
+    if l.contains("trial") || l.contains("free") {
+        return "体验版".into();
+    }
+    if l.contains("ultra") || l.contains("ultimate") {
+        return "旗舰版".into();
+    }
+    if l.contains("pro plus") || l.contains("pro+") || l.contains("premium") || l.contains("advanced") {
+        return "高级版".into();
+    }
+    if l.contains("pro") || l.contains("professional") {
+        return "专业版".into();
+    }
+    s.to_string()
+}
+
+/// 套餐档位回填门控（qoder_credits 余额刷新顺带拉取 /api/v2/user/plan 的决策函数，
+/// 2026-10-02 审查优化）：仅当 ①本行余额拉取成功 且 ②池内无套餐 或 存量值为待归一
+/// 的原始档位名（plan_display_name 对已归一展示名/Teams 等未知档位映射为自身）时
+/// 才发起查询——已归一账号的余额刷新不再支付每次一次的额外 HTTP 往返。
+pub fn need_plan_fetch(row_ok: bool, stored_plan: &str) -> bool {
+    row_ok && (stored_plan.is_empty() || plan_display_name(stored_plan) != stored_plan)
+}
+
+/// GET /api/v2/user/plan → (plan_tier 展示名, user_type, end_date_ms)；失败全 None。
 /// 实测响应：{"user_type":"personal_professional_trial","plan_tier_name":"Pro Trial",
 ///           "is_personal_version":true,"is_paid_plan":false,...,"end_date":1791673619906}
 pub fn fetch_plan(agent: &ureq::Agent, creds: &QoderCreds) -> (Option<String>, Option<String>, Option<i64>) {
@@ -555,9 +592,13 @@ pub fn fetch_plan(agent: &ureq::Agent, creds: &QoderCreds) -> (Option<String>, O
         return (None, None, None);
     }
     let Some(b) = body else { return (None, None, None) };
-    let tier = fs_utils::dig(&b, &["plan_tier_name", "planTierName"])
-        .and_then(Value::as_str)
-        .map(String::from);
+    // 宽容解析：tier 可能落 plan_tier_name/planTierName/plan_tier/planTier（枚举）等键
+    let tier = fs_utils::dig(
+        &b,
+        &["plan_tier_name", "planTierName", "plan_tier", "planTier"],
+    )
+    .and_then(Value::as_str)
+    .map(plan_display_name);
     let user_type = fs_utils::dig(&b, &["user_type", "userType"])
         .and_then(Value::as_str)
         .map(String::from);
@@ -865,6 +906,36 @@ pub fn account_id_of(token: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 套餐档位映射：openapi 展示名 / Web 端枚举 / 定价档位名 → 体验/专业/高级/旗舰版
+    #[test]
+    fn plan_display_name_maps_known_tiers() {
+        assert_eq!(plan_display_name("PLAN_TIER_FREE"), "体验版");
+        assert_eq!(plan_display_name("Pro Trial"), "体验版");
+        assert_eq!(plan_display_name("PLAN_TIER_PRO"), "专业版");
+        assert_eq!(plan_display_name("Pro"), "专业版");
+        assert_eq!(plan_display_name("PLAN_TIER_PRO_PLUS"), "高级版");
+        assert_eq!(plan_display_name("Pro+"), "高级版");
+        assert_eq!(plan_display_name("PLAN_TIER_ULTRA"), "旗舰版");
+        assert_eq!(plan_display_name("Ultra"), "旗舰版");
+        assert_eq!(plan_display_name(""), "");
+        // 未识别档位原样透传（如 Teams / Enterprise）
+        assert_eq!(plan_display_name("Teams"), "Teams");
+        assert_eq!(plan_display_name("Enterprise"), "Enterprise");
+    }
+
+    /// 套餐回填门控（集成口径）：行失败恒不查；池内空/待归一原始名才查；
+    /// 已归一展示名与未知档位（映射为自身）不查——保证归一只发生一次
+    #[test]
+    fn need_plan_fetch_门控矩阵() {
+        assert!(need_plan_fetch(true, ""), "无套餐必查");
+        assert!(need_plan_fetch(true, "Pro Trial"), "openapi 原始展示名待归一");
+        assert!(need_plan_fetch(true, "PLAN_TIER_PRO"), "Web 枚举形态待归一");
+        assert!(!need_plan_fetch(true, "体验版"), "已归一展示名不再查");
+        assert!(!need_plan_fetch(true, "Teams"), "未知档位映射为自身，不重复查");
+        assert!(!need_plan_fetch(false, ""), "行失败（401 自愈未果等）不查");
+        assert!(!need_plan_fetch(false, "Pro Trial"));
+    }
 
     #[test]
     fn creds_of_parses_flat_and_nested() {

@@ -280,6 +280,8 @@ fn enabled(st: &AppState, key: &str) -> bool {
         // 积分快照独立开关（默认开；无账号时任务内部静默跳过不计失败）
         "qoder-checkin" => crate::commands::qoder::load_settings(st).auto_checkin,
         "qoder-credits-snapshot" => st.settings().qoder_credits_sync_enabled,
+        // Qoder 凭证定时续期（环境配置页可关；默认开，每 6h 兜底刷新）
+        "qoder-refresh" => st.settings().qoder_token_renew_enabled,
         // 看板数据同步（积分/Token）：mode=off 即关闭（hourly/daily 均视为启用）
         "wb-credits-snapshot" | "trae-credits-snapshot" => credits_sync_mode(st, key) != "off",
         // 模型同步开关（默认开；无账号时任务内部静默跳过不计失败）

@@ -119,6 +119,65 @@ fn read_vscdb_key(vscdb: &Path, key: &str) -> Result<Option<String>, String> {
 
 // ── 登录态读取 ─────────────────────────────────────────────────────────────
 
+/// Chromium Cookies 库单 Cookie 解密（Qoder Work 登录守卫用，2026-10-02 审查补齐）。
+/// 链路与 IDE 相同（根级 Local State → DPAPI → AES-256-GCM），差异仅在库文件与表结构：
+/// `Network/Cookies`（cookies 表 encrypted_value BLOB）。客户端运行中持库锁 → 先拷贝
+/// 到临时文件（含 -wal，尽量合并写入）再只读打开；找不到 Cookie / 解密失败 → None
+/// （调用方 fail-open，不阻断流程）。
+#[cfg(windows)]
+pub fn read_cookie_value(data_dir: &Path, host_suffix: &str, cookie_name: &str) -> Option<String> {
+    let db = data_dir.join("Network").join("Cookies");
+    if !db.is_file() {
+        return None;
+    }
+    // 临时副本：主库 + WAL（-shm 可省，SQLite 会重建）
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let tmp = std::env::temp_dir().join(format!("qoder-cookies-{}-{nanos}.db", std::process::id()));
+    let tmp_wal = tmp.with_file_name(format!("{}-wal", tmp.file_name()?.to_string_lossy()));
+    if std::fs::copy(&db, &tmp).is_err() {
+        return None;
+    }
+    let wal = db.with_file_name("Cookies-wal");
+    if wal.is_file() {
+        let _ = std::fs::copy(&wal, &tmp_wal);
+    }
+    let result = (|| {
+        let conn = rusqlite::Connection::open_with_flags(
+            &tmp,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .ok()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT encrypted_value, value FROM cookies \
+                 WHERE host_key LIKE ?1 AND name = ?2 \
+                 ORDER BY expires_utc DESC LIMIT 1",
+            )
+            .ok()?;
+        let mut rows = stmt
+            .query(rusqlite::params![format!("%{host_suffix}"), cookie_name])
+            .ok()?;
+        let row = rows.next().ok()??;
+        let enc: Vec<u8> = row.get(0).ok()?;
+        let plain_fallback: String = row.get(1).ok()?;
+        // 首选 v10 密文；空密文时回落明文 value（老版本/非加密 Cookie 形态）
+        let key = ide_aes_key(data_dir).ok()?;
+        decrypt_v10(&enc, &key).or_else(|| {
+            if enc.is_empty() && !plain_fallback.is_empty() {
+                Some(plain_fallback)
+            } else {
+                None
+            }
+        })
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&tmp_wal);
+    result
+}
+
 /// IDE 存储当前登录账号（解密产物；token 仅供导入通路，不落日志/事件）
 #[cfg(windows)]
 pub struct IdeLogin {
@@ -365,5 +424,98 @@ mod tests {
         assert_eq!(expire_ms_of(&v), Some(1_791_673_619_000));
         let v: serde_json::Value = serde_json::from_str(r#"{"expireTime":"1791673619"}"#).unwrap();
         assert_eq!(expire_ms_of(&v), Some(1_791_673_619_000));
+    }
+
+    /// Work 守卫数据源全链路（2026-10-02 审查补齐）：Local State（DPAPI 包裹 AES 密钥）
+    /// → Network/Cookies 库 → host+name 过滤 → v10 解密 qoderuid → 明文 value 回落。
+    /// 与生产 read_cookie_value 的唯一差异是库文件由测试生成（含诱饵行验证过滤）。
+    #[test]
+    fn work_cookie_解密全链路_roundtrip() {
+        use base64::Engine as _;
+        let base = std::env::temp_dir().join(format!(
+            "f80-workcookie-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let data_dir = base.join("com.qodercn.app.stable");
+        std::fs::create_dir_all(data_dir.join("Network")).unwrap();
+
+        // 1) AES 密钥经 DPAPI 包裹写入 Local State（os_crypt.encrypted_key，生产同构）
+        let key = [42u8; 32];
+        let protected = crate::vault::dpapi::protect(&key).unwrap();
+        let mut wrapped = b"DPAPI".to_vec();
+        wrapped.extend_from_slice(&protected);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&wrapped);
+        std::fs::write(
+            data_dir.join("Local State"),
+            serde_json::json!({ "os_crypt": { "encrypted_key": b64 } }).to_string(),
+        )
+        .unwrap();
+
+        // 2) Cookies 库：v10 加密的 qoderuid + 诱饵行（host/name 过滤必须排除）
+        let uid = "01a0fc99-d387-7867-96f6-8391bdf6b179";
+        let enc = {
+            use aes_gcm::aead::Aead;
+            use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+            let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+            let nonce = Nonce::from_slice(&[9u8; 12]);
+            let mut blob = b"v10".to_vec();
+            blob.extend_from_slice(nonce);
+            blob.extend_from_slice(&cipher.encrypt(nonce, uid.as_bytes()).unwrap());
+            blob
+        };
+        let db = data_dir.join("Network").join("Cookies");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cookies (host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, expires_utc INTEGER)",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cookies VALUES('https://evil.com', 'qoderuid', '', ?1, 0)",
+            rusqlite::params![b"v10-decoy".to_vec()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cookies VALUES('https://qoder.cn', 'other', '', x'00', 0)",
+            rusqlite::params![],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cookies VALUES('https://qoder.cn', 'qoderuid', '', ?1, 18934560000000000)",
+            rusqlite::params![enc],
+        )
+        .unwrap();
+        drop(conn);
+
+        // 3) 全链路解密：host 过滤排除诱饵行，v10 解出 qoderuid
+        assert_eq!(
+            read_cookie_value(&data_dir, "qoder.cn", "qoderuid").as_deref(),
+            Some(uid),
+            "host+name 过滤后应解密出 qoderuid"
+        );
+
+        // 4) 未登录（无 Cookies 库）→ None（fail-open）
+        let fresh = base.join("fresh");
+        std::fs::create_dir_all(&fresh).unwrap();
+        assert_eq!(read_cookie_value(&fresh, "qoder.cn", "qoderuid"), None);
+
+        // 5) 明文 value 回落（老形态）：密文清空、value 填明文 → 仍可读出
+        let conn2 = rusqlite::Connection::open(&db).unwrap();
+        conn2
+            .execute(
+                "UPDATE cookies SET encrypted_value = x'', value = ?1 WHERE name = 'qoderuid'",
+                rusqlite::params![uid],
+            )
+            .unwrap();
+        drop(conn2);
+        assert_eq!(
+            read_cookie_value(&data_dir, "qoder.cn", "qoderuid").as_deref(),
+            Some(uid),
+            "v10 密文为空时应回落明文 value"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

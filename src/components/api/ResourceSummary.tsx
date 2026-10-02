@@ -2,11 +2,11 @@
  * 全局 API 管理 · 资源总览与调度策略中心（unified-api-gateway-design §5.2/§5.3）
  * 「调度策略中心」卡集中三块（任务7，从资源角度整体设计）：
  *  ① 最佳组合预设：5 组专家组合（池间 + Trae / Buddy / Qoder 池内策略）一键应用，
- *     当前命中组合高亮（Qoder 池间调度恒尾部接管，不受预设池间策略影响）；
+ *     当前命中组合高亮（Qoder 与 Trae/Buddy 同等参与池间调度，默认序尾部可上移）；
  *  ② 池间调度策略：smart / priority + 优先级序编辑 + 跨池回退（dispatch_policy_get/set 即时生效）；
  *  ③ 各资源池池内调度：Trae（strategy）/ Buddy（wb_strategy，空 = 跟随 Trae 池）/
  *     Qoder（qoder_strategy，空 = 跟随 Trae 池）下拉编辑，自定义模型命中即直达；
- *     上游开关与池成员在各应用「资源调度」页维护（Qoder 开关在 Qoder 资源调度页）。
+ *     上游开关与池成员在各应用「资源调度」页维护。
  * 下方为 Trae / Buddy / Qoder / 自定义 四池摘要卡；前三者详情引导至各应用「资源调度」页，
  * 自定义池详情引导至「自定义模型」Tab。
  * 数据源：pool_list / accounts_list（Trae 池）、pool_list.wb_enabled / workbuddy_accounts_list
@@ -139,7 +139,7 @@ function DispatchCenterCard({
   if (!policy) return null;
 
   return (
-    <div className="card p-4 lg:col-span-3">
+    <div className="card p-4">
       {/* 头部 */}
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <SlidersHorizontal size={16} className="text-brand-500" />
@@ -156,7 +156,7 @@ function DispatchCenterCard({
       {/* ① 最佳组合预设 */}
       <div className="mb-3">
         <div className="mb-1.5 text-[11px] font-medium text-slate-500 dark:text-zinc-400">
-          最佳组合预设（池间 + Trae 池 + Buddy 池 一键应用）
+          最佳组合预设（池间 + Trae / Buddy / Qoder 池内策略 一键应用）
         </div>
         <div className="flex flex-wrap gap-1.5">
           {DISPATCH_PRESETS.map((p) => {
@@ -166,7 +166,7 @@ function DispatchCenterCard({
                 key={p.key}
                 title={p.desc}
                 disabled={!pool || saving}
-                onClick={() => void save({ inter: p.inter, trae: p.trae, buddy: p.buddy })}
+                onClick={() => void save({ inter: p.inter, trae: p.trae, buddy: p.buddy, qoder: p.qoder })}
                 className={`flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-colors disabled:opacity-50 ${
                   active
                     ? 'border-brand-500 bg-brand-50 font-semibold text-brand-600 dark:bg-brand-500/10 dark:text-brand-400'
@@ -183,15 +183,14 @@ function DispatchCenterCard({
           {activePreset ? activePreset.desc : '当前为手动组合；选择预设可一键对齐推荐配置'}
         </p>
         <p className="mt-1 text-[11px] text-slate-400 dark:text-zinc-500">
-          Qoder 池始终尾部接管（多源同名模型的兜底序），不受预设影响。
+          Qoder 池与 Trae / Buddy 同等地位参与策略调度（默认优先级序位于尾部，可在「固定优先级」中上移）。
         </p>
       </div>
 
       {/* ② 池间调度策略 */}
       <div className="border-t border-slate-100 pt-3 dark:border-zinc-800">
         <div className="mb-1.5 text-[11px] font-medium text-slate-500 dark:text-zinc-400">
-          池间调度（仅作用于多源同名模型 Trae/Buddy/Qoder；自定义模型命中即直达不受影响；
-          Qoder 池恒为兜底序尾部）
+          池间调度（仅作用于多源同名模型 Trae/Buddy/Qoder；自定义模型命中即直达不受影响）
         </div>
         <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs">
           <label className="flex items-center gap-2">
@@ -306,7 +305,7 @@ function DispatchCenterCard({
             自定义模型：<span className="text-slate-700 dark:text-zinc-200">命中即直达</span>（上游自有计费，无池内调度）
           </span>
           <span className="text-slate-400 dark:text-zinc-500">
-            上游开关与成员在各应用「资源调度」页（Qoder 开关在 Qoder 资源调度页配置）
+            上游开关与成员在各应用「资源调度」页配置
           </span>
         </div>
       </div>
@@ -373,17 +372,20 @@ export default function ResourceSummary() {
   const customEnabled = customModels.filter((m) => m.enabled).length;
 
   return (
-    <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-      {/* 调度策略中心（预设 + 池间 + 池内集中管理） */}
+    <div className="space-y-4">
+      {/* 调度策略中心（预设 + 池间 + 池内集中管理，整宽一行） */}
       <DispatchCenterCard pool={pool} onPoolChanged={setPool} />
 
+      {/* 四池摘要卡（Trae / Buddy / Qoder / 自定义）同行等宽排布 */}
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-4">
       {/* Trae 资源池摘要 */}
       <div className="card p-4">
         <div className="mb-3 flex items-center gap-2">
           <Server size={16} className="text-brand-500" />
           <span className="text-sm font-medium text-slate-800 dark:text-zinc-100">Trae 资源池</span>
-          <Badge tone={metrics.traePoolCount > 0 ? 'green' : 'slate'}>
-            {metrics.traePoolCount > 0 ? '可用' : '空池'}
+          {/* 对齐 Buddy/Qoder 卡口径：上游开关状态（原「可用/空池」与池成员数语义重复） */}
+          <Badge tone={(pool?.trae_enabled ?? true) ? 'green' : 'slate'}>
+            {(pool?.trae_enabled ?? true) ? '上游已启用' : '上游未启用'}
           </Badge>
         </div>
         <div className="space-y-1.5">
@@ -509,6 +511,7 @@ export default function ResourceSummary() {
           <Blocks size={11} className="mr-1 inline" />
           详情（新增 / 编辑 / 启停）见「自定义模型」Tab
         </p>
+      </div>
       </div>
     </div>
   );

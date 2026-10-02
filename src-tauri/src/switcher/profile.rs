@@ -12,6 +12,9 @@ use super::TargetApp;
 pub enum Layout {
     Icube,
     Chromium,
+    /// Electron 根级 Chromium 会话（Qoder Work：userData 根直挂 Network/Local
+    /// Storage，无 Default/Profile N 子目录，与 Chromium 布局不同构）
+    ElectronRoot,
     Authfile,
 }
 
@@ -21,6 +24,7 @@ impl Layout {
         match self {
             Layout::Icube => "icube",
             Layout::Chromium => "chromium",
+            Layout::ElectronRoot => "electron-root",
             Layout::Authfile => "authfile",
         }
     }
@@ -210,22 +214,47 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             settings_path_key: "qoder_ide_path",
             // 同 Trae 系：VSCode fork 强杀后 vscdb WAL 残留被启动回放，8s 优雅落盘
             graceful_wait_secs: 8,
-            // 壳（Qoder CN.exe）+ IDE 本体（Qoder CN IDE.exe）一起停；
-            // proc_patterns "Qoder CN*" 防误命中 QoderWork（Launcher 进程名不匹配），
-            // 再经 exe_names 白名单过滤防串台
-            proc_names: &["Qoder CN IDE", "Qoder CN"],
-            proc_patterns: &["Qoder CN*"],
-            exe_names: &["Qoder CN IDE.exe", "Qoder CN.exe"],
+            // 2026-10-02 收窄：IDE 全部进程均名为 "Qoder CN IDE"（安装目录仅此一个
+            // exe，实测）；旧「壳进程 Qoder CN.exe」已被 Qoder Work 独立客户端接管
+            //（%LOCALAPPDATA%\Programs\Qoder CN\Qoder CN.exe），保留会让
+            // exe_names/lnk/注册表/运行进程发现三级串台启动 Work exe → 白名单只留
+            // IDE 本体。切 IDE 不再连带关 Work（进程名已无交集）
+            proc_names: &["Qoder CN IDE"],
+            proc_patterns: &["Qoder CN IDE*"],
+            exe_names: &["Qoder CN IDE.exe"],
             lnk_patterns: &["*Qoder*"],
             reg_patterns: &["*Qoder*"],
             exe_candidates: vec![
                 PathBuf::from(format!("{local}\\Programs\\Qoder CN IDE\\Qoder CN IDE.exe")),
-                PathBuf::from(format!("{local}\\Programs\\Qoder CN\\Qoder CN.exe")),
                 PathBuf::from(format!("{program_files}\\Qoder CN IDE\\Qoder CN IDE.exe")),
-                PathBuf::from(format!("{program_files}\\Qoder CN\\Qoder CN.exe")),
             ],
             cb_global_storage_dir: None,
             icube_items: super::icube::QODER_IDE_ITEMS,
+        },
+        TargetApp::QoderWork => AppProfile {
+            app_name: "Qoder Work",
+            // 2026-10-02 实测：独立 Electron 客户端（0.4.3，.qoder-versions 滚动更新），
+            // 数据目录 %APPDATA%\com.qodercn.app.stable（默认会话挂 userData 根：
+            // Network/Cookies、Local Storage、Session Storage、Local State、Preferences）
+            layout: Layout::ElectronRoot,
+            data_dir: PathBuf::from(format!("{appdata}\\com.qodercn.app.stable")),
+            profiles_dir: data.join("data").join("profiles_qoder_work"),
+            settings_path_key: "qoder_work_path",
+            // Electron 退出前要落盘 leveldb/cookie（同豆包 chromium 布局 8s 理由）
+            graceful_wait_secs: 8,
+            // 进程名 "Qoder CN" 与 IDE 壳同名（Work 接管了该进程名）：精确匹配
+            // 只停 Work 本体，不 wildcard（"Qoder CN*" 会误杀 Qoder CN IDE）
+            proc_names: &["Qoder CN"],
+            proc_patterns: &["Qoder CN"],
+            exe_names: &["Qoder CN.exe"],
+            lnk_patterns: &["*Qoder*"],
+            reg_patterns: &["*Qoder*"],
+            exe_candidates: vec![
+                PathBuf::from(format!("{local}\\Programs\\Qoder CN\\Qoder CN.exe")),
+                PathBuf::from(format!("{program_files}\\Qoder CN\\Qoder CN.exe")),
+            ],
+            cb_global_storage_dir: None,
+            icube_items: &[],
         },
     }
 }
@@ -239,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn 六应用档案字段与ps常量表一致() {
+    fn 七应用档案字段与ps常量表一致() {
         let data = temp_data();
         let tw = profile_for(TargetApp::TraeWork, &data);
         assert_eq!(tw.app_name, "Trae Work");
@@ -285,10 +314,28 @@ mod tests {
         assert_eq!(qd.profiles_dir, data.join("data").join("profiles_qoder"));
         assert_eq!(qd.settings_path_key, "qoder_ide_path");
         assert_eq!(qd.graceful_wait_secs, 8);
-        assert_eq!(qd.proc_names, &["Qoder CN IDE", "Qoder CN"]);
-        assert_eq!(qd.exe_candidates.len(), 4);
+        // 2026-10-02 收窄：Qoder CN.exe 已归 Qoder Work，IDE 白名单只留本名
+        assert_eq!(qd.proc_names, &["Qoder CN IDE"]);
+        assert_eq!(qd.exe_names, &["Qoder CN IDE.exe"]);
+        assert_eq!(qd.exe_candidates.len(), 2);
         assert!(qd.cb_global_storage_dir.is_none());
         assert_eq!(qd.icube_items.len(), 15);
+
+        // 2026-10-02：Qoder Work 独立客户端（electron-root 布局，数据目录 com.qodercn.app.stable）
+        let qw = profile_for(TargetApp::QoderWork, &data);
+        assert_eq!(qw.app_name, "Qoder Work");
+        assert_eq!(qw.layout, Layout::ElectronRoot);
+        assert_eq!(
+            qw.data_dir,
+            PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("com.qodercn.app.stable")
+        );
+        assert_eq!(qw.profiles_dir, data.join("data").join("profiles_qoder_work"));
+        assert_eq!(qw.settings_path_key, "qoder_work_path");
+        assert_eq!(qw.graceful_wait_secs, 8);
+        assert_eq!(qw.proc_names, &["Qoder CN"]);
+        assert_eq!(qw.exe_candidates.len(), 2);
+        assert!(qw.cb_global_storage_dir.is_none());
+        assert!(qw.icube_items.is_empty());
     }
 
     #[test]

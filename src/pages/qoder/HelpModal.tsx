@@ -27,7 +27,7 @@ export function QoderHelpModal({ open, onClose }: { open: boolean; onClose: () =
               <b>OAuth 设备流登录</b>：点右上角「OAuth登录」，应用自动发起设备流授权，成功后凭证自动入池。
             </li>
             <li>
-              <b>扫描 IDE 登录态</b>：本机 Qoder CN IDE 已登录时，点「扫描 IDE 登录态」一键解密导入。
+              <b>扫描本地账号</b>：本机 Qoder CN IDE 已登录时，点「扫描本地账号」一键解密导入。
             </li>
           </ol>
         </section>
@@ -55,7 +55,7 @@ export function QoderHelpModal({ open, onClose }: { open: boolean; onClose: () =
 
         <section className="rounded-lg border border-slate-200 p-3 dark:border-zinc-700">
           <h3 className="mb-1 flex items-center gap-1.5 font-semibold">
-            <ScanSearch size={15} className="text-amber-500" /> 扫描 IDE 登录态
+            <ScanSearch size={15} className="text-amber-500" /> 扫描本地账号
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             扫描本机 Qoder CN IDE 的登录态存储并解密导入账号池，适合已在 IDE 中登录的用户一键入池。

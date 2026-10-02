@@ -223,7 +223,7 @@ export const api = {
   },
   switchAccount: (
     userId: string,
-    targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder',
+    targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork',
     skipJwtProbe?: boolean,
   ) =>
     invoke('switch_account', {
@@ -232,20 +232,21 @@ export const api = {
       // 续期 JWT 场景目标账号 JWT 本就可能已吊销，跳过切换前预检避免拦死续期链路
       skipJwtProbe: skipJwtProbe ?? false,
     }),
-  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') =>
+  saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
     invoke('save_current_login', { userId, targetApp: targetApp ?? null }),
   resetDeviceIds: (targetApp?: 'TraeWork' | 'Trae') =>
     invoke('reset_device_ids', { targetApp: targetApp ?? null }),
   profiles: {
     // Buddy 双应用：profile_list / profile_restore / profile_delete 支持 WorkBuddy / CodeBuddy 档案映射
     // Qoder：M3 Icube 档案（data/profiles_qoder；切号快照保存/恢复）
-    list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') =>
+    // QoderWork：2026-10-02 Qoder Work 独立客户端档案（data/profiles_qoder_work；electron-root 布局）
+    list: (targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
       invoke<ProfileInfo[]>('profile_list', { targetApp: targetApp ?? null }),
-    backup: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'Qoder') =>
+    backup: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'Qoder' | 'QoderWork') =>
       invoke('profile_backup', { userId, targetApp: targetApp ?? null }),
-    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') =>
+    restore: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
       invoke('profile_restore', { userId, targetApp: targetApp ?? null }),
-    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder') =>
+    delete: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy' | 'Qoder' | 'QoderWork') =>
       invoke('profile_delete', { userId, targetApp: targetApp ?? null }),
     formatSize: (bytes: number) => invoke<string>('profile_format_size', { bytes }),
   },
@@ -435,8 +436,10 @@ export const api = {
     /** PAT 手工导入（M1 最可靠凭证通道；qoder.com.cn/account/integrations 自建，pt- 前缀）。pat 后端必填 */
     accountImportPat: (name: string | undefined, pat: string) =>
       invoke<QoderAccountView>('qoder_account_import_pat', { name: name ?? null, pat }),
-    /** OAuth 设备流登录（浏览器授权页 + deviceToken/poll 轮询；事件 qoder-oauth-progress/done） */
-    oauthLogin: () => invoke<void>('qoder_oauth_login'),
+    /** OAuth 设备流登录（浏览器授权页 + deviceToken/poll 轮询；事件 qoder-oauth-progress/done）。
+     *  compat=true = 兼容模式（授权 URL 不带 client_id）：官方 client_id 常量被
+     *  Qoder 轮换导致授权页「参数无效」时的降级链路；前端在授权超时后自动切换重试 */
+    oauthLogin: (compat?: boolean) => invoke<void>('qoder_oauth_login', { compat: compat ?? null }),
     /** 取消进行中的 OAuth 轮询（弹框「取消授权」）：后端置标志后轮询线程自行发失败终态 */
     oauthCancel: () => invoke<void>('qoder_oauth_cancel'),
     /** IDE 存储账号发现/导入（M3；secret://aicoding.auth.userInfo DPAPI+AES-GCM 解密） */
