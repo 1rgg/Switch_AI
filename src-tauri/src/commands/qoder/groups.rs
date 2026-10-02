@@ -111,7 +111,11 @@ pub fn qoder_groups_update(
 }
 
 #[tauri::command]
-pub fn qoder_groups_remove(state: State<AppState>, id: String) -> Result<(), String> {
+pub fn qoder_groups_remove(
+    state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    id: String,
+) -> Result<(), String> {
     let mut defs = load_defs(&state);
     defs.retain(|g| g.id != id);
     save_defs(&state, &defs)?;
@@ -123,7 +127,17 @@ pub fn qoder_groups_remove(state: State<AppState>, id: String) -> Result<(), Str
             }
         }
         Ok(())
-    })
+    })?;
+    // 清理 api_pool 对该分组的筛选引用：被删分组的 id 在资源调度页无 chip 可取消
+    // （幽灵筛选），残留会使 Qoder 池被静默清空且 UI 无出口。有引用变更时联动热重载。
+    let store = crate::store::db(&state.data_dir);
+    let mut pool_file: crate::models::ApiPoolFile = store.kv_get("api_pool");
+    if pool_file.qoder_group_ids.iter().any(|g| g == &id) {
+        pool_file.qoder_group_ids.retain(|g| g != &id);
+        store.kv_set("api_pool", &pool_file)?;
+        crate::commands::api_server::reload_pools_if_running(&state, &runtime);
+    }
+    Ok(())
 }
 
 /// 移动账号到分组（group_id=None 回落「未分组」）；user_id = 账号 id（qd- 前缀，与 save/remove 同键）

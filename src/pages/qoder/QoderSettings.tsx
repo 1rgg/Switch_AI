@@ -5,7 +5,7 @@ import { Badge, Spinner } from '../../components/ui';
 import { withMinDelay } from '../../lib/delay';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
-import type { ApiPoolFile, QoderEnvCheck, QoderSettings } from '../../types';
+import type { QoderEnvCheck, QoderSettings } from '../../types';
 
 /**
  * qoder-settings 环境配置（F-80 §5.8，布局对齐 BuddySettings）：
@@ -30,11 +30,6 @@ export default function QoderSettings() {
   const [checkinHhmm, setCheckinHhmm] = useState('10:15');
   const [creditsHhmm, setCreditsHhmm] = useState('23:40');
   const [creditsSyncEnabled, setCreditsSyncEnabled] = useState(true);
-  // 网关上游开关（p3-3）：api_pool 配置 + Qoder 池成员保全所需的 poolFile 快照；
-  // 加载失败时开关禁用（对齐 settingsErr 的诚实禁用模式，避免保存静默跳过误报成功）
-  const [poolFile, setPoolFile] = useState<ApiPoolFile | null>(null);
-  const [poolErr, setPoolErr] = useState(false);
-  const [qoderGateway, setQoderGateway] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
   // 计划任务注册/卸载互斥（防连点重复提交）
@@ -55,21 +50,12 @@ export default function QoderSettings() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [ts, e, pf] = await Promise.all([
+      const [ts, e] = await Promise.all([
         api.qoder.checkinTaskStatus().catch(() => [] as string[]),
         api.qoder.envCheck().catch(() => null),
-        api.apiServer.poolList().catch(() => null),
       ]);
       setTaskTimes(ts);
       setEnv(e);
-      if (pf) {
-        setPoolFile(pf);
-        setQoderGateway(pf.qoder_enabled ?? false);
-        setPoolErr(false);
-      } else {
-        setPoolFile(null);
-        setPoolErr(true);
-      }
       await loadQoderSettings();
     } catch (err) {
       pushToast('error', `检测失败：${String(err)}`);
@@ -127,10 +113,6 @@ export default function QoderSettings() {
       pushToast('error', 'qoder-settings 加载失败，签到开关暂不可保存；请点「重新检测」重试');
       return;
     }
-    if (poolErr) {
-      pushToast('error', 'api_pool 配置加载失败，网关上游开关暂不可保存；请点「重新检测」重试');
-      return;
-    }
     if (!isValidHHMM(checkinHhmm)) {
       pushToast('error', `签到时刻格式无效：${checkinHhmm}（应为 HH:MM）`);
       return;
@@ -151,17 +133,6 @@ export default function QoderSettings() {
             qoder_credits_sync_enabled: creditsSyncEnabled,
           }),
           qoderSettings ? api.qoder.settingsSet(qoderSettings) : Promise.resolve(),
-          // 网关上游开关（p3-3）：uids 回传现值保全 Trae 池白名单；未传字段后端保留原值。
-          // poolFile 加载失败时跳过（开关已禁用 + 保存前显式拦截提示，不静默误报）
-          poolFile
-            ? api.apiServer
-                .poolSet(poolFile.enabled_uids ?? [], undefined, undefined, {
-                  qoderEnabled: qoderGateway,
-                })
-                .catch((err) => {
-                  throw new Error(`网关上游开关保存失败：${String(err)}`);
-                })
-            : Promise.resolve(),
         ]),
         800,
       );
@@ -341,39 +312,7 @@ export default function QoderSettings() {
                 </span>
               </label>
             </div>
-            {/* 网关上游（p3-3）：Qoder 推理网关接入 API 网关的总开关 */}
-            <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
-            <h3 className="mb-2 font-medium">网关上游</h3>
-            <div className="grid gap-3">
-              <label
-                className={`flex items-start gap-2 rounded-lg border p-3 ${
-                  poolErr
-                    ? 'border-amber-200 bg-amber-50/50 opacity-70 dark:border-amber-500/30 dark:bg-amber-500/5'
-                    : 'border-slate-100 dark:border-zinc-800'
-                }`}
-              >
-                <input
-                  type="checkbox"
-                  className="mt-0.5"
-                  disabled={poolErr}
-                  checked={qoderGateway}
-                  onChange={(e) => setQoderGateway(e.target.checked)}
-                />
-                <span className="text-sm">
-                  启用 Qoder 网关上游
-                  <span className="block text-xs text-slate-400">
-                    开启后 API 网关的 Qoder 目录模型（Auto/Qwen/GLM/Kimi 等）路由到 Qoder 账号池，
-                    按倍率计费不消耗通用积分；需先在「账号管理」导入 Qoder 账号。
-                    保存后立即生效（服务运行中热应用）。
-                  </span>
-                  {poolErr && (
-                    <span className="mt-1 block text-xs text-amber-600 dark:text-amber-400">
-                      api_pool 配置加载失败，当前不可修改；请点右上角「重新检测」重试
-                    </span>
-                  )}
-                </span>
-              </label>
-            </div>
+            {/* 网关上游开关已收口至 Qoder「资源调度」页（本页不再重复配置） */}
           </div>
         </div>
 

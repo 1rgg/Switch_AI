@@ -8,6 +8,7 @@ import { withMinDelay } from '../../lib/delay';
 import type {
   ApiServiceStatus,
   ApiPoolFile,
+  GroupView,
   PoolStatus,
   UnifiedModel,
   UsageDayView,
@@ -15,12 +16,13 @@ import type {
 } from '../../types';
 
 /**
- * Qoder · 资源调度（对齐方案 P1，已交付并归档至 backlog F-80）
+ * Qoder · 资源调度（对齐方案 P1 + 账号池配置对齐 Buddy）
  * 参照 Buddy「资源调度」页同构布局，按 Qoder 实际能力裁剪：
- * - 资源开关仅 qoderEnabled 一个（Qoder v1 无路由级 effort/工具代执行等 wb 同构特性）；
- * - 池成员为 fail-open 全量含凭证账号（后端无独立白名单/分组配置），账号清单只读展示；
+ * - 资源开关仅 qoderEnabled 一个（Qoder 无路由级 effort/工具代执行等 wb 同构特性）；
+ * - 账号池选择与 Buddy 同构：勾选白名单（清空 = 全部含凭证账号 fail-open 入池）+
+ *   分组筛选（qoder_groups 分组体系，账号 group_id 随账号池持久化）；
  * - 模型目录数据源为统一目录聚合（api.apiServer.unifiedModels 过滤 qoder 源），
- *   手动同步复用每日调度任务入口（qoderCatalogSync）。
+ *   手动同步复用每日调度任务入口（qoderCatalogSync），每日定时时刻存 app Settings。
  * 网关级功能（服务启停 / 接口配置 / API Keys / 用量统计）在全局 API 管理弹窗，
  * 页内不重复。
  */
@@ -33,11 +35,19 @@ export default function QoderApiService() {
   // F-80-余 v2：竞速对冲阈值（0 = 关闭）+ 会话粘性开关（默认关）
   const [qoderHedgeThresholdMs, setQoderHedgeThresholdMs] = useState(8_000);
   const [qoderStickyEnabled, setQoderStickyEnabled] = useState(false);
+  // 账号池选择（对齐 Buddy）：null = 未自定义（fail-open 全量，显示为全选）；
+  // 值域 = a.id（qd- 前缀账号 id）；分组筛选空集 = 不限分组
+  const [qoderUids, setQoderUids] = useState<string[] | null>(null);
+  const [qoderPoolGroups, setQoderPoolGroups] = useState<Set<string>>(new Set());
+  const [qoderGroups, setQoderGroups] = useState<GroupView[]>([]);
   const [accounts, setAccounts] = useState<QoderAccountView[]>([]);
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [syncing, setSyncing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  // 模型目录定时同步配置（qoder_catalog_sync_enabled/hhmm 存 app Settings，独立保存）
+  const [catSync, setCatSync] = useState({ enabled: true, hhmm: '05:50' });
+  const [savingCatSync, setSavingCatSync] = useState(false);
   // 当日活跃账号数据源（今日 qoder 用量桶的账号维度计数）
   const [usage, setUsage] = useState<UsageDayView[]>([]);
   // Qoder 池实时状态（可观测：per-account inflight 在途计数）
@@ -46,7 +56,7 @@ export default function QoderApiService() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [st, pf, accs, cat] = await Promise.all([
+      const [st, pf, accs, cat, groups] = await Promise.all([
         api.apiServer.status().catch(() => null),
         api.apiServer.poolList().catch(() => null),
         api.qoder.accountsList().catch(() => [] as QoderAccountView[]),
@@ -54,17 +64,29 @@ export default function QoderApiService() {
           .unifiedModels()
           .then((list) => list.filter((m) => m.sources.some((s) => s.pool === 'qoder')))
           .catch(() => [] as UnifiedModel[]),
+        api.qoder.groups.list().catch(() => [] as GroupView[]),
       ]);
       setStatus(st);
       setPool(pf);
       setAccounts(accs);
       setModels(cat);
+      setQoderGroups(groups);
       if (pf) {
         setQoderEnabled(pf.qoder_enabled ?? false);
         // F-80-余 v2 参数回显（缺省对齐后端 serde default：对冲 8s / 粘性关）
         setQoderHedgeThresholdMs(pf.qoder_hedge_threshold_ms ?? 8_000);
         setQoderStickyEnabled(pf.qoder_sticky_enabled ?? false);
+        // 空数组 = fail-open（全部自动入池）→ 视为未自定义，显示为全选（对齐 Buddy）
+        setQoderUids(pf.qoder_enabled_uids?.length ? pf.qoder_enabled_uids : null);
+        // 分组筛选：空 = 不限（全部参与）
+        setQoderPoolGroups(new Set(pf.qoder_group_ids ?? []));
       }
+      api.misc
+        .settingsGet()
+        .then((s) =>
+          setCatSync({ enabled: s.qoder_catalog_sync_enabled ?? true, hhmm: s.qoder_catalog_sync_hhmm || '05:50' }),
+        )
+        .catch(() => {});
     } catch (err) {
       pushToast('error', `读取资源状态失败：${String(err)}`);
     } finally {
@@ -110,8 +132,8 @@ export default function QoderApiService() {
     return () => clearInterval(id);
   }, [refreshPoolStatus]);
 
-  // 保存资源开关：uids/strategy/groups 原样回传（本页不改 Trae/WB 池配置）；
-  // qoderEnabled 随本次保存提交（服务运行中热生效）
+  // 保存资源开关 + 账号池选择：uids/strategy/groups 原样回传（本页不改 Trae/WB 池配置）；
+  // qoderEnabled/白名单/分组随本次保存提交（成员/分组变更服务运行中热重载即时生效）
   const saveFlags = async () => {
     // 池配置未加载时禁止保存：uids/strategy/groups 原样回传依赖 pool 快照，
     // pool=null 时保存会把 Trae 池 enabled_uids 清空（与 Buddy 页同款防护）
@@ -126,14 +148,41 @@ export default function QoderApiService() {
           qoderEnabled,
           qoderHedgeThresholdMs,
           qoderStickyEnabled,
+          // null = 未自定义（后端保留原值保持 fail-open）；数组 = 白名单覆盖（[] = 清空恢复全量）
+          ...(qoderUids !== null ? { qoderUids } : {}),
+          qoderGroupIds: Array.from(qoderPoolGroups),
         }),
         600,
       );
-      pushToast('success', 'Qoder 上游开关与调度参数已保存（服务运行中即时生效）');
+      pushToast('success', 'Qoder 上游配置已保存（服务运行中即时生效）');
     } catch (err) {
       pushToast('error', `保存失败：${String(err)}`);
     } finally {
       setSaving(false);
+    }
+  };
+
+  // 定时同步配置保存：settings_set 真 patch 语义，只写本卡两个字段
+  const saveCatSync = async () => {
+    setSavingCatSync(true);
+    try {
+      await withMinDelay(
+        api.misc.settingsSet({
+          qoder_catalog_sync_enabled: catSync.enabled,
+          qoder_catalog_sync_hhmm: catSync.hhmm.trim() || '05:50',
+        }),
+        400,
+      );
+      pushToast(
+        'success',
+        catSync.enabled
+          ? `已保存：每天 ${catSync.hhmm || '05:50'} 自动同步 Qoder 模型目录`
+          : '已关闭定时同步（仅手动同步）',
+      );
+    } catch (err) {
+      pushToast('error', `保存失败：${String(err)}`);
+    } finally {
+      setSavingCatSync(false);
     }
   };
 
@@ -155,8 +204,37 @@ export default function QoderApiService() {
 
   const credAccounts = useMemo(() => accounts.filter((a) => a.has_credential), [accounts]);
 
+  // 生效白名单：未自定义（null）= 全量含凭证账号（与后端 fail-open 默认一致）；
+  // 值域 = a.id（qd- 前缀账号 id）
+  const qoderSelected = qoderUids ?? credAccounts.map((a) => a.id);
+  const toggleQoderUid = (id: string) => {
+    const base = qoderUids ?? credAccounts.map((a) => a.id);
+    setQoderUids(base.includes(id) ? base.filter((u) => u !== id) : [...base, id]);
+  };
+
+  // 分组筛选实时预览（对齐 Buddy/Trae T10）：GroupView.uids 值域 = a.id，与白名单同域；
+  // 后端在池装配层按 qoder_group_ids 过滤账号后再应用白名单交集
+  const qoderGroupUidSets = useMemo(
+    () => qoderGroups.map((g) => ({ id: g.id, uids: new Set(g.uids ?? []) })),
+    [qoderGroups],
+  );
+  const inQoderFilter = (id: string) =>
+    qoderPoolGroups.size === 0 ||
+    qoderGroupUidSets.some((g) => qoderPoolGroups.has(g.id) && g.uids.has(id));
+  const qoderPoolPreview = (() => {
+    // 生效池 = 分组筛选 ∩ 白名单勾选（与后端 apply_pool_snapshot 装配语义一致）；
+    // excluded 仅统计分组外账号（未勾选由 checkbox 状态表达，不计入 excluded）
+    let inPool = 0;
+    let excluded = 0;
+    for (const a of credAccounts) {
+      if (!inQoderFilter(a.id)) excluded += 1;
+      else if (qoderSelected.includes(a.id)) inPool += 1;
+    }
+    return { inPool, excluded };
+  })();
+
   // 池指标（对齐 Buddy 口径）：健康 = 含凭证且无需重新登录；
-  // 今日使用 = 当日被调度使用；池内 = 含凭证账号总数（fail-open 语义即全量）
+  // 今日使用 = 当日被调度使用；池内 = 勾选且符合分组筛选的账号数
   const todayKey = new Date().toLocaleDateString('sv-SE');
   const healthyCount = credAccounts.filter((a) => !a.needs_relogin).length;
   const activeToday =
@@ -217,25 +295,109 @@ export default function QoderApiService() {
         />
         <StatCard
           label="池内账号"
-          value={credAccounts.length}
+          value={qoderPoolPreview.inPool}
           tone="violet"
-          hint="含凭证账号全量自动入池（fail-open）"
+          hint="勾选并符合分组筛选的账号数（清空勾选 = 全部含凭证账号自动入池）"
         />
       </div>
 
-      {/* 左列：资源开关 + 账号清单｜右列：模型目录（Qoder），同行左右两列各占 1/2 */}
+      {/* 左列：账号池选择 + 资源开关与调度参数（合并面板）｜右列：模型目录（Qoder），同行两列各占 1/2 */}
       <div className="mt-4 grid grid-cols-12 items-start gap-4">
         <div className="col-span-6">
           <div className="card p-4">
+            {/* 面板头＝账号池选择；「保存」位于面板整体右上角，一次保存账号池选择/资源开关/调度参数 */}
             <div className="mb-3 flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
                 <Activity size={16} className="text-brand-500" />
-                <span className="text-sm font-medium">账号池与资源开关</span>
+                <span className="text-sm font-medium">账号池选择</span>
+                <span className="text-xs text-slate-400">
+                  {credAccounts.length > 0 && `已选 ${qoderSelected.length}/${credAccounts.length}`}
+                </span>
               </div>
-              <button className="btn-outline" onClick={() => void saveFlags()} disabled={saving || !pool}>
-                {saving ? <Spinner /> : <Save size={15} />} 保存
-              </button>
+              <div className="flex items-center gap-1">
+                {credAccounts.length > 0 && (
+                  <>
+                    <button
+                      className="btn-ghost px-2 py-0.5 text-xs"
+                      onClick={() => setQoderUids(credAccounts.map((a) => a.id))}
+                    >
+                      全选
+                    </button>
+                    <button className="btn-ghost px-2 py-0.5 text-xs" onClick={() => setQoderUids([])}>
+                      清空
+                    </button>
+                  </>
+                )}
+                <button className="btn-outline" onClick={() => void saveFlags()} disabled={saving || !pool}>
+                  {saving ? <Spinner /> : <Save size={15} />} 保存
+                </button>
+              </div>
             </div>
+            <p className="mb-2 text-xs text-slate-400">
+              {credAccounts.length === 0
+                ? '暂无含凭证账号'
+                : '勾选账号参与 Qoder 上游调度（清空 = 全部含凭证账号自动入池）；保存后即时生效'}
+            </p>
+
+            {/* 分组筛选（对齐 Buddy/T10，保存后热重载即时生效）；分组在「账号管理 → 分组管理」维护。
+                分组列表加载失败但仍持有已保存筛选时保留控件区，提供清除出口（防幽灵筛选锁死） */}
+            {(qoderGroups.length > 0 || qoderPoolGroups.size > 0) && credAccounts.length > 0 && (
+              <div className="mb-3 space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
+                <div className="flex items-start gap-2">
+                  <label className="shrink-0 pt-1 text-xs text-slate-500 dark:text-zinc-400">
+                    分组筛选
+                  </label>
+                  <div className="flex flex-1 flex-wrap gap-1">
+                    {qoderGroups.map((g) => {
+                      const active = qoderPoolGroups.has(g.id);
+                      return (
+                        <button
+                          key={g.id}
+                          type="button"
+                          className={`rounded-full border px-2 py-0.5 text-xs transition ${
+                            active
+                              ? 'border-brand-400 bg-brand-50 text-brand-700 dark:border-brand-500 dark:bg-brand-500/15 dark:text-brand-300'
+                              : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-600'
+                          }`}
+                          onClick={() =>
+                            setQoderPoolGroups((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(g.id)) next.delete(g.id);
+                              else next.add(g.id);
+                              return next;
+                            })
+                          }
+                        >
+                          {g.name}
+                        </button>
+                      );
+                    })}
+                    {qoderGroups.length === 0 && qoderPoolGroups.size > 0 && (
+                      <span className="flex items-center gap-2 pt-0.5 text-xs text-amber-600 dark:text-amber-400">
+                        分组列表加载失败，仍按已保存的 {qoderPoolGroups.size} 个分组筛选
+                        <button
+                          type="button"
+                          className="underline hover:opacity-80"
+                          onClick={() => setQoderPoolGroups(new Set())}
+                        >
+                          清除筛选
+                        </button>
+                      </span>
+                    )}
+                    {qoderPoolGroups.size > 0 && (
+                      <span className="pt-0.5 text-xs text-slate-400">
+                        将纳入 {qoderPoolPreview.inPool} 个账号
+                        {qoderPoolPreview.excluded > 0 &&
+                          `，${qoderPoolPreview.excluded} 个分组外账号不参与调度`}
+                      </span>
+                    )}
+                  </div>
+                </div>
+                <p className="text-xs text-slate-400 dark:text-zinc-500">
+                  分组筛选作用于 Qoder 池取号范围，保存后即时生效；不选分组 = 全部参与（分组在「账号管理 → 分组管理」维护）。
+                </p>
+              </div>
+            )}
 
             {/* 资源开关（Qoder v1 仅上游总开关；池成员 fail-open 全量入池，无白名单/分组） */}
             <div className="mb-3 space-y-2 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
@@ -262,8 +424,9 @@ export default function QoderApiService() {
                 )}
               </div>
               <p className="px-1.5 text-[11px] text-slate-400 dark:text-zinc-500">
-                池成员为全部含凭证账号自动入池（fail-open），无需勾选；池间调度序为
-                Buddy → Trae → Qoder（Qoder 尾部接管），调度策略在全局 API 管理「调度策略中心」配置。
+                上方勾选与分组筛选决定 Qoder 池取号范围（清空勾选 = 全部含凭证账号自动入池）；
+                池间调度序为 Buddy → Trae → Qoder（Qoder 尾部接管），池内策略在全局 API
+                管理「调度策略中心」配置。
               </p>
               {/* 账号并发上限（只读透传，§4.1）：三池共用热参数，本页不提供编辑 */}
               <div className="flex items-center justify-between px-1.5 pt-1 text-[11px]">
@@ -322,7 +485,7 @@ export default function QoderApiService() {
               </div>
             </div>
 
-            {/* 账号清单（只读展示：健康状态 / 在途计数 / credits 余额） */}
+            {/* 账号清单（勾选白名单：健康状态 / 在途计数 / credits 余额；分组外整行灰显） */}
             {credAccounts.length === 0 ? (
               <p className="py-4 text-center text-xs text-slate-400">
                 暂无含凭证账号：请先在「账号管理」PAT 导入或 OAuth 登录入池（凭证写入本地 token store）。
@@ -332,12 +495,22 @@ export default function QoderApiService() {
                 {credAccounts.map((a) => {
                   // 可观测：实时在途并发（服务未运行/未匹配时为 0）；PoolStatus.uid 与账号 id 同域
                   const inflight = qoderPool.find((p) => p.uid === a.id)?.inflight ?? 0;
+                  // 分组筛选激活时，分组外账号不参与调度（整行半透明标记，对齐 Buddy/Trae）
+                  const filteredOut = !inQoderFilter(a.id);
                   return (
                     <div
                       key={a.id}
-                      className="flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800"
+                      className={`flex items-center gap-3 rounded-lg border border-slate-100 px-3 py-2 text-sm dark:border-zinc-800 ${
+                        filteredOut ? 'opacity-50' : ''
+                      }`}
                     >
+                      <input
+                        type="checkbox"
+                        checked={qoderSelected.includes(a.id)}
+                        onChange={() => toggleQoderUid(a.id)}
+                      />
                       <div className="min-w-0 flex-1 truncate font-medium">{a.nickname || a.id}</div>
+                      {filteredOut && <Badge tone="slate">分组外</Badge>}
                       <Badge tone="slate">{a.plan || a.credential_source || '—'}</Badge>
                       {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}
                       {running && inflight > 0 && <Badge tone="amber">在途 {inflight}</Badge>}
@@ -372,9 +545,34 @@ export default function QoderApiService() {
               </button>
             </div>
             <p className="mb-3 text-xs text-slate-400">
-              从 Qoder CN 网关 model/list 拉取并替换目录缓存（倍率/思考档位/图片模态以服务端为准）；
-              应用内置调度器每日自动同步，无账号时静默跳过。
+              从 Qoder CN 网关 model/list 拉取并替换目录缓存（倍率/思考档位/图片模态以服务端为准）。
             </p>
+            {/* 定时同步（app Settings）：应用内置调度器每日到点自动执行，无账号时静默跳过 */}
+            <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-slate-100 p-2.5 text-xs dark:border-zinc-800">
+              <label className="flex cursor-pointer items-center gap-1.5">
+                <input
+                  type="checkbox"
+                  checked={catSync.enabled}
+                  onChange={(e) => setCatSync((f) => ({ ...f, enabled: e.target.checked }))}
+                />
+                每日定时同步
+              </label>
+              <input
+                type="time"
+                value={catSync.hhmm}
+                onChange={(e) => setCatSync((f) => ({ ...f, hhmm: e.target.value || '05:50' }))}
+                disabled={!catSync.enabled}
+                className="input h-8 !w-28 text-xs"
+              />
+              <button className="btn-outline !px-2 !py-1" disabled={savingCatSync} onClick={() => void saveCatSync()}>
+                {savingCatSync ? <Spinner /> : <Save size={13} />} 保存
+              </button>
+              <span className="text-slate-400 dark:text-zinc-500">
+                {catSync.enabled
+                  ? `应用运行期间每天 ${catSync.hhmm || '05:50'} 自动同步（无账号时静默跳过）`
+                  : '已关闭定时同步，仅手动同步'}
+              </span>
+            </div>
             {models.length === 0 ? (
               <p className="py-4 text-center text-xs text-slate-400">
                 暂无目录数据：点击「同步目录」拉取（需至少一个含凭证的 Qoder 账号）。

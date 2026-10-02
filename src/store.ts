@@ -208,6 +208,8 @@ function defaultSettings(): Settings {
     trae_credits_sync_hhmm: '23:40',
     wb_catalog_sync_enabled: true,
     wb_catalog_sync_hhmm: '05:45',
+    qoder_catalog_sync_enabled: true,
+    qoder_catalog_sync_hhmm: '05:50',
     trae_models_sync_enabled: true,
     trae_models_sync_hhmm: '05:40',
     // 通知渠道（F-19，Trae/Buddy 全平台共用）：总开关与事件通知默认开，渠道留空 = 关闭

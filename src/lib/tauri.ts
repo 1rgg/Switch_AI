@@ -536,6 +536,12 @@ export const api = {
         qoderHedgeThresholdMs?: number;
         /** Qoder 会话粘性开关（F-80-余 v2）；null/未传 = 保留原值 */
         qoderStickyEnabled?: boolean;
+        /** Qoder 池入池白名单（qd- 账号 id）；null/未传 = 保留原值 */
+        qoderUids?: string[];
+        /** Qoder 池分组筛选；null/未传 = 保留原值 */
+        qoderGroupIds?: string[];
+        /** Qoder 池内调度策略（空串 = 跟随 Trae 池）；null/未传 = 保留原值 */
+        qoderStrategy?: string;
         /** Trae 池参与调度开关（默认开）；null/未传 = 保留原值 */
         traeEnabled?: boolean;
       },
@@ -559,6 +565,9 @@ export const api = {
         qoderEnabled: wbFlags?.qoderEnabled ?? null,
         qoderHedgeThresholdMs: wbFlags?.qoderHedgeThresholdMs ?? null,
         qoderStickyEnabled: wbFlags?.qoderStickyEnabled ?? null,
+        qoderUids: wbFlags?.qoderUids ?? null,
+        qoderGroupIds: wbFlags?.qoderGroupIds ?? null,
+        qoderStrategy: wbFlags?.qoderStrategy ?? null,
         traeEnabled: wbFlags?.traeEnabled ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
@@ -640,7 +649,7 @@ export const api = {
       invoke<DispatchPolicy>('dispatch_policy_set', { policy }),
     gatewaySettingsGet: () => invoke<GatewaySettings>('gateway_settings_get'),
     // 返回规范化后的生效值（前端展示以返回值为准）；端口改动下次启动 API 服务后生效
-    gatewaySettingsSet: (settings: GatewaySettings) =>
+    gatewaySettingsSet: (settings: Partial<GatewaySettings>) =>
       invoke<GatewaySettings>('gateway_settings_set', { settings }),
     // 局域网网卡 IPv4 列表（issue #34：过滤回环/链路本地/Docker/虚拟化/代理虚拟网卡，
     // 多物理网卡多 IP；网关 0.0.0.0 监听后作为局域网接入地址展示）

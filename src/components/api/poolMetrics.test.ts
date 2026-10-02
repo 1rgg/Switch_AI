@@ -11,9 +11,9 @@ const trae = (user_id: string, general_credits: number | null) =>
 const wb = (id: string, has_credential: boolean, credits_balance: number | null) =>
   ({ id, has_credential, credits_balance }) as WorkBuddyAccountView;
 
-/** 最小 Qoder 账号（仅单测所需字段，fail-open = 全部含凭证账号入池） */
-const qoder = (id: string, has_credential: boolean, credits_balance: number | null) =>
-  ({ id, has_credential, credits_balance }) as QoderAccountView;
+/** 最小 Qoder 账号（仅单测所需字段，池键 = id；group_id 供分组筛选口径） */
+const qoder = (id: string, has_credential: boolean, credits_balance: number | null, group_id = '') =>
+  ({ id, has_credential, credits_balance, group_id }) as QoderAccountView;
 
 /** 最小自定义模型 */
 const model = (enabled: boolean) => ({ enabled }) as CustomModel;
@@ -114,6 +114,40 @@ describe('computePoolMetrics（资源总览多池摘要口径）', () => {
     expect(m.qoderPoolCredits).toBe(30);
     expect(m.qoderTotalCredits).toBe(30);
     expect(m.qoderAccountTotal).toBe(3);
+  });
+
+  it('Qoder 池：白名单非空按名单取；分组筛选叠加白名单取交集；仅分组筛选时白名单 fail-open', () => {
+    const qoderAccounts = [
+      qoder('q-a', true, 10, 'g1'),
+      qoder('q-b', true, 20, 'g2'),
+      qoder('q-c', true, 40, ''), // 未分组：分组筛选激活时不参与
+    ];
+    // 白名单非空按名单取（无分组筛选）
+    const m1 = computePoolMetrics(
+      { enabled_uids: [], qoder_enabled: true, qoder_enabled_uids: ['q-a', 'q-c'] } as ApiPoolFile,
+      [], [], [], qoderAccounts,
+    );
+    expect(m1.qoderPoolCount).toBe(2);
+    expect(m1.qoderPoolCredits).toBe(50);
+    // 分组筛选 + 白名单 → 交集（q-b 在 g2 且在名单）
+    const m2 = computePoolMetrics(
+      {
+        enabled_uids: [],
+        qoder_enabled: true,
+        qoder_enabled_uids: ['q-a', 'q-b'],
+        qoder_group_ids: ['g2'],
+      } as ApiPoolFile,
+      [], [], [], qoderAccounts,
+    );
+    expect(m2.qoderPoolCount).toBe(1);
+    expect(m2.qoderPoolCredits).toBe(20);
+    // 仅分组筛选（白名单空 = fail-open）：仅 g1 组内账号入池
+    const m3 = computePoolMetrics(
+      { enabled_uids: [], qoder_enabled: true, qoder_group_ids: ['g1'] } as ApiPoolFile,
+      [], [], [], qoderAccounts,
+    );
+    expect(m3.qoderPoolCount).toBe(1);
+    expect(m3.qoderPoolCredits).toBe(10);
   });
 
   it('Qoder 池：全部余额未知 → credits 为 null（上层展示「未知」）；部分未知按 0 计入；开关缺失 = 未启用', () => {

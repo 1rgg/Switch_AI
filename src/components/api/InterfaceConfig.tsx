@@ -26,6 +26,8 @@ function PoolBadges({ pools }: { pools: string[] }) {
           <Badge key={p} tone="blue">Trae</Badge>
         ) : p === 'buddy' ? (
           <Badge key={p} tone="violet">Buddy</Badge>
+        ) : p === 'qoder' ? (
+          <Badge key={p} tone="green">Qoder</Badge>
         ) : (
           <Badge key={p} tone="amber">自定义</Badge>
         ),
@@ -96,13 +98,13 @@ export default function InterfaceConfig() {
     }
     setSaving(true);
     try {
-      // 后端会规范化（空模型名回退默认值），前端展示以返回值为准（§5.3）
+      // 后端会规范化（空模型名回退默认值），前端展示以返回值为准（§5.3）；
+      // patch 合并语义：仅显式修改的字段（端口/监听地址/默认模型）覆盖现值
       const next = await withMinDelay(
         api.apiServer.gatewaySettingsSet({
           port: p,
           host: host.trim(),
           default_model: model.trim(),
-          updated_at: gw?.updated_at ?? 0,
         }),
       );
       setGw(next);
@@ -273,7 +275,7 @@ curl -X POST http://127.0.0.1:${p}/v1/chat/completions \\
               ))}
             </select>
             <p className="mt-1 text-xs text-slate-400">
-              统一目录（Trae / Buddy 聚合）；用于 CC Switch 注册与未指定 model 的请求
+              统一目录（Trae / Buddy / Qoder 聚合）；用于 CC Switch 注册与未指定 model 的请求
             </p>
           </div>
         </div>

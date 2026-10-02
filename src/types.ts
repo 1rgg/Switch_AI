@@ -318,6 +318,10 @@ export interface Settings {
   wb_catalog_sync_enabled: boolean;
   /** Buddy 模型目录同步触发时刻 HH:MM（默认 05:45） */
   wb_catalog_sync_hhmm: string;
+  /** Qoder 上游模型目录每日同步开关（资源调度页，默认开；无账号时调度静默跳过） */
+  qoder_catalog_sync_enabled: boolean;
+  /** Qoder 模型目录同步触发时刻 HH:MM（默认 05:50） */
+  qoder_catalog_sync_hhmm: string;
   /** Trae 官网模型列表每日同步开关（API 服务页，默认开；无账号时调度静默跳过） */
   trae_models_sync_enabled: boolean;
   /** Trae 模型列表同步触发时刻 HH:MM（默认 05:40） */
@@ -579,6 +583,12 @@ export interface ApiPoolFile {
   qoder_hedge_threshold_ms?: number;
   /** Qoder 会话粘性开关（F-80-余 v2）：同会话 TTL 内绑定同一 Qoder 账号（默认关） */
   qoder_sticky_enabled?: boolean;
+  /** Qoder 池内调度策略；空 = 跟随 Trae 池（同 wb_strategy 语义） */
+  qoder_strategy?: string;
+  /** Qoder 池入池白名单（qd- 账号 id）；空 = fail-open 全部含凭证账号入池 */
+  qoder_enabled_uids?: string[];
+  /** Qoder 池分组筛选（qoder_groups 分组 id）；空 = 不限分组 */
+  qoder_group_ids?: string[];
 }
 
 /** CC Switch 协同状态（T5.7/F-43） */

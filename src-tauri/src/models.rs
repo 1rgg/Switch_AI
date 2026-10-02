@@ -199,6 +199,12 @@ pub struct Settings {
     /// Buddy 模型目录同步触发时刻 HH:MM（默认 05:45）
     #[serde(default = "default_wb_catalog_sync_hhmm")]
     pub wb_catalog_sync_hhmm: String,
+    /// Qoder 上游模型目录每日同步开关（资源调度页，默认开；无账号时调度静默跳过）
+    #[serde(default = "default_true")]
+    pub qoder_catalog_sync_enabled: bool,
+    /// Qoder 模型目录同步触发时刻 HH:MM（默认 05:50，错峰 Buddy 05:45）
+    #[serde(default = "default_qoder_catalog_sync_hhmm")]
+    pub qoder_catalog_sync_hhmm: String,
     /// Trae 官网模型列表每日同步开关（API 服务页，默认开；无账号时调度静默跳过）
     #[serde(default = "default_true")]
     pub trae_models_sync_enabled: bool,
@@ -321,7 +327,12 @@ fn default_trae_credits_sync_hhmm() -> String {
     "23:40".into()
 }
 fn default_wb_catalog_sync_hhmm() -> String {
-    "05:45".into()
+    "05:45".to_string()
+}
+
+/// Qoder 模型目录同步默认时刻（错峰 Buddy 05:45 / Trae 05:40）
+fn default_qoder_catalog_sync_hhmm() -> String {
+    "05:50".to_string()
 }
 fn default_trae_models_sync_hhmm() -> String {
     "05:40".into()
@@ -537,9 +548,18 @@ pub struct ApiPoolFile {
     /// Buddy 池调度策略（取值同上）；空 = 沿用 strategy（兼容旧数据两池同策略）
     #[serde(default)]
     pub wb_strategy: String,
+    /// Qoder 池调度策略（取值同上）；空 = 沿用 strategy（跟随 Trae 池，同 Buddy 语义）
+    #[serde(default)]
+    pub qoder_strategy: String,
     /// 参与调度的分组 id 列表；空 = 不限分组
     #[serde(default)]
     pub group_ids: Vec<String>,
+    /// Qoder 池入池白名单（qd- 前缀账号 id）；空 = fail-open 全部含凭证账号入池
+    #[serde(default)]
+    pub qoder_enabled_uids: Vec<String>,
+    /// Qoder 池分组筛选（Qoder 账号 group_id，qoder_groups 分组体系）；空 = 不限分组
+    #[serde(default)]
+    pub qoder_group_ids: Vec<String>,
     /// WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池
     #[serde(default)]
     pub wb_enabled: bool,
@@ -638,6 +658,9 @@ impl Default for ApiPoolFile {
             qoder_enabled: false,
             qoder_hedge_threshold_ms: default_hedge_threshold_ms(),
             qoder_sticky_enabled: false,
+            qoder_strategy: String::new(),
+            qoder_enabled_uids: Vec::new(),
+            qoder_group_ids: Vec::new(),
         }
     }
 }

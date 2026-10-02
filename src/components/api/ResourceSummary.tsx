@@ -1,12 +1,12 @@
 /**
  * 全局 API 管理 · 资源总览与调度策略中心（unified-api-gateway-design §5.2/§5.3）
  * 「调度策略中心」卡集中三块（任务7，从资源角度整体设计）：
- *  ① 最佳组合预设：5 组专家组合（池间 + Trae 池 + Buddy 池）一键应用，当前命中组合高亮
- *     （Qoder 池始终尾部接管，不受预设影响）；
+ *  ① 最佳组合预设：5 组专家组合（池间 + Trae / Buddy / Qoder 池内策略）一键应用，
+ *     当前命中组合高亮（Qoder 池间调度恒尾部接管，不受预设池间策略影响）；
  *  ② 池间调度策略：smart / priority + 优先级序编辑 + 跨池回退（dispatch_policy_get/set 即时生效）；
- *  ③ 各资源池池内调度：Trae（strategy）/ Buddy（wb_strategy，空 = 跟随 Trae 池）下拉编辑，
- *     自定义模型命中即直达；Qoder 池无池内策略可配（fail-open 全量入池），
- *     仅暴露「启用 Qoder 上游」开关（poolSet 第四参，对齐方案 §5.1，已交付归档）。
+ *  ③ 各资源池池内调度：Trae（strategy）/ Buddy（wb_strategy，空 = 跟随 Trae 池）/
+ *     Qoder（qoder_strategy，空 = 跟随 Trae 池）下拉编辑，自定义模型命中即直达；
+ *     上游开关与池成员在各应用「资源调度」页维护（Qoder 开关在 Qoder 资源调度页）。
  * 下方为 Trae / Buddy / Qoder / 自定义 四池摘要卡；前三者详情引导至各应用「资源调度」页，
  * 自定义池详情引导至「自定义模型」Tab。
  * 数据源：pool_list / accounts_list（Trae 池）、pool_list.wb_enabled / workbuddy_accounts_list
@@ -80,43 +80,35 @@ function DispatchCenterCard({
   /** 当前组合命中的预设（匹配规则见 dispatchPresets.matchPreset） */
   const activePreset = useMemo(() => matchPreset(pool, policy), [pool, policy]);
 
-  /** 统一保存入口：inter 走 dispatch_policy_set；trae/buddy 走 pool_set（未传维度保留原值） */
-  const save = async (patch: { inter?: DispatchPolicy['strategy']; trae?: string; buddy?: string }) => {
+  /** 统一保存入口：inter 走 dispatch_policy_set；trae/buddy/qoder 走 pool_set（未传维度保留原值） */
+  const save = async (patch: {
+    inter?: DispatchPolicy['strategy'];
+    trae?: string;
+    buddy?: string;
+    qoder?: string;
+  }) => {
     if (!pool) return;
     const trae = patch.trae ?? pool.strategy ?? '';
     const buddy = patch.buddy ?? pool.wb_strategy ?? '';
+    const qoder = patch.qoder ?? pool.qoder_strategy ?? '';
     setSaving(true);
     try {
       if (patch.inter && policy) {
         setPolicy(await api.apiServer.dispatchPolicySet({ ...policy, strategy: patch.inter }));
       }
-      // uids/groups 原样回传（本卡不改成员与分组）；wbFlags 未传 → 后端保留原值
-      await api.apiServer.poolSet(pool.enabled_uids, trae, pool.group_ids, undefined, buddy);
-      onPoolChanged({ ...pool, strategy: trae, wb_strategy: buddy });
+      // uids/groups 原样回传（本卡不改成员与分组）；wbFlags 仅带 Qoder 池内策略，
+      // 其余未传字段 → 后端保留原值
+      await api.apiServer.poolSet(
+        pool.enabled_uids,
+        trae,
+        pool.group_ids,
+        { qoderStrategy: qoder },
+        buddy,
+      );
+      onPoolChanged({ ...pool, strategy: trae, wb_strategy: buddy, qoder_strategy: qoder });
       toast('success', '调度策略已保存，运行中网关即时生效');
     } catch (e) {
       toast('error', `调度策略保存失败：${String(e).slice(0, 120)}`);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  /** Qoder 上游开关（对齐方案 §5.1）：读写走 poolSet 第四参
-   *  （与 Buddy wb 开关同链路）；uids/strategy/groups 原样回传（本卡不改池成员/分组） */
-  const saveQoder = async (next: boolean) => {
-    if (!pool) return;
-    setSaving(true);
-    try {
-      await api.apiServer.poolSet(pool.enabled_uids, pool.strategy ?? '', pool.group_ids, {
-        qoderEnabled: next,
-      });
-      onPoolChanged({ ...pool, qoder_enabled: next });
-      toast(
-        'success',
-        next ? 'Qoder 上游已启用，运行中网关即时生效' : 'Qoder 上游已关闭：仅 Qoder 源模型将显式报错',
-      );
-    } catch (e) {
-      toast('error', `Qoder 开关保存失败：${String(e).slice(0, 120)}`);
     } finally {
       setSaving(false);
     }
@@ -294,21 +286,28 @@ function DispatchCenterCard({
               ))}
             </select>
           </label>
+          <label className="flex items-center gap-2">
+            <span className="text-slate-400 dark:text-zinc-500">Qoder 池</span>
+            <select
+              className={selectCls}
+              value={pool?.qoder_strategy ?? ''}
+              disabled={!pool}
+              onChange={(e) => void save({ qoder: e.target.value })}
+            >
+              <option value="">跟随 Trae 池</option>
+              {STRATEGIES.map((s) => (
+                <option key={s} value={s}>
+                  {STRATEGY_LABELS[s]}
+                </option>
+              ))}
+            </select>
+          </label>
           <span className="text-slate-400 dark:text-zinc-500">
             自定义模型：<span className="text-slate-700 dark:text-zinc-200">命中即直达</span>（上游自有计费，无池内调度）
           </span>
-          <label className="flex items-center gap-2">
-            <input
-              type="checkbox"
-              checked={pool?.qoder_enabled ?? false}
-              disabled={!pool || saving}
-              onChange={(e) => void saveQoder(e.target.checked)}
-            />
-            <span className="text-slate-400 dark:text-zinc-500">启用 Qoder 上游</span>
-            <span className="text-slate-700 dark:text-zinc-200">
-              （fail-open 全量入池，无池内策略可配）
-            </span>
-          </label>
+          <span className="text-slate-400 dark:text-zinc-500">
+            上游开关与成员在各应用「资源调度」页（Qoder 开关在 Qoder 资源调度页配置）
+          </span>
         </div>
       </div>
     </div>
@@ -360,6 +359,12 @@ export default function ResourceSummary() {
   // Buddy 池内策略文案：空 = 跟随 Trae 池（展示 Trae 当前生效策略）
   const buddyStrategyText = pool?.wb_strategy
     ? (STRATEGY_LABELS[pool.wb_strategy] ?? pool.wb_strategy)
+    : pool?.strategy
+      ? `跟随 Trae 池（${STRATEGY_LABELS[pool.strategy] ?? pool.strategy}）`
+      : '—';
+  // Qoder 池内策略文案：空 = 跟随 Trae 池（同 Buddy 语义）
+  const qoderStrategyText = pool?.qoder_strategy
+    ? (STRATEGY_LABELS[pool.qoder_strategy] ?? pool.qoder_strategy)
     : pool?.strategy
       ? `跟随 Trae 池（${STRATEGY_LABELS[pool.strategy] ?? pool.strategy}）`
       : '—';
@@ -476,7 +481,7 @@ export default function ResourceSummary() {
               </span>
             }
           />
-          <Row label="池内调度策略" value="fail-open 全量入池" />
+          <Row label="池内调度策略" value={qoderStrategyText} />
           <Row label="消耗口径" value="Qoder 通用 credits" />
         </div>
         <p className="mt-3 border-t border-slate-100 pt-2 text-[11px] text-slate-400 dark:border-zinc-800 dark:text-zinc-500">

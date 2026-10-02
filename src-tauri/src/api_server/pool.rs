@@ -48,6 +48,12 @@ impl PoolStrategy {
         })
     }
 
+    /// Qoder 池生效策略：qoder_strategy 独立配置优先；空 = 跟随 Trae 池策略
+    ///（与 Buddy 同语义，复用同一跟随规则）
+    pub fn resolve_qoder(strategy: &str, qoder_strategy: &str) -> Self {
+        Self::resolve_wb(strategy, qoder_strategy)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ExpireFirst => "expire_first",

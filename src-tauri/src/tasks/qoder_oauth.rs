@@ -3,9 +3,10 @@
 //! 客户端真实链路（PKCE device flow）：
 //! 1. 生成 `nonce`（uuid v4）、`verifier`（64 字符）、`machine_id`/`client_id`（uuid v4）
 //! 2. 浏览器打开 `https://qoder.cn/device/selectAccounts?challenge=<BASE64URL(SHA256(verifier))>
-//!    &challenge_method=S256&nonce=..&machine_id=..&client_id=..&directLogin=true`
-//!    （用户在页面完成授权；directLogin 必须显式携带——缺省时授权页前端自行补参，
-//!    实测出现 `directLogin=true&directLogin=true` 重复参数导致页面报「参数无效」）
+//!    &challenge_method=S256&nonce=..&machine_id=..&client_id=..`
+//!    （用户在页面完成授权；**不携带 directLogin**——2026-10-02 与真实客户端跳转样例
+//!    对齐：真实 IDE 的 URL 参数集为 challenge/challenge_method/nonce/machine_id/client_id，
+//!    此前显式补 `directLogin=true` 的方案已被授权页判「参数无效」，以真实抓包为准）
 //! 3. 轮询 `GET {open_api}/api/v1/deviceToken/poll?nonce=..&verifier=..&challenge_method=S256`
 //!    - **pending = HTTP 404** `{"errorCode":"NotFound",...}`（实测）
 //!    - **成功 = HTTP 200**：`{id, token(dt-), user_id, expires_in:2591999999(≈30d ms),
@@ -56,7 +57,7 @@ impl DeviceFlow {
         let digest = Sha256::digest(verifier.as_bytes());
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
         let auth_url = format!(
-            "{DEVICE_AUTH_BASE}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}&client_id={client_id}&directLogin=true"
+            "{DEVICE_AUTH_BASE}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}&client_id={client_id}"
         );
         Self { nonce, verifier, machine_id, client_id, auth_url }
     }
@@ -158,10 +159,12 @@ mod tests {
         assert_ne!(f1.verifier, f2.verifier);
         assert_eq!(f1.verifier.len(), 64);
         assert!(f1.auth_url.starts_with(DEVICE_AUTH_BASE));
-        // query 参数完整性
-        for key in ["challenge=", "challenge_method=S256", "nonce=", "machine_id=", "client_id=", "directLogin=true"] {
+        // query 参数完整性（与真实客户端跳转参数集一致）
+        for key in ["challenge=", "challenge_method=S256", "nonce=", "machine_id=", "client_id="] {
             assert!(f1.auth_url.contains(key), "auth_url 缺少 {key}");
         }
+        // 不携带 directLogin：2026-10-02 实测授权页对该参数判「参数无效」
+        assert!(!f1.auth_url.contains("directLogin"), "auth_url 不应携带 directLogin");
         // challenge 可由 verifier 复算（S256 绑定）
         let expect = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(Sha256::digest(f1.verifier.as_bytes()));

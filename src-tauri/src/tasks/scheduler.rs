@@ -241,6 +241,7 @@ fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
         "qoder-credits-snapshot" => Some(st.settings().qoder_credits_sync_hhmm),
         "wb-catalog-sync" => Some(st.settings().wb_catalog_sync_hhmm),
         "trae-models-sync" => Some(st.settings().trae_models_sync_hhmm),
+        "qoder-catalog-sync" => Some(st.settings().qoder_catalog_sync_hhmm),
         _ => None,
     };
     let Some(v) = configured else {
@@ -284,6 +285,7 @@ fn enabled(st: &AppState, key: &str) -> bool {
         // 模型同步开关（默认开；无账号时任务内部静默跳过不计失败）
         "wb-catalog-sync" => st.settings().wb_catalog_sync_enabled,
         "trae-models-sync" => st.settings().trae_models_sync_enabled,
+        "qoder-catalog-sync" => st.settings().qoder_catalog_sync_enabled,
         // 其余任务幂等且低风险，恒开（Trae 签到 run_round 自带状态核验）
         _ => true,
     }

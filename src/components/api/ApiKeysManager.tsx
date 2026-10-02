@@ -380,10 +380,10 @@ export default function ApiKeysManager({
           </label>
           <div className="flex gap-1">
             {[
-              { key: '', label: '跟随全局', title: '不绑定，按系统策略选池' },
-              { key: 'trae', label: 'Trae 池', title: '优先走 Trae，异常可回退' },
-              { key: 'buddy', label: 'Buddy 池', title: '优先走 Buddy，异常可回退' },
-              { key: 'qoder', label: 'Qoder 池', title: '优先走 Qoder，异常可回退' },
+              { key: '', label: '全局', title: '不绑定，按系统策略选池' },
+              { key: 'trae', label: 'Trae', title: '优先走 Trae，异常可回退' },
+              { key: 'buddy', label: 'Buddy', title: '优先走 Buddy，异常可回退' },
+              { key: 'qoder', label: 'Qoder', title: '优先走 Qoder，异常可回退' },
             ].map((p) => (
               <button
                 key={p.key}
