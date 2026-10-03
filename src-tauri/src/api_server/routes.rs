@@ -1417,10 +1417,15 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
-            let converted = super::payload::prepare_llm_chat_body(
+            // 指纹清洗（issue #57）：Trae 池沿用全局 wb_sanitize 开关 + 热更新规则表，
+            // 客户端 harness 身份句不再原样透传上游（进入风控名单即全量 11128）
+            let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+            let templates = super::wb_route::load_templates(&state);
+            let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
                 &super::models_sync::load_models(&state.data_dir),
+                sanitize, &templates,
             );
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
@@ -1517,6 +1522,16 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             );
                         }
                         if let Some((code, msg)) = error_info {
+                            if super::is_empty_completion(code, &msg) {
+                                // 空完成（影子风控/上游异常，issue #57）：不冷却、不透传，
+                                // 换号重试（收尾帧未发，重试流可在同一连接续传）
+                                state.logger.log_request_ttfb(
+                                    "trae", "POST", proto.log_path(), &model, stream,
+                                    200, &picked.uid, duration_ms, ttfb_ms, &key_name,
+                                    &state.pool.name_of(&picked.uid), Some(&format!("空完成 → 换号重试{}", super::wb_payload::template_hit_note())),
+                                );
+                                break; // 退出重试循环 → 换号
+                            }
                             let kind = classify_solo_error(code, &msg);
                             if kind != ErrKind::None {
                                 state.pool.note_error(&picked.uid, kind);
@@ -1549,6 +1564,29 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                         return; // 流式结束后直接返回
                     }
                     Err((status, resp_body, retry_after)) => {
+                        // 11128 渠道风控（issue #57）：按请求指纹拦截、与账号/模型无关，
+                        // 换号无意义。清洗未启用时强制清洗后同号重试一次；已清洗仍命中
+                        // → 走下方 retry_plan 原样 Fatal（需更新 wb_template_map.json）
+                        if status == 400
+                            && super::retry::is_illegal_channel_error(&resp_body)
+                            && !sanitize
+                        {
+                            sanitize = true;
+                            state.logger.log_sched_event(&format!(
+                                "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
+                            ));
+                            converted = super::payload::prepare_llm_chat_body(
+                                &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                                &super::models_sync::load_models(&state.data_dir),
+                                true, &templates,
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            // 断连检测：重试等待期间客户端离开则终止
+                            if tx.is_closed() {
+                                return;
+                            }
+                            continue;
+                        }
                         // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
@@ -1752,10 +1790,14 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             // F-77 账号级在途计数：取号即绑定（换号时自动解绑旧账号）
             guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
 
-            let converted = super::payload::prepare_llm_chat_body(
+            // 指纹清洗（issue #57）：Trae 池沿用全局 wb_sanitize 开关 + 热更新规则表
+            let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+            let templates = super::wb_route::load_templates(&state);
+            let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
                 &super::models_sync::load_models(&state.data_dir),
+                sanitize, &templates,
             );
 
             // 分级重试（T2.2/F-33，与 wb_route 同一张表）：same_attempt 为同账号
@@ -1780,6 +1822,21 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         let duration_ms = start_ts.elapsed().as_millis() as u64;
                         match (resp, error_info) {
                             (Some(r), None) => {
+                                if super::aggregated_response_is_empty(&r) {
+                                    // 空完成（影子风控/上游异常，issue #57）：换号重试，
+                                    // 口径同下方「empty response」（Server 级短冷却）
+                                    state.pool.note_error(&picked.uid, ErrKind::Server);
+                                    state.record_usage(
+                                        false, &model, &picked.uid, &key_id, false, stream,
+                                        duration_ms, 0, 0,
+                                    );
+                                    state.logger.log_request(
+                                        "trae", "POST", proto.log_path(), &model, stream,
+                                        502, &picked.uid, duration_ms, &key_name,
+                                        &state.pool.name_of(&picked.uid), Some(&format!("空完成 → 换号重试{}", super::wb_payload::template_hit_note())),
+                                    );
+                                    break; // 换号
+                                }
                                 // 用量记账（成功：token 数从聚合响应 usage 提取）
                                 let (pt, ct) = r.get("usage").map(extract_tokens).unwrap_or((0, 0));
                                 state.record_usage(
@@ -1854,6 +1911,24 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                         }
                     }
                     Err((status, resp_body, retry_after)) => {
+                        // 11128 渠道风控（issue #57）：清洗未启用时强制清洗后同号重试一次；
+                        // 已清洗仍命中 → 走下方 retry_plan 原样 Fatal
+                        if status == 400
+                            && super::retry::is_illegal_channel_error(&resp_body)
+                            && !sanitize
+                        {
+                            sanitize = true;
+                            state.logger.log_sched_event(&format!(
+                                "11128 强制清洗重试{}", super::wb_payload::template_hit_note()
+                            ));
+                            converted = super::payload::prepare_llm_chat_body(
+                                &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
+                                &super::models_sync::load_models(&state.data_dir),
+                                true, &templates,
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            continue;
+                        }
                         // 分级重试策略表（T2.2/F-33 v1.2，与 wb_route 保持一致）
                         match retry_plan(status, &resp_body, same_attempt, retry_after) {
                             RetryAction::RetrySame { delay_ms } => {
