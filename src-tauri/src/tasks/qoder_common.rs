@@ -479,9 +479,32 @@ pub(crate) fn classify_refresh_status(status: u16) -> RefreshFail {
     }
 }
 
-/// 调 deviceToken/refresh（body {"refresh_token":...}）并给出失败分类。
+/// 无签名刷新端点按**刷新令牌前缀**分派（agent2api refresh.rs 情报互证 2026-10-03）：
+/// - `jrt-`（作业令牌的刷新令牌，PAT 通道产物）→ `/api/v1/jobToken/refresh`
+/// - 其余（设备流刷新令牌）→ `/api/v1/deviceToken/refresh`
+/// 两端点同在 openapi 主机、无 COSY 签名、body 均为 snake_case。
+/// 按「前缀」而非「有无 PAT」分派：PAT 与设备刷新令牌可并存于同一账号，按存在性
+/// 分派会让 PAT 劫持设备刷新，导致 COSY 身份与记录 machineId 错位（上游实测教训）。
+pub(crate) fn refresh_endpoint_for(refresh_token: &str) -> &'static str {
+    if refresh_token.starts_with("jrt-") {
+        "/api/v1/jobToken/refresh"
+    } else {
+        "/api/v1/deviceToken/refresh"
+    }
+}
+
+/// 调无签名刷新端点（body {"refresh_token":...}）并给出失败分类。
 /// 成功返回新 Creds（expires 按 expiresIn 归一为毫秒回填——R-6 实测毫秒级 86400000，
 /// 秒级值兼容 ×1000；设备头原样透传保留）。
+///
+/// agent2api 三条踩坑的本地对照（2026-10-03 情报核对）：
+/// ①「按前缀分派」→ refresh_endpoint_for（此前恒打 deviceToken/refresh，
+///   jrt- 刷新令牌会被设备端点拒绝）；
+/// ②「拒绝 expires_in 相对值」→ 本地 normalize_expires_in 以 30 天秒数为阈值的
+///   量级判别已覆盖其实测坑点（设备端点回 2591999994 毫秒，朴素秒解释会写出
+///   82 年后的过期时刻；阈值判别归毫秒 = 30 天，正确）；
+/// ③「身份只认 uid 字段」→ 本地刷新响应不解析身份（uid 唯一来源是 userinfo
+///   独立通道），无身份错位面，不适用。
 pub fn refresh_token_once_ex(
     agent: &ureq::Agent,
     creds: &QoderCreds,
@@ -492,7 +515,7 @@ pub fn refresh_token_once_ex(
     // 刷新端点不带 Authorization（下方 retain 移除；鉴权完全靠 body 中的 refresh_token）+ Cosy 头
     let mut h = build_auth_headers(creds);
     h.retain(|(k, _)| k != "Authorization");
-    let url = format!("{OPEN_API_BASE}/api/v1/deviceToken/refresh");
+    let url = format!("{OPEN_API_BASE}{}", refresh_endpoint_for(&creds.refresh_token));
     let (status, body) = post_json(
         agent,
         &url,
@@ -1076,6 +1099,25 @@ mod tests {
         assert_eq!(classify_refresh_status(422), RefreshFail::AuthDead, "其余 4xx 永久拒绝");
         assert_eq!(classify_refresh_status(500), RefreshFail::Transient, "5xx 服务端故障");
         assert_eq!(classify_refresh_status(503), RefreshFail::Transient, "5xx 服务端故障");
+    }
+
+    /// 无签名刷新端点按刷新令牌前缀分派（agent2api 情报互证）：
+    /// jrt- → jobToken/refresh，其余（dt- 系/空）→ deviceToken/refresh；
+    /// 分派依据是前缀本身而非「有无 PAT」（PAT 与设备刷新令牌可并存）
+    #[test]
+    fn refresh_endpoint_dispatch_by_prefix() {
+        assert_eq!(
+            refresh_endpoint_for("jrt-abc123"),
+            "/api/v1/jobToken/refresh",
+            "作业令牌刷新令牌走 jobToken 通道"
+        );
+        assert_eq!(refresh_endpoint_for("dt-xyz"), "/api/v1/deviceToken/refresh");
+        assert_eq!(refresh_endpoint_for(""), "/api/v1/deviceToken/refresh", "空值走设备通道缺省");
+        assert_eq!(
+            refresh_endpoint_for("rt-plain"),
+            "/api/v1/deviceToken/refresh",
+            "非 jrt- 前缀一律设备通道"
+        );
     }
 
     // ── p3-3 gateway 可行性探针（#[ignore]：cargo test probe_gateway -- --ignored --nocapture）──

@@ -2296,6 +2296,104 @@ mod tests {
         assert_eq!(meta.status, 110);
     }
 
+    // ── 首帧换号无损语义（agent2api issue #8 同型保障的本地回归锁，2026-10-03）──
+    //
+    // 保障链：QoderTranslate 首帧即信封错误 → 单发错误帧、不发 [DONE] →
+    // WbSseParser 解析为 WbEvent::Error → stream_forward_ex 在 !sent_any 时
+    // 上抛 error_info → qoder_route break 换号。空 delta 帧（role-only 等）被
+    // 翻译器整帧丢弃，不会把 sent_any 提前置 true——这是「首帧预读换号」在
+    // 本地架构下的等价实现（错误帧本身就是预读结果，无需额外 prefetch 层）。
+
+    /// 翻译 + 流式转发的端到端测试通道：返回 (error_info, sent_any, 已下发帧)
+    fn forward_rot(
+        lines: Vec<String>,
+        proto: crate::api_server::routes::Protocol,
+    ) -> (Option<(i64, String)>, bool, Vec<String>) {
+        let slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
+        let t = QoderTranslate::new(lines.into_iter(), slot.clone(), "chat-1", "M");
+        let ilines = InterruptibleLines::from_iterator(Box::new(t));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (err, sent_any, _fi, _u) = wb_sse::stream_forward_ex(ilines, &tx, proto, "chat-1", "M");
+        drop(tx);
+        let mut sent = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            sent.push(String::from_utf8_lossy(&frame.unwrap()).to_string());
+        }
+        (err, sent_any, sent)
+    }
+
+    const ERR_ENVELOPE: &str =
+        r#"data: {"statusCodeValue":110,"body":"{\"code\":\"110\",\"message\":\"no quota\"}"}"#;
+
+    /// 信封错误为首帧：无字节下发、错误上抛 → 路由层换号无损
+    #[test]
+    fn envelope_error_before_content_uplifts_for_rotation() {
+        let (err, sent_any, sent) =
+            forward_rot(vec![ERR_ENVELOPE.to_string()], crate::api_server::routes::Protocol::OpenAi);
+        assert!(err.is_some(), "错误必须上抛供路由层换号");
+        assert!(!sent_any);
+        assert!(sent.is_empty(), "不得向客户端下发任何帧: {sent:?}");
+    }
+
+    /// 空 delta（role-only）帧在错误之前到达：翻译器整帧丢弃，错误仍在
+    /// 「首内容帧前」→ 换号无损（这正是 agent2api emit_chunk「空 delta 不发」
+    /// 语义防住的坑：role 帧一旦下发，sent_any 提前置 true，换号永久失效）
+    #[test]
+    fn role_only_chunk_then_error_still_uplifts() {
+        let (err, sent_any, sent) = forward_rot(
+            vec![
+                envelope(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#),
+                ERR_ENVELOPE.to_string(),
+            ],
+            crate::api_server::routes::Protocol::OpenAi,
+        );
+        assert!(err.is_some());
+        assert!(!sent_any);
+        assert!(sent.is_empty(), "role-only 帧不得下发: {sent:?}");
+    }
+
+    /// Responses 协议同型：错误先于任何 chunk → 不得发出 response.created
+    ///（created 一旦发出即 sent_any=true，错误只能就地下发，换号失效）
+    #[test]
+    fn responses_protocol_error_first_sends_no_created() {
+        let (err, sent_any, sent) = forward_rot(
+            vec![ERR_ENVELOPE.to_string()],
+            crate::api_server::routes::Protocol::Responses,
+        );
+        assert!(err.is_some());
+        assert!(!sent_any);
+        assert!(
+            sent.iter().all(|f| !f.contains("response.created")),
+            "错误首帧不得触发 response.created: {sent:?}"
+        );
+    }
+
+    /// 对照组：真实内容帧已发出后再遇错误 → failed_inline 就地收尾（不换号，
+    /// 防重复流）——保证上面的换号语义只作用于「首内容帧前」窗口
+    #[test]
+    fn error_after_content_is_inline_not_rotation() {
+        let (err, sent_any, failed_inline, _u) = {
+            let slot: Arc<Mutex<Option<ErrMeta>>> = Arc::new(Mutex::new(None));
+            let t = QoderTranslate::new(
+                vec![
+                    envelope(r#"{"choices":[{"delta":{"content":"部分输出"}}]}"#),
+                    ERR_ENVELOPE.to_string(),
+                ]
+                .into_iter(),
+                slot.clone(),
+                "chat-1",
+                "M",
+            );
+            let ilines = InterruptibleLines::from_iterator(Box::new(t));
+            let (tx, _rx) =
+                tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+            wb_sse::stream_forward_ex(ilines, &tx, crate::api_server::routes::Protocol::OpenAi, "chat-1", "M")
+        };
+        assert!(err.is_none(), "内容已流出，错误不得上抛换号");
+        assert!(sent_any);
+        assert!(failed_inline, "内容后错误必须就地收尾");
+    }
+
     // ── 翻译器：思考拆解 ──
 
     #[test]
