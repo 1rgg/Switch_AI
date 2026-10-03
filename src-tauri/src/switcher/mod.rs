@@ -412,11 +412,9 @@ fn save_identity_guard(
     };
     match live {
         Some(live) if live != uid => {
-            let msg = format!(
-                "客户端当前登录的是账号 {live}，与要保存的账号 {uid} 不一致，已拒绝保存\
-                 （防止账号 {uid} 的槽位被账号 {live} 的登录态覆盖污染）。\
-                 请先「切换」到账号 {uid} 并在客户端确认登录，再点「保存当前登录态」。"
-            );
+            // issue #55 审查修复：文案按槽位状态分流（首存指引/污染自愈指引/通用），
+            // 不再一律指回「切换」（对无快照账号不可执行、对污染槽位是死循环）
+            let msg = save_reject_message(&sess.prof.profiles_dir, uid, &live);
             // 还原现场：用户客户端原本开着（stop 后被我们关掉），拉回来；
             // 失败仅 Warn，不影响拒绝结果
             if let Err(e) = proc::start_app(sess, sink) {
@@ -453,6 +451,46 @@ fn save_identity_guard(
             Ok(())
         }
     }
+}
+
+/// 保存守卫拒绝文案分派（issue #55 审查修复 2026-10-03）：L1 命令层与 L2 switcher
+/// 共用，按槽位状态给出**可执行**的补救指引。通用文案的「先切换到该账号」对两类
+/// 场景不可执行/死循环（issue #55 实测）：
+/// ① 槽位不存在（OAuth/扫描新入池账号首次保存）：切换无快照可恢复 → 指引客户端手动登录；
+/// ② 槽位 sidecar 记录的保存身份与槽位不符（历史污染）：「切换」只会恢复出被污染的
+///    会话（A 槽存了 B 的会话后，切到 A 恒登录为 B）→ 指引客户端退出重登；
+/// ③ 其余：通用文案（保留原语义 + 手动登录兜底提示）
+pub(crate) fn save_reject_message(profiles_dir: &Path, uid: &str, live: &str) -> String {
+    let slot = profiles_dir.join(uid);
+    let slot_bak = profiles_dir.join(format!("{uid}.bak"));
+    if !slot.exists() && !slot_bak.exists() {
+        return format!(
+            "客户端当前登录的是账号 {live}，与要保存的账号 {uid} 不一致，已拒绝保存。\
+账号 {uid} 还没有本地快照（如刚通过 OAuth/扫描入池），「切换」无法恢复出该账号。\
+请在客户端手动登录账号 {uid}（勿用「切换」），登录成功后再点「保存当前登录态」。"
+        );
+    }
+    let sidecar = profiles_dir.join(format!("{uid}.meta.json"));
+    if let Ok(text) = std::fs::read_to_string(&sidecar) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(saved) = v.get("detectedUid").and_then(|x| x.as_str()) {
+                if !saved.is_empty() && saved != uid {
+                    return format!(
+                        "客户端当前登录的是账号 {live}，与要保存的账号 {uid} 不一致，已拒绝保存。\
+账号 {uid} 的快照疑似已被账号 {saved} 的登录态污染（该快照保存时检测到的客户端身份是 {saved}），\
+此时「切换」到账号 {uid} 也只会恢复出账号 {saved} 的会话，反复操作无法自愈。\
+请在本应用客户端退出登录并手动重新登录账号 {uid}，再点「保存当前登录态」覆盖修复。"
+                    );
+                }
+            }
+        }
+    }
+    format!(
+        "客户端当前登录的是账号 {live}，与要保存的账号 {uid} 不一致，已拒绝保存\
+（防止账号 {uid} 的槽位被账号 {live} 的登录态覆盖污染）。\
+请先「切换」到账号 {uid} 并在客户端确认登录身份是 {uid}（若不是，请退出登录后手动登录），\
+再点「保存当前登录态」。"
+    )
 }
 
 fn backup_current(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
@@ -653,6 +691,40 @@ fn apply_fingerprint_override(sess: &Session, sink: &dyn ProgressSink) {
     }
 }
 
+/// 恢复后校验的 missing 判定（switch_flow 主快照与 .bak 回退重试共用；issue #9）：
+/// ①0 项恢复 = 快照空/损坏；②缺关键登录态文件 = 快照不含登录态或布局漂移。
+/// 仅 icube/electron_root 有可靠判定数据源，其余布局恒空。
+fn post_restore_missing(sess: &Session) -> Vec<String> {
+    match sess.prof.layout {
+        Layout::Icube => {
+            let mut m: Vec<String> = Vec::new();
+            if sess.last_restored_count <= 0 {
+                m.push("（快照为空或损坏，0 项恢复）".to_string());
+            } else {
+                for f in ["User\\globalStorage\\storage.json", "User\\globalStorage\\state.vscdb"] {
+                    if !sess.prof.data_dir.join(f).exists() {
+                        m.push(f.to_string());
+                    }
+                }
+            }
+            m
+        }
+        // 2026-10-02 审查：QoderWork（electron_root）同型校验——Local State 是
+        // cookie 解密密钥元数据，缺失则 Work 恢复后必然未登录，按 fatal 回滚；
+        // Cookies 缺失仅 Warn（快照可能是「启动过但未登录」的合法状态）
+        Layout::ElectronRoot => {
+            let mut m: Vec<String> = Vec::new();
+            if sess.last_restored_count <= 0 {
+                m.push("（快照为空或损坏，0 项恢复）".to_string());
+            } else if !sess.prof.data_dir.join("Local State").exists() {
+                m.push("Local State".to_string());
+            }
+            m
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Switch 主流程（PS 1415-1477 逐段对译，含防误覆盖守卫与恢复后校验回滚）
 fn switch_flow(
     sess: &mut Session,
@@ -709,34 +781,46 @@ fn switch_flow(
     // 恢复后校验（issue #9，仅 icube/electron_root）：①0 项恢复=快照空/损坏；
     // ②恢复后数据目录缺关键登录态文件 = 快照不含登录态或布局漂移。两种情况
     // 启动都只会「切了个寂寞」——从 last 槽回滚到切换前状态并重启，报 fatal 明示原因。
-    let missing: Vec<String> = match sess.prof.layout {
-        Layout::Icube => {
-            let mut m: Vec<String> = Vec::new();
-            if sess.last_restored_count <= 0 {
-                m.push("（快照为空或损坏，0 项恢复）".to_string());
-            } else {
-                for f in ["User\\globalStorage\\storage.json", "User\\globalStorage\\state.vscdb"] {
-                    if !sess.prof.data_dir.join(f).exists() {
-                        m.push(f.to_string());
+    let mut missing = post_restore_missing(sess);
+    // 缺陷4（issue #55 实测「traecode 切换失败」根因=主快照无效）：主快照损坏时
+    // 先尝试 <uid>.bak 回退槽（rotate_bak 保留的上一次覆盖前旧快照），有效则改用，
+    // 仍无效才回滚——旧逻辑直接回滚 fatal，用户必须手动重登重建快照；.bak 里往往
+    // 还留着一份完好的历史快照，白白浪费。
+    // 前置条件：主槽目录存在（若主槽本就缺失，resolve_slot 已自动回退 .bak，无需重试）
+    if !missing.is_empty() {
+        let bak_slot = format!("{uid}.bak");
+        if sess.prof.profiles_dir.join(uid).exists()
+            && sess.prof.profiles_dir.join(&bak_slot).exists()
+        {
+            sink.step(
+                "restore",
+                StepStatus::Warn,
+                &format!(
+                    "主快照无效（{}），尝试回退槽 {bak_slot}…",
+                    missing.join("；")
+                ),
+            );
+            // 恢复失败不中止（审查修复）：此时 live 已是坏的主快照内容，必须落回
+            // 下方 last 槽回滚 + 重启客户端，不能把停在关机状态的现场丢给用户
+            match restore_profile(sess, &bak_slot, sink) {
+                Ok(()) => {
+                    missing = post_restore_missing(sess);
+                    if missing.is_empty() {
+                        sink.step(
+                            "restore",
+                            StepStatus::Ok,
+                            &format!("回退槽 {bak_slot} 有效，已改用其恢复登录态"),
+                        );
                     }
                 }
+                Err(e) => sink.step(
+                    "restore",
+                    StepStatus::Warn,
+                    &format!("回退槽 {bak_slot} 恢复失败（将回滚到切换前状态）: {e}"),
+                ),
             }
-            m
         }
-        // 2026-10-02 审查：QoderWork（electron_root）同型校验——Local State 是
-        // cookie 解密密钥元数据，缺失则 Work 恢复后必然未登录，按 fatal 回滚；
-        // Cookies 缺失仅 Warn（快照可能是「启动过但未登录」的合法状态）
-        Layout::ElectronRoot => {
-            let mut m: Vec<String> = Vec::new();
-            if sess.last_restored_count <= 0 {
-                m.push("（快照为空或损坏，0 项恢复）".to_string());
-            } else if !sess.prof.data_dir.join("Local State").exists() {
-                m.push("Local State".to_string());
-            }
-            m
-        }
-        _ => Vec::new(),
-    };
+    }
     if !missing.is_empty() {
         sink.step(
             "restore",
@@ -749,7 +833,9 @@ fn switch_flow(
         restore_profile(sess, "last", sink)?;
         proc::start_app(sess, sink)?;
         let msg = format!(
-            "账号 {uid} 的快照无效（{}），已回滚到切换前状态。请登录该账号后重新「保存当前登录态」；若重新保存后仍报此错，可能是 {} 新版登录态布局变化，请携带日志反馈",
+            "账号 {uid} 的快照无效（{}），已回滚到切换前状态。请在客户端手动登录账号 {uid}\
+             （登录成功后点「保存当前登录态」重建快照；勿再「切换」到该账号，会重复此错误）；\
+             若重新保存后仍报此错，可能是 {} 新版登录态布局变化，请携带日志反馈",
             missing.join("；"),
             sess.prof.app_name
         );
@@ -886,6 +972,56 @@ mod tests {
                 .any(|(s, st, _)| s == "guard" && st == "warn"),
             "fail-open 应留 Warn 步骤"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// save_reject_message 三类场景分流（issue #55）：无槽位 → 首存指引（勿用切换）；
+    /// sidecar detectedUid ≠ 槽位 → 污染自愈指引（切换是死循环）；其余 → 通用文案
+    #[test]
+    fn save_reject_message_三类场景分流() {
+        let base = std::env::temp_dir().join(format!(
+            "sw-reject-msg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let profiles = base.join("data").join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+
+        // ① 无槽位（OAuth/扫描新入池账号首次保存）
+        let m1 = save_reject_message(&profiles, "3401253136383392", "2011463847263801");
+        assert!(m1.contains("还没有本地快照"), "m1={m1}");
+        assert!(m1.contains("手动登录"), "m1={m1}");
+
+        // ② 槽位存在 + sidecar 记录的保存身份是别的账号（历史污染）
+        std::fs::create_dir_all(profiles.join("1335050000000000")).unwrap();
+        std::fs::write(
+            profiles.join("1335050000000000.meta.json"),
+            r#"{"slot":"1335050000000000","savedAtMs":1,"detectedUid":"4487568582777872"}"#,
+        )
+        .unwrap();
+        let m2 = save_reject_message(&profiles, "1335050000000000", "4487568582777872");
+        assert!(m2.contains("污染"), "m2={m2}");
+        assert!(m2.contains("退出登录并手动重新登录"), "m2={m2}");
+
+        // ③ 槽位存在、无 sidecar / sidecar 身份一致 → 通用文案
+        std::fs::create_dir_all(profiles.join("2117003799429594")).unwrap();
+        let m3 = save_reject_message(&profiles, "2117003799429594", "4487568582777872");
+        assert!(m3.contains("已拒绝保存"), "m3={m3}");
+        assert!(m3.contains("确认登录身份"), "m3={m3}");
+        // sidecar 身份与槽位一致 → 不走污染文案
+        std::fs::write(
+            profiles.join("2117003799429594.meta.json"),
+            r#"{"slot":"2117003799429594","savedAtMs":1,"detectedUid":"2117003799429594"}"#,
+        )
+        .unwrap();
+        let m4 = save_reject_message(&profiles, "2117003799429594", "4487568582777872");
+        // 通用文案含「覆盖污染」字样，污染专案文案的特征是「疑似已被…污染」+「退出登录并手动重新登录」
+        assert!(!m4.contains("疑似已被"), "m4={m4}");
+        assert!(!m4.contains("反复操作无法自愈"), "m4={m4}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

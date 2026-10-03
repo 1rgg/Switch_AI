@@ -91,6 +91,10 @@ export interface AccountView {
   refresh_token_invalid?: boolean;
   /** 凭证最近一次落盘时间（OAuth 登录/导入/刷新成功时更新，F-78 批次 3 收尾） */
   auth_saved_at?: string | null;
+  /** JWT data.id 与 user_id 归属不一致（issue #55：扫描「已入池」可能经该账号 JWT 命中其他 uid） */
+  jwt_uid_mismatch?: boolean;
+  /** JWT 解析出的 data.id（mismatch 时展示用） */
+  jwt_uid?: string | null;
 }
 
 // ---- 积分消耗历史（Trae Work query_user_usage_group_by_session，按本地日聚合 + 增量拉取） ----
@@ -180,6 +184,10 @@ export interface DiscoveredAccount {
   app: string;
   app_label: string;
   in_pool: boolean;
+  /** 已入池时匹配到的账号名（user_id 直配优先，issue #55 透明化） */
+  matched_account_name?: string | null;
+  /** true = 仅经某账号 JWT 的 data.id 命中（该账号 user_id 与本 uid 不一致） */
+  matched_via_jwt?: boolean;
   storage_path: string;
 }
 

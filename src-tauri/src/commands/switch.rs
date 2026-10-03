@@ -205,14 +205,12 @@ pub fn switch_account(
     let expected_uid = if is_doubao {
         crate::commands::doubao::detect_guard_uid_strict(&state)
     } else if is_trae {
-        // icube 布局（TraeWork/Trae）切换守卫：混合推导（本机使用证据 + 桥标记切换
-        // 时刻，F2-6）——纯证据推导会被快照冻结的旧时间戳误导（实测指向一个月前的
-        // 历史账号，守卫恒误判不一致而跳过回写）。推导失败（None）→ 维持空串
-        // fail-open 不阻断切换。switch_account 为 async 命令，vscdb/storage 同步读取
-        // 在工作线程执行，不冻结 UI
+        // icube 布局（TraeWork/Trae）切换守卫（issue #55 审查修复）：live_cloud_uid
+        // 日志探测优先（当前会话 dynamicConfig.log uid 是「现在登录的是谁」的直接
+        // 证据），hybrid 仅在日志不可用时回退——回写来源槽的判定不再被桥标记/冻结
+        // 证据带偏。推导失败（None）→ 维持空串 fail-open 不阻断切换
         let kind = target_app.as_deref().unwrap_or("TraeWork");
-        crate::commands::trae_apps::current_cloud_uid_hybrid(kind, &state.data_dir)
-            .unwrap_or_default()
+        crate::commands::trae_apps::live_cloud_uid(kind, &state.data_dir).unwrap_or_default()
     } else if is_buddy {
         // F1-3/F2-5 authfile 布局切换守卫：按端取「当前登录账号 id」——
         // WorkBuddy 由共享 auth 文件驱动 → auth 文件 uid 在池反查优先，桥标记兜底；
@@ -402,21 +400,24 @@ pub fn save_current_login(
         }
     }
 
-    // L1 保存守卫（icube 布局，TraeWork/Trae）：与 F2-5 同型，数据源为
-    // current_cloud_uid_hybrid（本机使用证据 + 桥标记混合推导）。与 L2 日志硬校验
-    // （switcher::icube_save_identity_guard，stop 后读客户端日志）构成双层防护：
-    // L1 在命令层 fail-fast（客户端尚未被关停，体验最好），L2 兜底防 L1 数据源失真
-    // 后误放行。检测不可用（None，如未登录/无证据无标记）→ fail-open 放行。
+    // L1 保存守卫（icube 布局，TraeWork/Trae）：与 F2-5 同型。数据源改为
+    // live_cloud_uid（issue #55 审查修复：客户端日志探测优先，hybrid 回退）——
+    // hybrid 在手动重登后会被桥标记/快照冻结旧证据带偏，误拦合法保存，且拦截发生在
+    // 数据源更可靠的 L2 日志校验之前，曾造成「OAuth 新账号无法建立首个快照」死锁
+    // （切换要快照 → 快照要保存 → 保存被误拒）。与 L2 构成双层防护：L1 命令层
+    // fail-fast（客户端尚未被关停，体验最好），L2 兜底防 L1 数据源失真后误放行。
+    // 检测不可用（None，如未登录/无日志无证据无标记）→ fail-open 放行。
     if matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae")) {
         let kind = target_app.as_deref().unwrap_or("TraeWork");
-        if let Some(live) =
-            crate::commands::trae_apps::current_cloud_uid_hybrid(kind, &state.data_dir)
-        {
+        if let Some(live) = crate::commands::trae_apps::live_cloud_uid(kind, &state.data_dir) {
             if !live.is_empty() && live != user_id.trim() {
-                let msg = format!(
-                    "客户端当前登录的是账号 {live}，与要保存的账号 {user_id} 不一致，已拒绝保存（防止账号 {user_id} 的槽位被账号 {live} 的登录态覆盖污染）。\
-                     请先「切换」到账号 {user_id} 并在客户端确认登录，再点「保存当前登录态」。"
-                );
+                // issue #55 审查修复：拒绝文案按槽位状态分流（首存/污染/通用）
+                let profiles_dir = crate::switcher::profile::profile_for(
+                    TargetApp::parse(kind),
+                    &state.data_dir,
+                )
+                .profiles_dir;
+                let msg = crate::switcher::save_reject_message(&profiles_dir, user_id.trim(), &live);
                 fs_utils::app_log(&state.data_dir, &format!("保存登录态被守卫拦截: {msg}"));
                 return Err(msg);
             }

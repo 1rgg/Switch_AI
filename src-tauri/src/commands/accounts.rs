@@ -2032,6 +2032,15 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
                 .exp_hours
                 .map(|h| h <= 24.0)
                 .unwrap_or(true);
+        // JWT 归属一致性（issue #55）：user_id 与 JWT data.id 均非空且不同 → 警示。
+        // user_id 为空时视图 uid 本就回退 JWT id（既有语义），不算 mismatch
+        let raw_user_id = a.user_id.clone().unwrap_or_default();
+        let jwt_uid = info.user_id.clone();
+        let jwt_uid_mismatch = !raw_user_id.is_empty()
+            && jwt_uid
+                .as_deref()
+                .map(|j| !j.is_empty() && j != raw_user_id)
+                .unwrap_or(false);
         out.push(AccountView {
             user_id: uid.clone(),
             name: a.name.clone(),
@@ -2065,6 +2074,8 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
             refresh_token_fails: a.refresh_token_fails,
             refresh_token_invalid: a.refresh_token_invalid,
             auth_saved_at: a.auth_saved_at.clone(),
+            jwt_uid_mismatch,
+            jwt_uid,
         });
     }
     out

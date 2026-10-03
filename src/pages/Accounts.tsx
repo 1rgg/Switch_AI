@@ -452,6 +452,14 @@ export default function Accounts() {
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-1">
                         <JwtStatusBadge hours={a.jwt_exp_hours} />
+                        {a.jwt_uid_mismatch && (
+                          <Badge
+                            tone="amber"
+                            title={`该账号的 JWT 实际属于账号 ${a.jwt_uid ?? '?'}，与记录的账号 id ${a.user_id} 不一致（可能粘贴错 JWT 或被污染）。快照槽位按账号 id 命名，请编辑账号重新粘贴正确的 JWT，或删除该账号重新收录`}
+                          >
+                            JWT/id 不符
+                          </Badge>
+                        )}
                         {a.has_refresh_token && (
                           <span title="支持自动刷新" className="text-sky-500">
                             <Zap size={12} />

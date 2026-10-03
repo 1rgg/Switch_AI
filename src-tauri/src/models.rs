@@ -50,6 +50,14 @@ pub struct AccountView {
     /// F-78 批次 3 收尾，对齐 Buddy 侧 auth_saved_at 先例）
     #[serde(default)]
     pub auth_saved_at: Option<String>,
+    /// JWT data.id 与 user_id 归属不一致（issue #55：此时扫描「已入池」可能经该账号
+    /// JWT 命中其他 uid，列表却无从对账；显式暴露供列表警示。快照槽位按 user_id
+    /// 命名，自动改写会孤儿化既有快照，故仅警示不强修）
+    #[serde(default)]
+    pub jwt_uid_mismatch: bool,
+    /// JWT 解析出的 data.id（mismatch 时供 tooltip 展示）
+    #[serde(default)]
+    pub jwt_uid: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
