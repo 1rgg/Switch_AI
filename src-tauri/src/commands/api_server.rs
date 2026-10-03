@@ -302,7 +302,16 @@ pub async fn do_start(
                 let (creds, _, status) =
                     crate::tasks::qoder_common::ensure_fresh(&st, &agent, acct_id, 1);
                 if creds.access_token.is_empty() {
-                    return Err(format!("qoder 凭证缺失(id={acct_id}, status={status})"));
+                    // 审查修复：暂态失败（网络/5xx → refresh_failed）带标记前缀，
+                    // 网关侧走 Server 熔断可自愈；仅永久失效（凭证缺失/过期需重登/
+                    // PAT 被拒/refresh_token 被拒）走 SessionDead 永久禁用
+                    return Err(match status {
+                        "refresh_failed" => format!(
+                            "{}qoder 凭证暂不可用(id={acct_id}, status={status}；网络/服务端暂态，稍后自动恢复)",
+                            crate::tasks::qoder_common::TRANSIENT_ERR_TAG
+                        ),
+                        _ => format!("qoder 凭证缺失(id={acct_id}, status={status})"),
+                    });
                 }
                 Ok(creds)
             })

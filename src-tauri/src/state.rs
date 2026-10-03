@@ -145,6 +145,11 @@ const CONF_FILES: &[&str] = &["app_settings.json"];
 impl AppState {
     pub fn new() -> Result<Self, String> {
         // 数据目录：%APPDATA%\AIWorkAssistant，不存在则创建
+        // macOS 适配预留（2026-10-03）：Qoder 账号池（qoder_pool/token store/
+        // 快照 profiles_qoder*）全部落在此目录之下。macOS 对应根 = `dirs::data_dir()`
+        // 即 ~/Library/Application Support/AIWorkAssistant；建议本函数按 cfg 分支
+        // 取根目录（Windows=APPDATA / macOS=dirs::data_dir()），下游 data_dir
+        // 拼接逻辑与 Qoder 域代码零改动
         let appdata = std::env::var("APPDATA")
             .map(PathBuf::from)
             .map_err(|_| "无法读取 APPDATA 环境变量".to_string())?;

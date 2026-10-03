@@ -14,6 +14,15 @@
 //! 快照完整性：switcher QODER_IDE_ITEMS 白名单含 Local State 与 state.vscdb（+WAL/SHM），
 //! 快照恢复后密钥与密文同槽走，IDE 可自解密——本模块只读不改。
 //!
+//! 【跨平台审查 2026-10-03】macOS 适配预留（本模块为 Qoder 域解密核心）：
+//! - 跨平台可复用：`parse_buffer` / `decrypt_v10` / `read_vscdb_key` / `scan_ide_login`
+//!   主流程与 state.vscdb 结构均为平台无关（Chromium os_crypt v10 密文同构）；
+//! - 平台分支点：唯一差异在 AES 密钥获取（`ide_aes_key`）——Windows = Local State
+//!   os_crypt.encrypted_key + DPAPI；macOS = Keychain「Chromium Safe Storage」service
+//!   条目（service 名与 v10/v11 前缀需真机实测，预期走 security-cli 或 security-framework crate）；
+//! - Work Cookie 链路（read_cookie_value）同理：Cookies SQLite 表结构跨平台一致，
+//!   仅密钥包装不同。检索标记：`macOS 适配预留`。
+//!
 //! 凭证红线：token 不进日志/事件/返回值；摘要只回 qd- id 与昵称。
 
 use std::path::Path;
@@ -32,6 +41,11 @@ const KEY_USER_INFO: &str = "secret://aicoding.auth.userInfo";
 // ── 解密链路（对齐 device_proxy/local_capture.rs Chrome AES 模板）──────────
 
 /// Local State（dataDir 根目录）→ os_crypt.encrypted_key → base64 → DPAPI → AES 密钥
+/// macOS 适配预留：Windows 专属密钥获取。macOS 等价实现 = 读 Keychain
+/// 「Chromium Safe Storage」条目得到 16B 密钥（security-framework crate 或
+/// `security find-generic-password` 子进程），后续 AES-256-GCM 解密逻辑
+/// （decrypt_v10）无需改动；建议以同签名 `ide_aes_key(data_dir)` 按 cfg 并存，
+/// scan_ide_login 调用链零改动
 #[cfg(windows)]
 fn ide_aes_key(data_dir: &Path) -> Result<Vec<u8>, String> {
     use base64::Engine as _;
@@ -245,7 +259,10 @@ pub struct QoderIdeScanResult {
 /// 仍按 §5.10 注入每账号绑定指纹——IDE 本机指纹不入 store，避免多账号共享单指纹）。
 /// async：命令含 DPAPI 解密 + SQLite 读取等阻塞 IO，移出主线程避免卡 UI。
 #[tauri::command(async)]
-pub fn qoder_ide_scan(state: State<AppState>) -> Result<QoderIdeScanResult, String> {
+pub fn qoder_ide_scan(
+    state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<QoderIdeScanResult, String> {
     #[cfg(windows)]
     {
         let data_dir = ide_data_dir().ok_or("无法定位 QoderCN 数据目录（APPDATA 缺失）")?;
@@ -283,7 +300,12 @@ pub fn qoder_ide_scan(state: State<AppState>) -> Result<QoderIdeScanResult, Stri
                 if a.credential_source.is_empty() {
                     a.credential_source = "ide_store".into();
                 }
-                a.token_expires_at = login.expires_at_ms.map(|ms| ms / 1000);
+                // 到期时间过域钳制（与 creds_of 同口径：超 (0, now+10y] 视为无过期信息，
+                // 防服务端脏数据导致到期看板溢出/千年展示）
+                a.token_expires_at = login
+                    .expires_at_ms
+                    .and_then(qoder_common::clamp_expires_at)
+                    .map(|ms| ms / 1000);
                 a.needs_relogin = false;
                 a.relogin_reason = String::new();
                 if a.device_profile.is_none() {
@@ -301,7 +323,10 @@ pub fn qoder_ide_scan(state: State<AppState>) -> Result<QoderIdeScanResult, Stri
                     uid: login.uid.clone(),
                     nickname: nickname.clone(),
                     credential_source: "ide_store".into(),
-                    token_expires_at: login.expires_at_ms.map(|ms| ms / 1000),
+                    token_expires_at: login
+                        .expires_at_ms
+                        .and_then(qoder_common::clamp_expires_at)
+                        .map(|ms| ms / 1000),
                     // 入池即生成稳定指纹（§5.10：一次生成永不轮换）
                     device_profile: Some(QoderDeviceProfile::generate()),
                     ..Default::default()
@@ -321,6 +346,8 @@ pub fn qoder_ide_scan(state: State<AppState>) -> Result<QoderIdeScanResult, Stri
         };
         qoder_common::save_token_store(&state, &id, &creds)?;
         crate::fs_utils::app_log(&state.data_dir, &format!("Qoder IDE 存储账号已发现并导入: {id}"));
+        // 新账号/凭证变更联动网关池热重载（fail-open 即时入池调度；服务未运行时 no-op）
+        crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
         Ok(QoderIdeScanResult {
             found: true,
             imported: !updated,
@@ -333,6 +360,8 @@ pub fn qoder_ide_scan(state: State<AppState>) -> Result<QoderIdeScanResult, Stri
     #[cfg(not(windows))]
     {
         let _ = &state;
+        // macOS 适配预留：macOS 分支实装后本分支删除——scan_ide_login 主流程
+        // 跨平台复用，仅需补 Keychain 密钥获取（见模块头【跨平台审查】与 ide_aes_key 注释）
         Err("IDE 存储发现仅支持 Windows（DPAPI + AES-GCM）".into())
     }
 }

@@ -76,14 +76,14 @@ const TASKS: &[SchedTask] = &[
     // F-80 Qoder 积分快照：每日 HH:MM（settings.qoder_credits_sync_hhmm 可改，开关独立）
     SchedTask { key: "qoder-credits-snapshot", name: "Qoder 积分快照", hhmm: "23:40", kind: "fix" },
     // F-80 Qoder 凭证 6h 兜底刷新（kind "refresh" → EveryHours(6)；hhmm 不参与判定）。
-    // 恒开、空池空转，无 settings 键——对齐 doubao-keepalive 惯例（规避「有配置无 UI」死配置）
+    // 空池空转；开关独立（settings.qoder_token_renew_enabled，默认开，环境配置页可关）
     SchedTask { key: "qoder-refresh", name: "Qoder 凭证定时刷新", hhmm: "06:00", kind: "refresh" },
     // 模型同步（每日 HH:MM，默认开；无账号时静默跳过不计失败，对齐 models-sync 惯例）
     SchedTask { key: "trae-models-sync", name: "Trae 模型列表同步", hhmm: "05:40", kind: "models" },
     SchedTask { key: "wb-catalog-sync", name: "WorkBuddy 模型目录同步", hhmm: "05:45", kind: "models" },
     // Qoder 模型目录同步（p3-3 收尾）：真 COSY 签名拉 model/list → adopt_remote
-    // 替换 CN 区缓存；无 settings 键恒开（幂等低风险 + qoder_enabled 默认关时
-    // 池空空转，规避「有配置无 UI」死配置，对齐 qoder-refresh 惯例）
+    // 替换 CN 区缓存；开关/时刻独立（settings.qoder_catalog_sync_enabled /
+    // qoder_catalog_sync_hhmm，均默认开，环境配置页可改；空池/无凭证静默跳过不计失败）
     SchedTask { key: "qoder-catalog-sync", name: "Qoder 模型目录同步", hhmm: "05:50", kind: "models" },
 ];
 
@@ -138,7 +138,7 @@ fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
     match t.kind {
         // 看板数据同步：hourly 按小时节流，daily（含非法值回退）按每日时刻
         "credits" if credits_sync_mode(st, t.key) == "hourly" => SchedPlan::Hourly,
-        // Qoder 凭证兜底刷新：固定每 6 小时（无 settings 键，恒开）
+        // Qoder 凭证兜底刷新：固定每 6 小时（hhmm 不参与判定；开关 settings.qoder_token_renew_enabled）
         "refresh" => SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS),
         _ => SchedPlan::Daily(effective_hhmm(st, t)),
     }
@@ -187,14 +187,26 @@ fn tick(st: &AppState) {
             }
         }
         let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_task(t.key, st))) {
-            Ok(Ok(v)) => Ok(summarize(&v)),
+            Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("任务线程 panic（已捕获，不影响后续调度）".to_string()),
         };
         match outcome {
-            Ok(summary) => {
-                mark_run(st, t.key, &today, &summary);
-                fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）：{}", t.name, trigger, summary));
+            Ok(v) => {
+                let summary = summarize(&v);
+                // skipped_busy（审查修复：qoder-checkin 轮次锁被 UI 路径持有的幂等跳过）
+                // 不 mark_run——跳过≠完成，mark_run 会固化「当日已跑」关闭当日重试链，
+                // UI 轮次的失败账号将失去当日调度兜底。其余 skipped（空池静默空转）
+                // 仍照常记账，防 EveryHours/Hourly 任务每 tick 空转刷日志
+                if v.get("skipped_busy").is_some() {
+                    fs_utils::app_log(
+                        &st.data_dir,
+                        &format!("[调度器] {}（{}）：{}（不记当日已跑，稍后重试）", t.name, trigger, summary),
+                    );
+                } else {
+                    mark_run(st, t.key, &today, &summary);
+                    fs_utils::app_log(&st.data_dir, &format!("[调度器] {}（{}）：{}", t.name, trigger, summary));
+                }
             }
             Err(summary) => {
                 // 当日首败判定（在 mark_fail 覆盖前读旧值）：上次失败不在今天 → 今天首次失败。
@@ -333,7 +345,8 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
             // 抢不到轮次锁（UI 路径正在签到）= 幂等跳过而非失败：返 Err 会被调度器记
             // 当日首败并推送「签到失败」误报通知（签到本身未失败，UI 路径会照常完成）
             let Ok(_round) = crate::tasks::qoder_checkin::try_acquire_qoder_round() else {
-                return Ok(json!({ "ok": true, "skipped": "已有 Qoder 签到任务在执行中，本轮跳过" }));
+                // skipped_busy：tick 据此跳过 mark_run（保留当日后续 tick 重试机会）
+                return Ok(json!({ "ok": true, "skipped": "已有 Qoder 签到任务在执行中，本轮跳过", "skipped_busy": true }));
             };
             let opts = super::qoder_checkin::QoderCheckinOpts::daily();
             let done = super::qoder_checkin::run_checkin_round(st, &opts, &mut |_| {});

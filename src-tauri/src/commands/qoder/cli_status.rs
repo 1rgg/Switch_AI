@@ -9,6 +9,9 @@
 use serde_json::{json, Value};
 
 /// CLI status 文件：`~/.qoder-cn/.qoder-app-status.json`
+/// macOS 适配预留：`.qoder-cn` 目录名本身跨平台同构（CLI 官方约定），仅主目录
+/// 变量需分支——Windows 用 USERPROFILE，macOS 用 HOME（或统一 dirs::home_dir()）；
+/// macOS 下本函数当前返回 None → available=false（fail-safe），不阻塞其他功能
 fn cli_status_path() -> Option<std::path::PathBuf> {
     let home = std::env::var("USERPROFILE").ok()?;
     let home = home.trim();

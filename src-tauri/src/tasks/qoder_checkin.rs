@@ -164,6 +164,12 @@ fn append_results(state: &AppState, events: &[Value]) {
 
 // ── 签到主流程 ─────────────────────────────────────────────────────────────
 
+/// empty_campaigns 失败标记（结构化 fail_kind 的唯一产源标记）。
+/// 产源 = list_claimable 空活动分支（message 以本常量开头）；诊断日志与 fail_kind
+/// 均按 `starts_with(EMPTY_CAMPAIGNS_TAG)` 派生——调整「：」后的展示文案不影响
+/// 统计，更换标记本身只需改本常量一处（勿在消费侧绕过常量硬编码前缀）。
+const EMPTY_CAMPAIGNS_TAG: &str = "empty_campaigns";
+
 /// 拉取活动列表并过滤可领项。返回 Ok(可领 campaign 列表)；
 /// Err(kind, message)：auth（401，调用方刷新重试）| fail。
 fn list_claimable(
@@ -193,7 +199,10 @@ fn list_claimable(
         .cloned()
         .unwrap_or_default();
     if campaigns.is_empty() {
-        return Err(("fail".into(), "empty_campaigns：活动列表为空（活动未开始或不可用）".into()));
+        return Err((
+            "fail".into(),
+            format!("{EMPTY_CAMPAIGNS_TAG}：活动列表为空（活动未开始或不可用）"),
+        ));
     }
     // 过滤 claimStatus==CLAIMABLE（大小写宽容），双活动自然全覆盖
     let claimable: Vec<Value> = campaigns
@@ -415,18 +424,19 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
                         &["name", "title", "campaignName", "campaign_name"],
                     ));
                     let (k, m, r) = claim_one(agent, &headers, &urls, c);
+                    if k == "auth" {
+                        kind = "auth".into();
+                        auth_msg = m;
+                        // 已领取活动的累计奖励不丢弃（真实入账，原 reward=None 会抹掉）
+                        // auth 中断条目不入 campaigns_log（档期日历只收真实领取结果）
+                        break;
+                    }
                     campaigns_log.push(json!({
                         "id": cid,
                         "name": if cname.is_empty() { cid.clone() } else { cname },
                         "kind": k,
                         "reward": r,
                     }));
-                    if k == "auth" {
-                        kind = "auth".into();
-                        auth_msg = m;
-                        // 已领取活动的累计奖励不丢弃（真实入账，原 reward=None 会抹掉）
-                        break;
-                    }
                     // kind 优先级归并（P2）：success > fail > already——
                     // 部分活动失败不掩盖整体成功，任一失败也不被 already 掩盖
                     kind = merge_claim_kind(&kind, &k);
@@ -548,13 +558,20 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
         _ => "fail",
     };
     // 空活动列表诊断（脱敏：只记账号与结论，不含 token/响应原文）
-    if message.starts_with("empty_campaigns") {
+    if message.starts_with(EMPTY_CAMPAIGNS_TAG) {
         fs_utils::app_log(
             &state.data_dir,
             &format!("qoder 签到空活动列表: {aid}（Cosy-ClientType={} 已带；若持续出现请核查活动状态/接口结构 R-9）", qoder_common::COSY_CLIENT_TYPE),
         );
     }
     let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": status_txt, "message": message });
+    // 结构化失败类别（审查 L-empty_campaigns）：调度器/CLI/UI 统计一律消费
+    // fail_kind 字段，不再各自耦合 message 文案；前缀派生已收敛到
+    // EMPTY_CAMPAIGNS_TAG 常量（与产源 list_claimable 同源，改展示文案尾缀
+    // 不破坏统计，换标记只动常量一处）
+    if message.starts_with(EMPTY_CAMPAIGNS_TAG) {
+        ev["fail_kind"] = json!(EMPTY_CAMPAIGNS_TAG);
+    }
     if let Some(r) = reward {
         ev["reward"] = json!(r);
     }
@@ -601,14 +618,14 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
     let already = events.iter().filter(|e| e["status"] == "already").count();
     let failed = events.len() - ok - already;
     // empty_campaigns 单列（审查 L-empty_campaigns）：活动未开始/不可用属非用户可操作
-    // 失败，启动补签推送按 failed - failed_empty_campaigns 判定，避免无效打扰
+    // 失败，启动补签推送按 failed - failed_empty_campaigns 判定，避免无效打扰。
+    // 判定读结构化 fail_kind 字段（process_account 产出），字段值取自
+    // EMPTY_CAMPAIGNS_TAG 常量，与产源/派生同源
     let failed_empty_campaigns = events
         .iter()
         .filter(|e| {
             e["status"] == "fail"
-                && e.get("message")
-                    .and_then(Value::as_str)
-                    .is_some_and(|m| m.starts_with("empty_campaigns"))
+                && e.get("fail_kind").and_then(Value::as_str) == Some(EMPTY_CAMPAIGNS_TAG)
         })
         .count();
     let done = json!({

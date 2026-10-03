@@ -82,7 +82,7 @@ export default function Sidebar({
   const [showAbout, setShowAbout] = useState(false);
   const [showSystem, setShowSystem] = useState(false);
 
-  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 6 页；Qoder → 5 页（F-80）
+  // 按当前应用切换菜单：Trae → 现有 6 页；豆包 → 3 页；Buddy → 6 页；Qoder → 6 页（F-80）
   const nav =
     activeApp === 'doubao'
       ? DOUBAO_NAV

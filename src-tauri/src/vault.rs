@@ -112,6 +112,13 @@ pub(crate) mod dpapi {
 
 #[cfg(not(windows))]
 mod dpapi {
+    // macOS 适配预留（2026-10-03）：Qoder 域直接消费点为 ide_store.rs 的
+    // Chromium os_crypt 密钥解包（Local State encrypted_key "DPAPI" 前缀段）。
+    // macOS 等价物 = Keychain generic password（service≈"Chromium Safe Storage"，
+    // 需真机实测 Qoder 实际条目名），取回 16B 密钥后 AES-GCM 逻辑不变。
+    // 建议：以同签名 unprotect 语义做一个 mac 模块供 ide_store 按 cfg 选择，
+    // 或在 ide_store 内直接分支——本占位仅服务 vault 自身（stronghold 主密码
+    // 不依赖 DPAPI，见 generate_password，macOS 走 stronghold 原生即可）
     pub fn protect(_plain: &[u8]) -> Result<Vec<u8>, String> {
         Err("vault 仅支持 Windows".into())
     }
@@ -147,6 +154,10 @@ pub(crate) fn csprng_fill(dest: &mut [u8]) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = dest;
+        // macOS 适配预留（2026-10-03）：等价替换 = SecRandomCopyBytes（Security
+        // framework）或 libc getrandom/getentropy；qoder data_io.rs 加密导出的
+        // salt/nonce 与 vault 主密码生成都经此函数，macOS 分支实装本分支即可
+        // 全链路生效（fail-fast 语义保持：RNG 不可用必须 Err，不许弱熵兜底）
         Err("vault 仅支持 Windows（无可用 CSPRNG 封装）".into())
     }
 }

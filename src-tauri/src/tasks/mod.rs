@@ -96,10 +96,16 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
         "qoder-checkin" => {
             let opts = qoder_checkin::QoderCheckinOpts::daily();
             let done = qoder_checkin::run_checkin_round(state, &opts, &mut print_progress);
-            // 审查 M-1：存在失败账号时返 Err，让调度器既有 30 分钟冷却重试生效
-            //（暂态网络/服务端失败可自行恢复；empty_campaigns 随重试覆盖活动延迟上线场景）
+            // 审查 M-1：存在失败账号时返 Err（schtasks 退出码可见 + 通知渠道）。
+            // 口径对齐调度器（scheduler.rs 同款）：empty_campaigns（活动未上线/不可用）
+            // 属非用户可操作失败，不计失败——CLI 进程本身无 30min 冷却重试链，
+            // 重试由次日调度覆盖；done 事件恒携带该字段，旧结构缺字段时按 0 兜底
             let failed = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
-            if failed > 0 {
+            let failed_empty = done
+                .get("failed_empty_campaigns")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if failed - failed_empty > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 Err(format!(

@@ -27,7 +27,7 @@ interface QoderAccountLine {
 
 type ParsedEvent =
   | { type: 'start'; total: number }
-  | { type: 'done'; ok: number; already: number; failed: number }
+  | { type: 'done'; ok: number; already: number; failed: number; failed_empty_campaigns?: number }
   | { type: 'exit' }
   | QoderAccountLine;
 
@@ -80,7 +80,7 @@ export default function QoderCheckin() {
   const [accounts, setAccounts] = useState<QoderAccountView[]>([]);
   const [running, setRunning] = useState(false);
   const [lines, setLines] = useState<QoderAccountLine[]>([]);
-  const [doneInfo, setDoneInfo] = useState<{ ok: number; already: number; failed: number } | null>(null);
+  const [doneInfo, setDoneInfo] = useState<{ ok: number; already: number; failed: number; empty: number } | null>(null);
   const [checkinMap, setCheckinMap] = useState<Map<string, QoderCheckinRecord[]>>(new Map());
   const [refreshing, setRefreshing] = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
@@ -124,10 +124,18 @@ export default function QoderCheckin() {
         setLines([]);
         setDoneInfo(null);
       } else if ('type' in parsed && parsed.type === 'done') {
-        setDoneInfo({ ok: parsed.ok, already: parsed.already, failed: parsed.failed });
+        // failed_empty_campaigns（活动未开始/不可用）为非用户可操作失败：
+        // 与真实失败分开计数，避免用户对无解失败反复重试（口径对齐 Rust 侧补签通知）
+        const empty = Math.max(0, parsed.failed_empty_campaigns ?? 0);
+        const actionable = parsed.failed - empty;
+        setDoneInfo({ ok: parsed.ok, already: parsed.already, failed: parsed.failed, empty });
         setRunning(false);
         void refresh();
-        pushToast(parsed.failed > 0 ? 'warn' : 'success', `Qoder 签到完成：成功 ${parsed.ok}，已签 ${parsed.already}，失败 ${parsed.failed}`);
+        pushToast(
+          actionable > 0 ? 'warn' : 'success',
+          `Qoder 签到完成：成功 ${parsed.ok}，已签 ${parsed.already}，失败 ${parsed.failed}` +
+            (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : ''),
+        );
       } else if ('index' in parsed && parsed.index != null && parsed.index > 0) {
         const line = parsed as QoderAccountLine;
         const reward = scalarNum(line.reward);
@@ -329,8 +337,9 @@ export default function QoderCheckin() {
             {running ? (
               <Badge tone="blue">运行中</Badge>
             ) : doneInfo ? (
-              <Badge tone={doneInfo.failed > 0 ? 'amber' : 'green'}>
+              <Badge tone={doneInfo.failed - doneInfo.empty > 0 ? 'amber' : 'green'}>
                 完成：成功 {doneInfo.ok} · 已签 {doneInfo.already} · 失败 {doneInfo.failed}
+                {doneInfo.empty > 0 && `（含 ${doneInfo.empty} 项活动未开放）`}
                 {earned > 0 && ` · 获得 ${earned} Credits`}
               </Badge>
             ) : null}

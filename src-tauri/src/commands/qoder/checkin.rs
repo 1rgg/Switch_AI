@@ -43,26 +43,33 @@ pub fn qoder_checkin_start(
     };
     let app2 = app.clone();
     let state2 = state.inner().clone();
-    std::thread::spawn(move || {
-        let _guard = round;
-        // panic 不外泄线程：捕获后记录，exit 终态照常下发（否则前端运行态永挂）
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            qoder_checkin::run_checkin_round(&state2, &o, &mut |ev| emit_qoder_event(&app2, ev));
-        }));
-        if result.is_err() {
-            fs_utils::app_log(&state2.data_dir, "Qoder 签到轮次线程 panic（已捕获，exit 终态仍下发）");
-        }
-        // 终态事件（前端据 "type":"exit" 复位运行态）：emit 失败落日志（issue #44 约定对齐）。
-        // 契约同 wb：NDJSON **字符串** payload（listen<string> 后 JSON.parse），传对象会
-        // 破坏 parseLine 导致 exit 事件被静默丢弃
-        let line = serde_json::json!({ "type": "exit", "ok": true }).to_string();
-        crate::events::emit_logged(
-            &app2,
-            "qoder-checkin-progress",
-            serde_json::Value::String(line),
-            Some(state2.data_dir.as_path()),
-        );
-    });
+    // I17（对齐 oauth）：命名线程便于诊断；spawn 失败时闭包（已 move 持有轮次锁
+    // guard）随之 drop 自动释放，不会阻塞后续签到
+    let spawned = std::thread::Builder::new()
+        .name("qoder-checkin".into())
+        .spawn(move || {
+            let _guard = round;
+            // panic 不外泄线程：捕获后记录，exit 终态照常下发（否则前端运行态永挂）
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                qoder_checkin::run_checkin_round(&state2, &o, &mut |ev| emit_qoder_event(&app2, ev));
+            }));
+            if result.is_err() {
+                fs_utils::app_log(&state2.data_dir, "Qoder 签到轮次线程 panic（已捕获，exit 终态仍下发）");
+            }
+            // 终态事件（前端据 "type":"exit" 复位运行态）：emit 失败落日志（issue #44 约定对齐）。
+            // 契约同 wb：NDJSON **字符串** payload（listen<string> 后 JSON.parse），传对象会
+            // 破坏 parseLine 导致 exit 事件被静默丢弃
+            let line = serde_json::json!({ "type": "exit", "ok": true }).to_string();
+            crate::events::emit_logged(
+                &app2,
+                "qoder-checkin-progress",
+                serde_json::Value::String(line),
+                Some(state2.data_dir.as_path()),
+            );
+        });
+    if let Err(e) = spawned {
+        return Err(format!("签到后台线程启动失败: {e}"));
+    }
     Ok(())
 }
 
@@ -117,6 +124,16 @@ pub fn qoder_checkin_results(
 }
 
 // ── 每日签到定时任务（schtasks 双轨；对照 wb_checkin_task_register）─────────
+// 【跨平台审查 2026-10-03】macOS 适配预留：本节为 Windows 专属调度兜底
+// （schtasks /Create /Query /Delete + cmd 启动器）。macOS 等价物 = launchd
+// LaunchAgent（~/Library/LaunchAgents/<label>.plist + launchctl load/unload），
+// 建议按「注册/查询/卸载」三命令同签名收敛：commands 层按 cfg 分平台调度到
+// schtasks 或 launchd 实现，任务名前缀常量跨平台共用（LaunchAgent label 用同值）；
+// build_qoder_task_tr 的 cmd /c 启动器为 Windows 特有，macOS plist 里直接
+// ProgramArguments 数组调用主 exe + --task-run 参数即可（环境变量用
+// EnvironmentVariables 键替代 AIWORKDATA_DIR set）。应用内 in-app 调度器
+// （tasks/scheduler.rs）本身跨平台，关掉 schtasks 双轨不丢签到能力。
+// 检索标记：`macOS 适配预留`
 
 const QODER_CHECKIN_TASK_PREFIX: &str = "AIWorkAssistant_QoderCheckin";
 

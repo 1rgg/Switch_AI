@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::json;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -47,6 +47,9 @@ fn open_in_browser(url: &str) -> Result<(), String> {
 
 /// 非 Windows 占位（cmd/raw_arg/creation_flags 为 Windows 专属，逐函数门控
 /// 对齐 common.rs is_running 惯例）
+/// macOS 适配预留：用 `open <url>` 子进程（Command::new("open").arg(url)）等价替换，
+/// URL 校验逻辑（https/http 前缀 + 引号/空格拒绝）跨平台保留；Linux 分支可顺手
+/// 用 `xdg-open`，三平台收敛为 cfg 分支同签名函数，调用方 qoder_oauth_login 零改动
 #[cfg(not(windows))]
 fn open_in_browser(_url: &str) -> Result<(), String> {
     Err("打开浏览器仅支持 Windows".into())
@@ -147,6 +150,11 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<
                         match import_device_creds(&state2, creds, &uid) {
                             Ok((id, nickname)) => {
                                 fs_utils::app_log(&state2.data_dir, &format!("qoder OAuth 登录成功: {id}"));
+                                // 网关池热重载：重登清除 needs_relogin / 新账号入池后
+                                // 即时恢复调度（否则禁用态残留到重启/手动 pool_set；
+                                // 服务未运行时 no-op）
+                                let rt = app2.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+                                crate::commands::api_server::reload_pools_if_running(&state2, rt.inner());
                                 emit_done(
                                     &app2,
                                     &state2.data_dir,

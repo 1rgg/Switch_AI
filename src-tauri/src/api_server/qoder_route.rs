@@ -506,7 +506,7 @@ fn run_qoder_stream(
                 }
                 None => {
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
-                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0);
+                    state.record_usage_qoder(model, "none", key_id, false, true, duration_ms, 0, 0, None);
                     state.logger.log_request(
                         "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
                         duration_ms, &key_name, "", Some("no healthy account"),
@@ -540,7 +540,14 @@ fn run_qoder_stream(
             Some(resolve) => match resolve(&picked.uid) {
                 Ok(c) => c,
                 Err(e) => {
-                    state.qoder_pool.note_error(&picked.uid, ErrKind::SessionDead);
+                    // 审查修复：瞬时失败（网络/5xx，带 TRANSIENT_ERR_TAG）记 Server 熔断
+                    //（可自愈）；仅永久失效 SessionDead 禁用
+                    let kind = if crate::tasks::qoder_common::is_transient_identity_err(&e) {
+                        ErrKind::Server
+                    } else {
+                        ErrKind::SessionDead
+                    };
+                    state.qoder_pool.note_error(&picked.uid, kind);
                     *safe_lock(&state.last_error) =
                         Some(format!("qoder identity uid={} err={}", picked.uid, e));
                     state.logger.log_request(
@@ -578,6 +585,8 @@ fn run_qoder_stream(
             if tx.is_closed() {
                 return;
             }
+            // F-76① TTFT 采样（同 wb_route：各次尝试独立计时，竞速胜者首字即 TTFB）
+            let ttfb_start = Instant::now();
             match qoder_upstream::make_qoder_request(
                 &creds,
                 &converted,
@@ -607,6 +616,7 @@ fn run_qoder_stream(
                             break;
                         }
                     };
+                    let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
                     // 对冲计数落定 + guard 重绑（接管时生效账号 = 对冲账号）
                     guard = settle_qoder_hedge(state, &mut race, guard, &picked.uid);
                     hedge_taken = race.takeover;
@@ -640,6 +650,7 @@ fn run_qoder_stream(
                         duration_ms,
                         pt,
                         ct,
+                        Some(ttfb_ms),
                     );
                     match error_info {
                         Some((code, msg)) => {
@@ -691,9 +702,9 @@ fn run_qoder_stream(
                                 // 流未开始：错误不下发，允许换号重试
                                 break;
                             }
-                            state.logger.log_request(
+                            state.logger.log_request_ttfb(
                                 "qoder", "POST", "/v1/chat/completions", model, true, 200,
-                                &win_uid, duration_ms, &key_name,
+                                &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                 &state.qoder_pool.name_of(&win_uid), Some(&msg),
                             );
                             return; // 已有数据流出：就地收尾
@@ -701,9 +712,9 @@ fn run_qoder_stream(
                         None => {
                             if failed_inline {
                                 // 流内失败已就地透传客户端：不重试不记账冷却（同 wb_route）
-                                state.logger.log_request(
+                                state.logger.log_request_ttfb(
                                     "qoder", "POST", "/v1/chat/completions", model, true, 200,
-                                    &win_uid, duration_ms, &key_name,
+                                    &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                     &state.qoder_pool.name_of(&win_uid),
                                     Some("流内失败已透传客户端"),
                                 );
@@ -720,9 +731,9 @@ fn run_qoder_stream(
                                 state.qoder_sticky.bind(&sticky_key, &win_uid, &sticky_seed, now_ts());
                                 state.qoder_sticky.save(&state.data_dir);
                             }
-                            state.logger.log_request(
+                            state.logger.log_request_ttfb(
                                 "qoder", "POST", "/v1/chat/completions", model, true, 200,
-                                &win_uid, duration_ms, &key_name,
+                                &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                 &state.qoder_pool.name_of(&win_uid), None,
                             );
                             return;
@@ -921,6 +932,7 @@ pub async fn qoder_aggregate_chat(
                             start_ts.elapsed().as_millis() as u64,
                             0,
                             0,
+                            None,
                         );
                         return Err("no healthy account available".to_string());
                     }
@@ -937,7 +949,13 @@ pub async fn qoder_aggregate_chat(
                 Some(resolve) => match resolve(&picked.uid) {
                     Ok(c) => c,
                     Err(e) => {
-                        state.qoder_pool.note_error(&picked.uid, ErrKind::SessionDead);
+                        // 审查修复：瞬时失败走 Server 熔断可自愈（同流式路径）
+                        let kind = if crate::tasks::qoder_common::is_transient_identity_err(&e) {
+                            ErrKind::Server
+                        } else {
+                            ErrKind::SessionDead
+                        };
+                        state.qoder_pool.note_error(&picked.uid, kind);
                         *safe_lock(&state.last_error) =
                             Some(format!("qoder identity uid={} err={}", picked.uid, e));
                         continue;
@@ -955,6 +973,8 @@ pub async fn qoder_aggregate_chat(
             #[allow(unused_assignments)]
             let mut hedge_taken = false;
             loop {
+                // F-76① TTFT 采样（同 wb_route 聚合：各轮独立计时，最终轮即最终回复 TTFT）
+                let ttfb_start = Instant::now();
                 match qoder_upstream::make_qoder_request(
                     &creds,
                     &converted,
@@ -983,6 +1003,7 @@ pub async fn qoder_aggregate_chat(
                                 break;
                             }
                         };
+                        let ttfb_ms = ttfb_start.elapsed().as_millis() as u64;
                         // 对冲计数落定 + guard 重绑（接管时生效账号 = 对冲账号）
                         guard = settle_qoder_hedge(&state, &mut race, guard, &picked.uid);
                         hedge_taken = race.takeover;
@@ -1012,6 +1033,7 @@ pub async fn qoder_aggregate_chat(
                                     .unwrap_or((0, 0));
                                 state.record_usage_qoder(
                                     &model, &win_uid, &key_id, true, stream, duration_ms, pt, ct,
+                                    Some(ttfb_ms),
                                 );
                                 clear_model_cooldown(&model); // 审查修复：成功即清模型级冷却
                                 state.qoder_pool.note_success(&win_uid);
@@ -1023,9 +1045,9 @@ pub async fn qoder_aggregate_chat(
                                     state.qoder_sticky.bind(&sticky_key, &win_uid, &sticky_seed, now_ts());
                                     state.qoder_sticky.save(&state.data_dir);
                                 }
-                                state.logger.log_request(
+                                state.logger.log_request_ttfb(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
-                                    &win_uid, duration_ms, &key_name,
+                                    &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                     &state.qoder_pool.name_of(&win_uid), None,
                                 );
                                 return Ok(r);
@@ -1073,9 +1095,9 @@ pub async fn qoder_aggregate_chat(
                                     "qoder uid={} code={} msg={}",
                                     win_uid, code, msg
                                 ));
-                                state.logger.log_request(
+                                state.logger.log_request_ttfb(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream, 200,
-                                    &win_uid, duration_ms, &key_name,
+                                    &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                     &state.qoder_pool.name_of(&win_uid), Some(&msg),
                                 );
                                 // 流内错误且未产出内容 → 换号重试
@@ -1083,9 +1105,9 @@ pub async fn qoder_aggregate_chat(
                             }
                             _ => {
                                 state.qoder_pool.note_error(&win_uid, ErrKind::Server);
-                                state.logger.log_request(
+                                state.logger.log_request_ttfb(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream, 502,
-                                    &win_uid, duration_ms, &key_name,
+                                    &win_uid, duration_ms, Some(ttfb_ms), &key_name,
                                     &state.qoder_pool.name_of(&win_uid),
                                     Some("empty response"),
                                 );
@@ -1130,16 +1152,9 @@ pub async fn qoder_aggregate_chat(
                                     "qoder uid={} status={}",
                                     picked.uid, status
                                 ));
-                                state.record_usage_qoder(
-                                    &model,
-                                    &picked.uid,
-                                    &key_id,
-                                    false,
-                                    stream,
-                                    start_ts.elapsed().as_millis() as u64,
-                                    0,
-                                    0,
-                                );
+                                // 记账口径对齐流式路径（每请求一行）：换号中间态不记
+                                // usage（原聚合路径每次换号多记一条失败，qoder 桶
+                                // requests/errors 虚高）；最终 no-healthy 由取号分支记录
                                 state.logger.log_request(
                                     "qoder", "POST", "/v1/chat/completions", &model, stream,
                                     status, &picked.uid,

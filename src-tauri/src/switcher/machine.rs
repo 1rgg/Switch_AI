@@ -20,6 +20,9 @@ fn random_digits(n: usize) -> String {
 /// 重置 6 层机器码中的 MachineGuid（需管理员）。非管理员时跳过并提示，不阻断切换。
 /// 注意：必须用 create()（KEY_READ|KEY_WRITE）——open() 仅 KEY_READ 只读句柄，
 /// set_string 必然拒绝访问（os error 5），管理员权限下也一样（issue #33）。
+/// macOS 适配预留（2026-10-03）：注册表 MachineGuid 无 macOS 对应物——macOS 硬件
+/// 标识为 IOPlatformUUID（只读，不可也无需重置）；macOS 分支本函数直接
+/// sink.step(Skip, "macOS 无 MachineGuid，跳过") 返回 Ok 即可，调用方无感
 pub fn reset_machine_id(sink: &dyn ProgressSink) -> Result<(), String> {
     let new_guid = uuid::Uuid::new_v4().to_string();
     match windows_registry::LOCAL_MACHINE
@@ -290,6 +293,9 @@ fn edit_storage_device_ids(
 ///    绑定 = 单标识域模型，与 QoderPatcher 伪造口径一致，不引入第二标识源）；
 /// ③ state.vscdb ItemTable storage.serviceMachineId ← machine_id（upsert）。
 /// 返回成功层数；任何一层失败 → Err 汇总（调用侧降级 warn 不阻断切换）
+/// macOS 适配预留（2026-10-03）：三层写入全部为「文件 + SQLite」操作，跨平台
+/// 无需改动（machineid 无 BOM 写、storage.json 点号键、vscdb upsert 均平台无关）；
+/// 仅 6 层重置里的第 5 层注册表（reset_device_ids_only）为 Windows 专属，见其注释
 pub fn apply_qoder_fingerprint(data_dir: &Path, machine_id: &str) -> Result<usize, String> {
     let mut ok = 0usize;
     let mut errs: Vec<String> = Vec::new();

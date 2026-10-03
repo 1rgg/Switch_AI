@@ -17,7 +17,7 @@
 
 use base64::Engine as _;
 use serde_json::Value;
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use super::common::{load_pool, load_pool_checked, save_pool, QoderAccount};
 use crate::fs_utils;
@@ -143,11 +143,16 @@ pub fn qoder_accounts_export(
             Ok(v)
         })
         .collect::<Result<Vec<_>, String>>()?;
+    // 分组定义随载荷导出（审查修复）：成员关系存在账号 group_id 上，异机导入时
+    // 无分组定义会产生幽灵 group_id（聚合落空）。旧版导入器忽略未知字段，向后兼容
+    let groups: Vec<crate::models::Group> =
+        crate::store::db(&state.data_dir).kv_get("qoder_groups");
     let payload = serde_json::json!({
         "kind": "aiwork-qoder-pool",
         "version": 1,
         "exported_at": fs_utils::now_iso(),
         "include_credentials": include_cred,
+        "groups": groups,
         "accounts": accounts,
     });
     match (include_cred, password) {
@@ -267,10 +272,27 @@ fn has_plaintext_credentials(payload: &Value) -> bool {
 /// 加密信封（AIWQENC1 魔数）必须提供 password 解密后再走统一校验链路；
 /// 无魔数走原明文路径（旧明文导出文件向后兼容，password 提供了也忽略）。
 /// 明文含凭证文件导入成功时结果带 `plaintext_credentials: true`（F-80-余 v2
-/// 迁移提示：前端提醒重新以加密格式导出归档；不自动改动用户文件）
-#[tauri::command(async)]
-pub fn qoder_accounts_import(
-    state: State<AppState>,
+/// 迁移提示：前端提醒重新以加密格式导出归档；不自动改动用户文件）。
+/// 审查 P3 修复：全程持池锁跨逐账号 vault 慢 IO，整体移入 spawn_blocking——
+/// 不占 async worker、池锁互斥窗口不阻塞 tokio 运行时
+#[tauri::command]
+pub async fn qoder_accounts_import(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    payload: Value,
+    password: Option<String>,
+) -> Result<Value, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        qoder_accounts_import_impl(&st, &app, payload, password)
+    })
+    .await
+    .map_err(|e| format!("账号导入任务失败: {e}"))?
+}
+
+fn qoder_accounts_import_impl(
+    state: &AppState,
+    app: &AppHandle,
     payload: Value,
     password: Option<String>,
 ) -> Result<Value, String> {
@@ -309,7 +331,36 @@ pub fn qoder_accounts_import(
     // 写路径必须走 checked 版：池存在损坏行时拒绝导入（坏行静默丢弃后 save 会整池
     // 覆盖永久丢账号，违反 common.rs 红线）
     let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let mut pool = load_pool_checked(&state)?;
+    let mut pool = load_pool_checked(state)?;
+    // 分组定义合并（审查修复）：导出载荷携带 groups（旧版无此字段则跳过），
+    // 按 id 幂等 upsert——本地已有同 id 分组保留本地定义（用户可能已改名），仅补缺失。
+    // 持池锁执行：与并发导入互斥，防 kv("qoder_groups") 读改写竞争丢定义；
+    // 且池损坏提前 Err 时不再产生分组定义副作用
+    let store = crate::store::db(&state.data_dir);
+    let mut defs: Vec<crate::models::Group> = store.kv_get("qoder_groups");
+    if let Some(groups) = payload.get("groups").and_then(Value::as_array) {
+        let mut defs_changed = false;
+        for g in groups {
+            let Ok(def) = serde_json::from_value::<crate::models::Group>(g.clone()) else {
+                continue;
+            };
+            if def.id.is_empty() || defs.iter().any(|x| x.id == def.id) {
+                continue;
+            }
+            defs.push(def);
+            defs_changed = true;
+        }
+        if defs_changed {
+            store.kv_set("qoder_groups", &defs)?;
+        }
+    }
+    let valid_group_ids: std::collections::HashSet<String> =
+        defs.iter().map(|g| g.id.clone()).collect();
+    // 凭证写入先收集、落池成功后再执行（审查修复）：原实现循环内先落凭证
+    // （token store + vault 永久提交）、save_pool 在循环后执行——save_pool 失败时
+    // 凭证已落库而池条目丢失，产生列表不可见、移除接口原先拒绝清理的孤儿凭证。
+    // 调序后最坏情况是凭证单条失败（rejected 聚合、重新导入可补齐），语义不变
+    let mut cred_writes: Vec<(String, crate::tasks::qoder_common::QoderCreds)> = Vec::new();
     for a in accounts {
         match merge_account(&mut pool, a) {
             Ok((final_id, is_new)) => {
@@ -326,15 +377,7 @@ pub fn qoder_accounts_import(
                     creds.machine_id.clear();
                     creds.machine_token.clear();
                     if !creds.access_token.is_empty() || !creds.pat.is_empty() {
-                        // 单账号凭证落库失败不再 `?` 中断整体（部分导入比整体中断更糟）：
-                        // 聚合进 rejected 继续导入；账号信息照常入池，重新导入可补齐凭证
-                        match crate::tasks::qoder_common::save_token_store(&state, &final_id, &creds) {
-                            Ok(()) => with_cred += 1,
-                            Err(e) => rejected.push(serde_json::json!({
-                                "id": final_id,
-                                "reason": format!("账号已入池，但凭证落库失败：{e}（重新导入可补齐）"),
-                            })),
-                        }
+                        cred_writes.push((final_id.clone(), creds));
                     }
                 }
             }
@@ -344,7 +387,28 @@ pub fn qoder_accounts_import(
             }
         }
     }
-    save_pool(&state, &pool)?;
+    // 幽灵分组防御（审查修复）：合并分组定义后仍指向不存在分组的账号回落「未分组」。
+    // 同机重导不受影响（id 命中本地/已合并定义）；旧版无 groups 载荷在同机导入同样命中
+    for a in pool.iter_mut() {
+        if !a.group_id.is_empty() && !valid_group_ids.contains(&a.group_id) {
+            a.group_id.clear();
+        }
+    }
+    save_pool(state, &pool)?;
+    for (final_id, creds) in cred_writes {
+        // 单账号凭证落库失败不中断整体（部分导入比整体中断更糟）：
+        // 聚合进 rejected 继续导入；账号信息已入池，重新导入可补齐凭证
+        match crate::tasks::qoder_common::save_token_store(state, &final_id, &creds) {
+            Ok(()) => with_cred += 1,
+            Err(e) => rejected.push(serde_json::json!({
+                "id": final_id,
+                "reason": format!("账号已入池，但凭证落库失败：{e}（重新导入可补齐）"),
+            })),
+        }
+    }
+    // 导入完成联动网关池热重载（fail-open 新账号即时入池调度；服务未运行时 no-op）
+    let rt = app.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+    crate::commands::api_server::reload_pools_if_running(state, rt.inner());
     fs_utils::app_log(
         &state.data_dir,
         &format!(

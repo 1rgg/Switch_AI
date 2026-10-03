@@ -119,7 +119,7 @@ export function QoderHelpModal({ open, onClose }: { open: boolean; onClose: () =
             「导出账号」将账号池打包为 JSON 文件；「导入账号」读取后按 uid 幂等合并——已存在的账号原位更新：仅补全空缺字段，绝不覆盖已有数据。适合跨设备迁移或多机同步。
           </p>
           <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
-            ⚠ 勾选「附带凭证副本」的导出文件包含明文凭证，等同密码，请妥善保管，切勿通过不可信渠道传输。
+            ⚠ 勾选「附带凭证副本」的导出文件中凭证以 AES-256-GCM 加密写入（需设置导出密码），导入时须提供同一密码——仍等同密码，请妥善保管，切勿通过不可信渠道传输。
           </p>
         </section>
 

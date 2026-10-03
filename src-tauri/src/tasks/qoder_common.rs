@@ -96,7 +96,7 @@ fn i_of(v: Option<&Value>) -> Option<i64> {
 
 /// expires_at 域钳制（审查 L-溢出）：畸形大值（秒/毫秒单位错、服务端脏数据）会导致
 /// 临期比较整数溢出、到期日历展示为千年后；超界一律视为「无过期信息」（保守走刷新路径）
-fn clamp_expires_at(ms: i64) -> Option<i64> {
+pub fn clamp_expires_at(ms: i64) -> Option<i64> {
     let now = chrono::Utc::now().timestamp_millis();
     let max = now + 10 * 365 * 24 * 3_600_000;
     if ms <= 0 || ms > max {
@@ -369,7 +369,20 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
         }
         obj.insert("version".into(), serde_json::json!(1));
         if let Some(t) = obj.entry("tokens").or_insert_with(|| serde_json::json!({})).as_object_mut() {
-            t.insert(id.to_string(), target);
+            // 凭证红线（审查 P0 修复）：target 是 secure_store_for_save 占位化**之前**
+            // 克隆的明文行，直接落库会把明文凭证写进 SQLite（直到下次启动迁移才收敛，
+            // 且 token_store_load_secure「DB 明文优先」会持续旁路 vault 回填）。
+            // 落库前必须与 secure_store_for_save 同口径占位——DB qoder_tokens 一律空串，
+            // 明文唯一驻留地是 vault；vault 失败时同样落占位行（重新登录可恢复）
+            let mut row = target;
+            if let Some(rm) = row.as_object_mut() {
+                for k in TOKEN_SENSITIVE_KEYS {
+                    if rm.contains_key(k) {
+                        rm.insert(k.to_string(), serde_json::json!(""));
+                    }
+                }
+            }
+            t.insert(id.to_string(), row);
         }
     }
     crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &fresh)?;
@@ -383,7 +396,11 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &QoderCreds) -> Resul
 /// 避免「库里还在、密钥已删」的悬挂态（重导同账号可复用既有凭证恢复）。
 pub fn remove_token(state: &AppState, id: &str) -> Result<(), String> {
     let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut store = load_token_store(state);
+    // 凭证红线（审查 P0 修复）：此处只需摘行，必须读 DB 原始表（占位形态）——
+    // 不可走 load_token_store（vault 回填后的明文整表写回，会把其余账号的
+    // 明文凭证重新落库）
+    let mut store =
+        crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
     if let Some(t) = store.get_mut("tokens").and_then(Value::as_object_mut) {
         t.remove(id);
     }
@@ -646,11 +663,24 @@ pub(crate) fn normalize_expires_in(e: i64) -> i64 {
 /// 成功返回以作业令牌为 access_token 的 Creds（pat 字段保存原始 PAT 供到期重换）。
 /// data_dir 用于状态码落日志（脱敏：只记端点与 HTTP 状态，不含 token）——全部失败时
 /// 便于定位是 401（PAT 不被接受）还是 404（端点不存在）。
+///
+/// 失败分类（审查 P2 修复：网络失败与 PAT 被拒不再同报 None）：
+/// 以**首通道（已证实路径）**的状态码为准——0（网络不可达）/5xx 归 `Transient`
+///（可重试自愈），4xx 归 `Rejected`（PAT 被服务端明确拒绝，需人工）；兜底通道
+/// 状态仅落日志不参与分类（②③ 未证实，恒 404 不代表 PAT 无效）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobExchangeFail {
+    /// 网络/服务端暂态失败：可重试（调度冷却/401 自愈均有意义）
+    Transient,
+    /// PAT 被服务端拒绝（首通道 4xx）：重试无解，需重新创建并导入 PAT
+    Rejected,
+}
+
 pub fn exchange_job_token(
     agent: &ureq::Agent,
     pat: &str,
     data_dir: &std::path::Path,
-) -> Option<QoderCreds> {
+) -> Result<QoderCreds, JobExchangeFail> {
     let attempts: [(&str, Value, &str); 3] = [
         (
             "/api/v1/me/jobToken",
@@ -664,8 +694,12 @@ pub fn exchange_job_token(
         ),
         ("/api/v1/jobToken/exchange", serde_json::json!({}), "exchange"),
     ];
-    let mut last_status: u16 = 0;
-    for (path, body, tag) in attempts {
+    // 首通道（已证实 R-6 路径）状态码决定失败分类；None = 首通道未产生 HTTP 状态
+    //（理论不可达——attempts 非空），按暂态兜底保守处理
+    let mut first_status: Option<u16> = None;
+    for (i, (path, body, tag)) in attempts.iter().enumerate() {
+        let path = *path;
+        let tag = *tag;
         let url = format!("{OPEN_API_BASE}{path}");
         let headers = vec![
             ("Authorization".to_string(), format!("Bearer {pat}")),
@@ -674,7 +708,9 @@ pub fn exchange_job_token(
             ("Content-Type".to_string(), "application/json".to_string()),
         ];
         let (status, resp) = post_json(agent, &url, &headers, &body);
-        last_status = status;
+        if i == 0 {
+            first_status = Some(status);
+        }
         if status == 200 {
             if let Some(b) = resp {
                 let token = s_of(fs_utils::dig(&b, &["token", "accessToken", "access_token", "job_token"]));
@@ -688,7 +724,7 @@ pub fn exchange_job_token(
                         data_dir,
                         &format!("qoder PAT→作业令牌换取成功（通道 {tag}）"),
                     );
-                    return Some(QoderCreds {
+                    return Ok(QoderCreds {
                         access_token: token,
                         refresh_token,
                         expires_at_ms,
@@ -708,9 +744,16 @@ pub fn exchange_job_token(
     }
     fs_utils::app_log(
         data_dir,
-        &format!("qoder PAT→作业令牌全部通道失败（最后 HTTP {last_status}）：PAT 可能无效/已吊销，或换取端点对 PAT 另有要求"),
+        &format!("qoder PAT→作业令牌全部通道失败（首通道 HTTP {}）：PAT 可能无效/已吊销，或换取端点对 PAT 另有要求", first_status.unwrap_or(0)),
     );
-    None
+    // 分类（见函数头）：首通道 0/5xx = 暂态；4xx = PAT 被拒；200-but-malformed
+    // 走完全部通道（接口结构变化）重试同样无解，保守归 Rejected
+    let st = first_status.unwrap_or(0);
+    if st == 0 || st >= 500 {
+        Err(JobExchangeFail::Transient)
+    } else {
+        Err(JobExchangeFail::Rejected)
+    }
 }
 
 // ── 惰性刷新（对齐 wb_common::ensure_fresh 语义）────────────────────────────
@@ -760,7 +803,7 @@ pub fn ensure_fresh(
             return (creds, false, "fresh");
         }
         return match exchange_job_token(agent, &pat, &state.data_dir) {
-            Some(new) => {
+            Ok(new) => {
                 // 落库失败不能静默：否则新作业令牌只存活本轮，下轮仍走 PAT 重换
                 if let Err(e) = save_token_store(state, acct_id, &new) {
                     fs_utils::app_log(&state.data_dir, &format!("[qoder] token 落库失败(id={acct_id}, PAT通道): {e}"));
@@ -774,7 +817,11 @@ pub fn ensure_fresh(
                 super::qoder_device::merge_device_profile(&mut out, profile.as_ref());
                 (out, true, "refreshed")
             }
-            None => (creds, false, "pat_rejected"),
+            // 失败分类（审查 P2）：网络/5xx 暂态归 refresh_failed（调度冷却重试可自愈，
+            // 此前误报 pat_rejected 会被当成「重试无解」放弃 + 误导用户重导 PAT）；
+            // 首通道 4xx 才是 PAT 被拒（永久，需人工）
+            Err(JobExchangeFail::Transient) => (creds, false, "refresh_failed"),
+            Err(JobExchangeFail::Rejected) => (creds, false, "pat_rejected"),
         };
     }
     // ── 客户端 token 通道：惰性刷新（deviceToken/refresh）──
@@ -832,6 +879,18 @@ pub fn ensure_fresh(
         return (creds, false, "auth_dead");
     }
     (creds, false, "refresh_failed")
+}
+
+// ── 网关 identity 失败分类（审查 P2：瞬时失败不再永久禁用账号）──────────────
+// 网关 qoder_identity 回调（commands/api_server.rs）把 ensure_fresh 的 status 映射为
+// Err 文本；暂态失败（refresh_failed）带此前缀，qoder_route 侧据此记 ErrKind::Server
+//（熔断：连续 3 错 30m 起指数退避、成功重置，可自愈）而非 SessionDead（永久禁用，
+// 此前一次网络抖动即把账号禁用到池热重载/重启）。
+pub const TRANSIENT_ERR_TAG: &str = "[qoder-transient]";
+
+/// identity Err 文本是否为暂态失败（前缀标记判定；两侧常量同源，无文案耦合面）
+pub fn is_transient_identity_err(e: &str) -> bool {
+    e.starts_with(TRANSIENT_ERR_TAG)
 }
 
 // ── 账号池回写 ─────────────────────────────────────────────────────────────

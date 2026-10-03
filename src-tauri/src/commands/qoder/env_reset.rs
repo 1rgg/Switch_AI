@@ -7,6 +7,14 @@
 //!
 //! 指纹提示：清理 machine_identity / shared_client_cache 等于放弃当前设备身份，
 //! 客户端下次启动将重新注册（可配合「账号绑定指纹」仍存于工具侧不受影响）。
+//!
+//! 【跨平台审查 2026-10-03】macOS 适配预留：清理清单的目录语义本身跨平台同构
+//! （数据目录布局不变），差异点：① 路径解析走 ide_data_dir()/cli_dir()，改底层
+//! 取目录函数即全清单生效；② graceful_kill_app 的 taskkill 为 Windows 专属，
+//! macOS 需 pkill/AppleScript 等价实现（见 commands/process.rs）；③ 带重试删除
+//! （force_rmtree 3×400ms）针对 Windows 文件锁场景，macOS 下无害可原样保留；
+//! ④ cli_auth 详情文案「%USERPROFILE%」为 Windows 表述，macOS 分支需本地化。
+//! 检索标记：`macOS 适配预留`。
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -18,6 +26,8 @@ use crate::state::AppState;
 use super::common::ide_data_dir;
 
 fn cli_dir() -> Option<PathBuf> {
+    // macOS 适配预留：与 cli_status.rs::cli_status_path 同款主目录分支——
+    // Windows USERPROFILE / macOS HOME，建议两处统一收敛为一个 home_dir() 助手
     std::env::var("USERPROFILE")
         .ok()
         .map(|h| PathBuf::from(h).join(".qoder-cn"))

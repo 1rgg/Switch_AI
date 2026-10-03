@@ -202,6 +202,19 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             icube_items: super::icube::TRAE_ICUBE_ITEMS,
         },
         TargetApp::Qoder => AppProfile {
+            // 【跨平台审查 2026-10-03】macOS 适配预留：Qoder 档案是 macOS 分支的
+            // 单点扩展位——AppProfile 为纯数据表，macOS 无需动切换管线，只需
+            // profile_for 内按 cfg(target_os) 返回 mac 档案。预期映射：
+            //   data_dir        = ~/Library/Application Support/QoderCN
+            //                     （Electron userData 惯例，需真机实测）
+            //   exe_candidates  = /Applications/Qoder CN IDE.app/Contents/MacOS/<可执行名>
+            //   proc_names/exe_names = 去 .exe 后缀形态（"Qoder CN IDE"），
+            //                     strip_exe_suffix（switcher/proc.rs）在 mac 上天然
+            //                     剥不动无后缀名，双平台白名单可直接并存
+            //   lnk_patterns/reg_patterns = Windows 专属发现级（.lnk/注册表），
+            //                     macOS 分支对应「/Applications 下 .app 扫描 +
+            //                     Spotlight (mdfind)」，AppProfile 字段语义可承载，
+            //                     由 locate.rs 分平台消费
             app_name: "Qoder",
             layout: Layout::Icube,
             // F-80 M0 实测 2026-09-27：IDE 数据目录为 %APPDATA%\QoderCN（设计文档
@@ -232,6 +245,14 @@ pub fn profile_for(app: TargetApp, app_data_dir: &std::path::Path) -> AppProfile
             icube_items: super::icube::QODER_IDE_ITEMS,
         },
         TargetApp::QoderWork => AppProfile {
+            // 【跨平台审查 2026-10-03】macOS 适配预留：ElectronRoot 布局快照管线
+            // （switcher/electron_root.rs）纯文件拷贝，跨平台零改动；macOS 差异仅
+            //   data_dir        = ~/Library/Application Support/com.qodercn.app.stable
+            //                     （Electron userData 惯例，与 Windows 同名不同根，需实测）
+            //   exe_candidates  = /Applications/Qoder CN.app/Contents/MacOS/<可执行名>
+            //   proc_names      = "Qoder CN"（macOS 映像名无 .exe 后缀）
+            // 注意：macOS 上 QoderWork 与 Qoder IDE 进程名同样可能含 "Qoder" 前缀，
+            // 精确匹配防串台的收窄语义（见下方 proc_names 注释）必须保持
             app_name: "Qoder Work",
             // 2026-10-02 实测：独立 Electron 客户端（0.4.3，.qoder-versions 滚动更新），
             // 数据目录 %APPDATA%\com.qodercn.app.stable（默认会话挂 userData 根：

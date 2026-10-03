@@ -116,10 +116,10 @@ pub fn qoder_groups_remove(
     runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     id: String,
 ) -> Result<(), String> {
-    let mut defs = load_defs(&state);
-    defs.retain(|g| g.id != id);
-    save_defs(&state, &defs)?;
-    // 组内账号回落「未分组」（I09：持锁读-改-写，防并发整池覆盖丢更新）
+    // 先回落组内账号、成功后再删分组定义（审查修复）：反序在中途回落失败时会产生
+    // 「分组定义已删、账号 group_id 悬空」且重试路径断裂（retain 幂等空操作，
+    // with_pool_mut 仍因同一原因失败）。本序最坏情况是回落成功但定义残留
+    // （空分组，重试即可删除），无悬空引用
     with_pool_mut(&state, |accounts| {
         for a in accounts.iter_mut() {
             if a.group_id == id {
@@ -128,6 +128,9 @@ pub fn qoder_groups_remove(
         }
         Ok(())
     })?;
+    let mut defs = load_defs(&state);
+    defs.retain(|g| g.id != id);
+    save_defs(&state, &defs)?;
     // 清理 api_pool 对该分组的筛选引用：被删分组的 id 在资源调度页无 chip 可取消
     // （幽灵筛选），残留会使 Qoder 池被静默清空且 UI 无出口。有引用变更时联动热重载。
     let store = crate::store::db(&state.data_dir);

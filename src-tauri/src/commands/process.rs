@@ -106,6 +106,12 @@ pub fn images_for_app(app_kind: &str) -> Vec<&'static str> {
 }
 
 /// 便捷入口：按应用类别三级关闭
+/// macOS 适配预留（2026-10-03）：Qoder 环境重置（commands/qoder/env_reset.rs）
+/// 经本入口关停 "Qoder CN"。三级关闭在 macOS 的等价实现：
+/// ① 优雅关闭 = AppleScript `tell application "<app>" to quit`（落盘语义等价 WM_CLOSE）；
+/// ② 强杀 = `pkill -f <映像名>` / SIGKILL；③ 等待退出 = 轮询 pgrep。
+/// 映像名表 images_for_app 在 macOS 需去 .exe 后缀形态（"Qoder CN.exe" → "Qoder CN"），
+/// 建议函数内 cfg 分支返回各自后缀约定，调用方零改动
 pub fn graceful_kill_app(app_kind: &str) -> Result<(), String> {
     let images = images_for_app(app_kind);
     if images.is_empty() {

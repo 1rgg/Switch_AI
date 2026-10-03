@@ -491,9 +491,13 @@ pub fn resolve_target(
     // per_model 与 smart 重排（用户 Key 级显式配置优先于全局策略）
     let policy = load_policy(&state.data_dir);
     let mut order: Vec<TargetPool> = if let Some(b) = bind {
-        // b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"，无需再 parse
+        // b 经 parse_bind_pool 归一化，仅可能为 "trae"/"buddy"/"qoder"，无需再 parse
         if b == "trae" {
             vec![TargetPool::Trae, TargetPool::Buddy]
+        } else if b == "qoder" {
+            // Qoder 绑定（审查修复：原先落 else 被当 Buddy 处理，「Key 绑定池 >
+            // 全局策略」对 Qoder 断链——多源模型先打 Buddy，仅回退才到 Qoder）
+            vec![TargetPool::Qoder, TargetPool::Buddy, TargetPool::Trae]
         } else {
             vec![TargetPool::Buddy, TargetPool::Trae]
         }

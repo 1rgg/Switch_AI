@@ -239,14 +239,18 @@ impl ApiSharedState {
         duration_ms: u64,
         prompt_tokens: u64,
         completion_tokens: u64,
+        // F-76① 同构 TTFT 入账（审查补齐）：首字耗时；无首字语义的失败（no-healthy/
+        // identity 未达首字）传 None
+        ttfb_ms: Option<u64>,
     ) {
         let mut guard = self
             .usage
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        guard.record_in(
+        guard.record_in_ttfb(
             usage::UsageBucket::Qoder,
             model, uid, key_id, ok, is_stream, duration_ms, prompt_tokens, completion_tokens,
+            ttfb_ms,
         );
         // 批次 C 削峰：同 record_usage_custom，仅标脏不落盘
         let day = usage::today_key();
