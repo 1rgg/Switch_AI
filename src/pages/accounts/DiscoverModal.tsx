@@ -83,14 +83,17 @@ export function DiscoverModal({
                         {d.in_pool ? (
                           <Badge
                             tone={d.matched_via_jwt ? 'amber' : 'green'}
+                            className="max-w-[55%] overflow-hidden"
                             title={
                               d.matched_account_name
                                 ? `已入池：匹配账号「${d.matched_account_name}」${d.matched_via_jwt ? '（经其 JWT 命中，账号 id 不一致）' : ''}`
                                 : '已入池'
                             }
                           >
-                            <CheckCircle2 size={12} /> 已入池
-                            {d.matched_account_name ? ` · ${d.matched_account_name}` : ''}
+                            <CheckCircle2 size={12} className="shrink-0" />
+                            <span className="truncate">
+                              已入池{d.matched_account_name ? ` · ${d.matched_account_name}` : ''}
+                            </span>
                           </Badge>
                         ) : d.uid_confident ? (
                           <button
