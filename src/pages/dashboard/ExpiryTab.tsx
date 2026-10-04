@@ -9,8 +9,12 @@ import type { PlatformScope } from './KpiRow';
 /**
  * 积分到期 Tab（credits-dashboard-plan.md §6）：
  * ① 账号积分明细：Trae（store.accounts）+ Buddy（workbuddy_credits_fetch.accounts[]）+ Qoder（qoder_credits_fetch.accounts[]）合并表；
- * ② 积分到期日历：Trae expiryItems（积分包 + 会员）+ Buddy packages[] + Qoder 积分包/Plan 订阅重置，按平台维度联动过滤。
+ * ② 积分到期日历：Trae 按积分包明细展示（credit_packs，对齐 Buddy packages[] 包级口径，
+ *    老缓存无包明细时回退账号级汇总）+ Buddy packages[] + Qoder 积分包/Plan 订阅重置，按平台维度联动过滤。
  */
+
+/** 长期有效哨兵时间戳（2100-01-01，与后端 pack_to_detail 口径一致） */
+const PERPETUAL_TS = 4102444800;
 
 interface AccountRow {
   key: string;
@@ -44,16 +48,25 @@ export default function ExpiryTab({
     const out: AccountRow[] = [];
     if (scope === 'trae') {
       for (const a of accounts) {
-        const expires = [a.credits_expire_at, a.membership_expire].filter(
-          (t): t is number => t != null && t > 0,
-        );
+        // 有包明细（刷新过积分）→ 包级口径：包数真实计数、最近到期取包级最早（排除长期有效哨兵）；
+        // 无明细（老缓存）→ 回退账号级汇总口径（原实现）
+        const hasPacks = a.credit_packs != null;
+        // 与 Buddy activePkgs 同口径：只计剩余 > 0 的包（后端已过滤，前端同款防御）
+        const activePkgs = (a.credit_packs ?? []).filter((p) => p.remaining > 0);
+        const pkgRealExpires = activePkgs
+          .filter((p) => p.expire_time > 0 && p.expire_time < PERPETUAL_TS)
+          .map((p) => p.expire_time);
+        const expires: number[] = hasPacks
+          ? [...pkgRealExpires, a.membership_expire ?? 0].filter((t) => t > 0)
+          : [a.credits_expire_at, a.membership_expire].filter((t): t is number => t != null && t > 0);
         out.push({
           key: `trae-${a.user_id}`,
           platform: 'Trae',
           name: a.name,
           balance: a.remaining_credits,
-          packages:
-            (a.credits_expire_at != null ? 1 : 0) + (a.membership_expire != null ? 1 : 0),
+          packages: hasPacks
+            ? activePkgs.length + (a.membership_expire != null ? 1 : 0)
+            : (a.credits_expire_at != null ? 1 : 0) + (a.membership_expire != null ? 1 : 0),
           nearestExpire: expires.length > 0 ? Math.min(...expires) : null,
           ok: !(a.cooldown_until != null && a.cooldown_until > nowSec),
           status:
@@ -109,12 +122,29 @@ export default function ExpiryTab({
     return out.sort((x, y) => (y.balance ?? -1) - (x.balance ?? -1));
   }, [scope, accounts, wbCredits, qoderCredits]);
 
-  // 到期日历 items（§6.2）：Trae 积分包 + 会员；Buddy remaining > 0 的积分包；Qoder 积分包 + Plan 订阅重置
+  // 到期日历 items（§6.2）：Trae 按积分包明细展示（对齐 Buddy 包级口径）+ 会员，
+  // 老缓存无 credit_packs 时回退账号级汇总（积分包 1 条 + 会员 1 条）；
+  // Buddy remaining > 0 的积分包；Qoder 积分包 + Plan 订阅重置
   const expiryItems = useMemo<ExpiryItem[]>(() => {
     const items: ExpiryItem[] = [];
     if (scope === 'trae') {
       for (const a of accounts) {
-        if (a.credits_expire_at != null) {
+        if (a.credit_packs != null) {
+          // 包级明细：每个可用包一条（对齐 Buddy 展示结构：label=平台·账号·包名、kind=积分包、
+          // note=「剩余 X / 总 Y」两位小数；通用/Work 维度并入 note 前缀保留信息）
+          (a.credit_packs ?? []).forEach((p, i) => {
+            // 剩余积分为 0 的包（已用完）无到期提醒价值，过滤不展示（与 Buddy 同款防御）
+            if (p.remaining <= 0) return;
+            items.push({
+              key: `trae-${a.user_id}-pack-${i}`,
+              label: `Trae · ${a.name} · ${p.source}`,
+              kind: '积分包',
+              expire_ts: p.expire_time,
+              note: `${p.kind} · 剩余 ${p.remaining.toFixed(2)} / ${(p.total ?? 0).toFixed(2)}`,
+            });
+          });
+        } else if (a.credits_expire_at != null) {
+          // 老缓存回退：账号级汇总展示
           items.push({
             key: `trae-${a.user_id}-credits`,
             label: `Trae · ${a.name}`,

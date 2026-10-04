@@ -58,6 +58,11 @@ pub struct AccountView {
     /// JWT 解析出的 data.id（mismatch 时供 tooltip 展示）
     #[serde(default)]
     pub jwt_uid: Option<String>,
+    /// 积分包明细（仅剩余 > 0 且未过期，按到期时间升序；来自 remaining_credits.json 缓存）：
+    /// 到期日历与「7 天内到期」KPI 按包口径展示/计算（对齐 Buddy packages[]）；
+    /// 刷新过积分即有值，无包/全用完为空数组，老缓存缺省 → 前端回退账号级汇总口径
+    #[serde(default)]
+    pub credit_packs: Vec<CreditPackDetail>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -497,12 +502,16 @@ pub struct RemainingCreditsFile {
     /// 会员套餐下次自动续费时间缓存（Unix 秒，next_billing_time）
     #[serde(default)]
     pub membership_next_billing: HashMap<String, i64>,
+    /// 积分包明细缓存（仅剩余 > 0 且未过期的包，按到期时间升序）：
+    /// 到期日历/7 天内到期 KPI 按包口径计算（对齐 Buddy packages[]），替代账号级汇总
+    #[serde(default)]
+    pub packs: HashMap<String, Vec<CreditPackDetail>>,
     #[serde(default)]
     pub updated_at: Option<String>,
 }
 
 /// 积分明细条目（仅剩余 > 0 且未过期的积分包）
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CreditPackDetail {
     /// "ͨ用" | "Work"
     pub kind: String,
@@ -510,6 +519,8 @@ pub struct CreditPackDetail {
     pub source: String,
     /// 该包剩余积分 = credits_limit - usage.credits_amount
     pub remaining: f64,
+    /// 该包本周期总额度（credits_limit；到期日历「剩余 X / 总 Y」口径，对齐 Buddy packages[].total）
+    pub total: f64,
     /// 过期时间（Unix 秒）
     pub expire_time: i64,
 }
