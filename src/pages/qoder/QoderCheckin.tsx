@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { listen } from '@tauri-apps/api/event';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { CheckCircle2, Gift, PlayCircle, RefreshCw, XCircle } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
 import { Badge } from '../../components/ui';
@@ -14,39 +13,9 @@ import type { QoderAccountView, QoderCheckinRecord } from '../../types';
  * 签到控制卡（NDJSON 进度）+ 双活动说明卡。
  * 双活动：0 点刷新的 QoderWork 签到（100 Credits/天）+ 10:00 开窗的每日登录奖励
  * （100 Add-on Credits/天）——接口层同源 sash campaigns，一次触发自然全覆盖。
+ * 疑点⑦：签到进行态由 store 单例持有（qoder-checkin-progress 监听也在 store 层
+ * setupListeners 注册），页面切走/卸载不丢事件，切回时进度/汇总完好。
  */
-
-interface QoderAccountLine {
-  index: number;
-  user_id: string;
-  name: string;
-  status: 'success' | 'already' | 'fail' | 'skip';
-  message?: string;
-  reward?: number;
-}
-
-type ParsedEvent =
-  | { type: 'start'; total: number }
-  | { type: 'done'; ok: number; already: number; failed: number; failed_empty_campaigns?: number }
-  | { type: 'exit' }
-  | QoderAccountLine;
-
-function parseLine(raw: string): ParsedEvent | null {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-function scalarNum(v: unknown): number | null {
-  if (typeof v === 'number') return isFinite(v) ? v : null;
-  if (typeof v === 'string' && v.trim() !== '') {
-    const n = Number(v);
-    return isNaN(n) ? null : n;
-  }
-  return null;
-}
 
 function MiniTokenBadge({ a }: { a: QoderAccountView }) {
   if (a.needs_relogin)
@@ -77,22 +46,22 @@ function SourceBadge({ a }: { a: QoderAccountView }) {
 
 export default function QoderCheckin() {
   const pushToast = useAppStore((s) => s.pushToast);
+  const startQoderCheckin = useAppStore((s) => s.startQoderCheckin);
+  // 疑点⑦：签到进行态（running/lines/done）来自 store，页面卸载不丢、切回即恢复
+  const { running, lines, done: doneInfo, doneRev } = useAppStore((s) => s.qoderCheckin);
   const [accounts, setAccounts] = useState<QoderAccountView[]>([]);
-  const [running, setRunning] = useState(false);
-  const [lines, setLines] = useState<QoderAccountLine[]>([]);
-  const [doneInfo, setDoneInfo] = useState<{ ok: number; already: number; failed: number; empty: number } | null>(null);
   const [checkinMap, setCheckinMap] = useState<Map<string, QoderCheckinRecord[]>>(new Map());
   const [refreshing, setRefreshing] = useState(false);
-  const unlistenRef = useRef<(() => void) | null>(null);
   // F-80-余 v2 档期日历：90 天签到结果（通用组件渲染；聚合在 checkinCalendarModel）
   const [history, setHistory] = useState<QoderCheckinRecord[]>([]);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
+      // 不做内层吞错：任一源失败走外层 catch 统一 toast，避免「静默空态无反馈」
       const [accs, recs] = await Promise.all([
-        api.qoder.accountsList().catch(() => [] as QoderAccountView[]),
-        api.qoder.checkinResults(90).catch(() => [] as QoderCheckinRecord[]),
+        api.qoder.accountsList(),
+        api.qoder.checkinResults(90),
       ]);
       setAccounts(accs);
       setHistory(recs);
@@ -116,62 +85,23 @@ export default function QoderCheckin() {
 
   useEffect(() => {
     void refresh();
-    let disposed = false;
-    void listen<string>('qoder-checkin-progress', (ev) => {
-      const parsed = parseLine(ev.payload);
-      if (!parsed || typeof parsed !== 'object') return;
-      if ('type' in parsed && parsed.type === 'start') {
-        setLines([]);
-        setDoneInfo(null);
-      } else if ('type' in parsed && parsed.type === 'done') {
-        // failed_empty_campaigns（活动未开始/不可用）为非用户可操作失败：
-        // 与真实失败分开计数，避免用户对无解失败反复重试（口径对齐 Rust 侧补签通知）
-        const empty = Math.max(0, parsed.failed_empty_campaigns ?? 0);
-        const actionable = parsed.failed - empty;
-        setDoneInfo({ ok: parsed.ok, already: parsed.already, failed: parsed.failed, empty });
-        setRunning(false);
-        void refresh();
-        pushToast(
-          actionable > 0 ? 'warn' : 'success',
-          `Qoder 签到完成：成功 ${parsed.ok}，已签 ${parsed.already}，失败 ${parsed.failed}` +
-            (empty > 0 ? `（其中 ${empty} 项为活动未开放）` : ''),
-        );
-      } else if ('index' in parsed && parsed.index != null && parsed.index > 0) {
-        const line = parsed as QoderAccountLine;
-        const reward = scalarNum(line.reward);
-        setLines((prev) => {
-          const next = prev.slice();
-          next[line.index - 1] = { ...line, reward: reward ?? undefined };
-          return next;
-        });
-      } else if ('type' in parsed && parsed.type === 'exit') {
-        setRunning(false);
-      }
-    }).then((u) => {
-      if (disposed) u();
-      else unlistenRef.current = u;
-    });
-    return () => {
-      disposed = true;
-      unlistenRef.current?.();
-    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 疑点⑦：进度事件由 store 归约（applyQoderCheckinLine），页面只按 doneRev 联动刷新
+  // 账号列表/签到记录（skipped_busy 整轮跳过不递增 doneRev，不触发刷新——对齐原页面语义）
+  useEffect(() => {
+    if (doneRev > 0) void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doneRev]);
 
   const startCheckin = async () => {
     if (accounts.length === 0) {
       pushToast('warn', '账号池为空：请先在「账号管理」导入 PAT 或客户端账号');
       return;
     }
-    setRunning(true);
-    setLines([]);
-    setDoneInfo(null);
-    try {
-      await api.qoder.checkinStart({ skip_checked_in: true });
-    } catch (err) {
-      setRunning(false);
-      pushToast('error', `发起签到失败：${String(err)}`);
-    }
+    // 连点自守/进度清理/失败置回均在 store 动作内（疑点⑦）
+    await startQoderCheckin();
   };
 
   const todayEarnedOf = (uid: string): number | null => {

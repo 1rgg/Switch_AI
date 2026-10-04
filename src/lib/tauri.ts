@@ -783,6 +783,8 @@ export interface ListenerHandlers {
   onDeviceResetDone?: (e: DeviceResetDoneEvent) => void;
   onProfileProgress?: (line: string) => void;
   onProfileDone?: (e: ProfileDoneEvent) => void;
+  /** Qoder 签到 NDJSON 进度（payload 为 JSON 字符串，归约前需 parse） */
+  onQoderCheckinProgress?: (line: string) => void;
 }
 
 export async function setupListeners(
@@ -861,6 +863,13 @@ export async function setupListeners(
     unsubs.push(
       await listen<ProfileDoneEvent>('profile-done', (e) =>
         handlers.onProfileDone!(e.payload),
+      ),
+    );
+  }
+  if (handlers.onQoderCheckinProgress) {
+    unsubs.push(
+      await listen<string>('qoder-checkin-progress', (e) =>
+        handlers.onQoderCheckinProgress!(e.payload),
       ),
     );
   }

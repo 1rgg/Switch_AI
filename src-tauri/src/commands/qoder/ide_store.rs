@@ -102,16 +102,25 @@ fn read_vscdb_key(vscdb: &Path, key: &str) -> Result<Option<String>, String> {
     if !vscdb.is_file() {
         return Ok(None);
     }
+    // P3 审查修复：IDE 异常退出会残留 -wal 而无 -shm，只读连接无法重建索引导致
+    // 读取失败——检测该形态并在错误消息附修复指引，防一律误报「被 IDE 占用」
+    let wal_orphan = vscdb.with_file_name("state.vscdb-wal").is_file()
+        && !vscdb.with_file_name("state.vscdb-shm").is_file();
+    let wal_hint = if wal_orphan {
+        "；检测到异常退出残留的 WAL 索引，重启一次 IDE 可自动修复"
+    } else {
+        ""
+    };
     let conn = rusqlite::Connection::open_with_flags(vscdb, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| format!("state.vscdb 打开失败（可能被 IDE 占用）: {e}"))?;
+        .map_err(|e| format!("state.vscdb 打开失败（可能被 IDE 占用{wal_hint}）: {e}"))?;
     conn.busy_timeout(std::time::Duration::from_millis(1500))
         .map_err(|e| format!("state.vscdb busy_timeout 设置失败: {e}"))?;
     let mut stmt = conn
         .prepare("SELECT value FROM ItemTable WHERE key = ?1")
-        .map_err(|e| format!("state.vscdb 查询准备失败: {e}"))?;
+        .map_err(|e| format!("state.vscdb 查询准备失败{wal_hint}: {e}"))?;
     let mut rows = stmt
         .query(rusqlite::params![key])
-        .map_err(|e| format!("state.vscdb 查询执行失败: {e}"))?;
+        .map_err(|e| format!("state.vscdb 查询执行失败{wal_hint}: {e}"))?;
     let row = match rows
         .next()
         .map_err(|e| format!("state.vscdb 读取行失败: {e}"))?
@@ -136,7 +145,8 @@ fn read_vscdb_key(vscdb: &Path, key: &str) -> Result<Option<String>, String> {
 /// Chromium Cookies 库单 Cookie 解密（Qoder Work 登录守卫用，2026-10-02 审查补齐）。
 /// 链路与 IDE 相同（根级 Local State → DPAPI → AES-256-GCM），差异仅在库文件与表结构：
 /// `Network/Cookies`（cookies 表 encrypted_value BLOB）。客户端运行中持库锁 → 先拷贝
-/// 到临时文件（含 -wal，尽量合并写入）再只读打开；找不到 Cookie / 解密失败 → None
+/// 到临时文件（含 -wal，尽量合并写入）再读写打开（P2 审查修复：只读连接无法在
+/// -shm 缺失时重建 WAL 索引）；找不到 Cookie / 解密失败 → None
 /// （调用方 fail-open，不阻断流程）。
 #[cfg(windows)]
 pub fn read_cookie_value(data_dir: &Path, host_suffix: &str, cookie_name: &str) -> Option<String> {
@@ -144,13 +154,14 @@ pub fn read_cookie_value(data_dir: &Path, host_suffix: &str, cookie_name: &str) 
     if !db.is_file() {
         return None;
     }
-    // 临时副本：主库 + WAL（-shm 可省，SQLite 会重建）
+    // 临时副本：主库 + WAL（-shm 由 SQLite 在副本上自行重建）
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_nanos();
     let tmp = std::env::temp_dir().join(format!("qoder-cookies-{}-{nanos}.db", std::process::id()));
     let tmp_wal = tmp.with_file_name(format!("{}-wal", tmp.file_name()?.to_string_lossy()));
+    let tmp_shm = tmp.with_file_name(format!("{}-shm", tmp.file_name()?.to_string_lossy()));
     if std::fs::copy(&db, &tmp).is_err() {
         return None;
     }
@@ -159,11 +170,11 @@ pub fn read_cookie_value(data_dir: &Path, host_suffix: &str, cookie_name: &str) 
         let _ = std::fs::copy(&wal, &tmp_wal);
     }
     let result = (|| {
-        let conn = rusqlite::Connection::open_with_flags(
-            &tmp,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .ok()?;
+        // P2 审查修复：读写打开——只读连接在 -wal 存在而 -shm 缺失时无法执行
+        // WAL 恢复（SQLITE_CANTOPEN → None），客户端运行中/异常退出后 Work 登录
+        // 守卫常态静默失效，恰是守卫最有价值的场景。副本为私有临时文件，
+        // SQLite 在其上重建 -shm 索引不触碰原库
+        let conn = rusqlite::Connection::open(&tmp).ok()?;
         let mut stmt = conn
             .prepare(
                 "SELECT encrypted_value, value FROM cookies \
@@ -189,6 +200,7 @@ pub fn read_cookie_value(data_dir: &Path, host_suffix: &str, cookie_name: &str) 
     })();
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&tmp_wal);
+    let _ = std::fs::remove_file(&tmp_shm);
     result
 }
 
@@ -284,9 +296,15 @@ pub fn qoder_ide_scan(
             });
         }
         let id = account_id_of(&login.token);
-        // I09：持锁读-改-写，防并发整池覆盖丢更新
-        let (updated, nickname) = with_pool_mut(&state, |accounts| {
-            if let Some(a) = accounts.iter_mut().find(|a| a.id == id) {
+        // I09：持锁读-改-写，防并发整池覆盖丢更新。
+        // P2 审查修复：入池匹配补 uid 兜底（对齐 oauth/data_io/PAT 导入的同款语义）——
+        // 同账号先经其他通道入池（token 派生 id 不同）后再扫描 IDE 时，uid 命中保留
+        // 原 id，防同 uid 重复账号；凭证按生效 id 落库，与池条目对齐
+        let (updated, nickname, effective_id) = with_pool_mut(&state, |accounts| {
+            if let Some(a) = accounts
+                .iter_mut()
+                .find(|a| a.id == id || (!login.uid.is_empty() && a.uid == login.uid))
+            {
                 // 已有账号保守回填：uid/nickname 只在为空时补，不覆盖用户手动改名
                 if a.uid.is_empty() && !login.uid.is_empty() {
                     a.uid = login.uid.clone();
@@ -294,24 +312,29 @@ pub fn qoder_ide_scan(
                 if a.nickname.is_empty() && !login.name.is_empty() {
                     a.nickname = login.name.clone();
                 }
-                // P2 审查修复：credential_source 保守更新——本路径按 id（token 摘要）命中，
-                // 同 id 即同 token、凭证本体未变，仅来源字段为空时回填，防多通道
-                // 导入时徽标随「最后导入者」漂移（与 uid/nickname 的保守回填策略一致）
-                if a.credential_source.is_empty() {
+                // P2 审查修复：credential_source 保守更新——id 命中即同 token、凭证本体
+                // 未变，仅来源字段为空时回填；uid 兜底命中且派生 id 不同 = 换了新凭证
+                // （其他通道 → IDE 登录），徽标随之更新（对齐 oauth.rs 同款判据）
+                if a.credential_source.is_empty() || a.id != id {
                     a.credential_source = "ide_store".into();
                 }
                 // 到期时间过域钳制（与 creds_of 同口径：超 (0, now+10y] 视为无过期信息，
-                // 防服务端脏数据导致到期看板溢出/千年展示）
-                a.token_expires_at = login
+                // 防服务端脏数据导致到期看板溢出/千年展示）。
+                // P3 审查修复：仅在解析出有效到期时间时覆盖（对齐 data_io merge 的
+                // is_some 才覆盖口径）——登录态无 expireTime/钳制失败时保留本地已知值
+                if let Some(sec) = login
                     .expires_at_ms
                     .and_then(qoder_common::clamp_expires_at)
-                    .map(|ms| ms / 1000);
+                    .map(|ms| ms / 1000)
+                {
+                    a.token_expires_at = Some(sec);
+                }
                 a.needs_relogin = false;
                 a.relogin_reason = String::new();
                 if a.device_profile.is_none() {
                     a.device_profile = Some(QoderDeviceProfile::generate());
                 }
-                Ok((true, a.nickname.clone()))
+                Ok((true, a.nickname.clone(), a.id.clone()))
             } else {
                 let nickname = if login.name.is_empty() {
                     format!("Qoder {}", &id[3..9])
@@ -331,7 +354,7 @@ pub fn qoder_ide_scan(
                     device_profile: Some(QoderDeviceProfile::generate()),
                     ..Default::default()
                 });
-                Ok((false, nickname))
+                Ok((false, nickname, id.clone()))
             }
         })?;
         // 凭证入 token store（save_token_store 非空字段 merge，不抹掉存量字段）
@@ -344,15 +367,17 @@ pub fn qoder_ide_scan(
             kind: "client".into(),
             ..Default::default()
         };
-        qoder_common::save_token_store(&state, &id, &creds)?;
-        crate::fs_utils::app_log(&state.data_dir, &format!("Qoder IDE 存储账号已发现并导入: {id}"));
+        // 凭证按生效 id 落库（uid 兜底命中时为池内既有 id），与池条目对齐——
+        // 若按派生 id 落库则凭证与池条目错位，后续扫描/导入按 id 查不到新凭证
+        qoder_common::save_token_store(&state, &effective_id, &creds)?;
+        crate::fs_utils::app_log(&state.data_dir, &format!("Qoder IDE 存储账号已发现并导入: {effective_id}"));
         // 新账号/凭证变更联动网关池热重载（fail-open 即时入池调度；服务未运行时 no-op）
         crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
         Ok(QoderIdeScanResult {
             found: true,
             imported: !updated,
             updated,
-            account_id: id,
+            account_id: effective_id,
             nickname,
             reason: String::new(),
         })

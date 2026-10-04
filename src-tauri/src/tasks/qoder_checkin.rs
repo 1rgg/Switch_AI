@@ -110,22 +110,34 @@ fn jitter_sleep() {
 }
 
 /// POST 空 body（R-4 抓包实测：claim 请求 Content-Length: 0，非 JSON `{}`）。
-/// 返回 (http_status, parsed)；status=0 网络不可达。
-fn post_empty(agent: &ureq::Agent, url: &str, headers: &[(String, String)]) -> (u16, Option<Value>) {
+/// 返回 (http_status, parsed, raw_text)；status=0 网络不可达。
+/// 红线（响应体读取失败禁吞空串）：读取失败时 raw 携带 `<响应体读取失败: …>`
+/// 标记——Ok 分支原样返回真实 status（原硬编码 200 会把 201/204 记失真），
+/// 供 claim_one 区分「空响应」与「读取失败」并保留诊断信息。
+fn post_empty(
+    agent: &ureq::Agent,
+    url: &str,
+    headers: &[(String, String)],
+) -> (u16, Option<Value>, String) {
     let mut req = agent.post(url);
     for (k, v) in headers {
         req = req.set(k, v);
     }
     match req.call() {
         Ok(resp) => {
-            let raw = resp.into_string().unwrap_or_default();
-            (200, serde_json::from_str(&raw).ok())
+            let code = resp.status();
+            let raw = resp
+                .into_string()
+                .unwrap_or_else(|e| format!("<响应体读取失败: {e}>"));
+            (code, serde_json::from_str(&raw).ok(), raw)
         }
         Err(ureq::Error::Status(code, resp)) => {
-            let raw = resp.into_string().unwrap_or_default();
-            (code, serde_json::from_str(&raw).ok())
+            let raw = resp
+                .into_string()
+                .unwrap_or_else(|e| format!("<响应体读取失败: {e}>"));
+            (code, serde_json::from_str(&raw).ok(), raw)
         }
-        Err(_e) => (0, None),
+        Err(_e) => (0, None, String::new()),
     }
 }
 
@@ -305,7 +317,7 @@ fn claim_one(
         campaign_id
     );
     jitter_sleep();
-    let (status, body) = post_empty(agent, &url, headers);
+    let (status, body, raw) = post_empty(agent, &url, headers);
     if status == 401 {
         return ("auth".into(), "登录态失效（401）".into(), None);
     }
@@ -321,6 +333,10 @@ fn claim_one(
         }
         return ("fail".into(), "网络不可达（claim）".into(), None);
     }
+    // 响应体读取失败标记（红线）：2xx 下服务端已受理，维持宽容成功语义
+    //（重试只会触发幂等回放，复查亦可恢复），但 message 携带失败信息入
+    // 落库/事件供排障；非 2xx 由末尾 fail 分支 raw 兜底
+    let read_failed = raw.starts_with("<响应体读取失败");
     let replayed = body
         .as_ref()
         .and_then(|b| fs_utils::dig(b, &["replayed", "data.replayed"]))
@@ -345,14 +361,24 @@ fn claim_one(
         if claimed_status.as_deref() == Some("CLAIMED") {
             return ("success".into(), "领取成功".into(), reward);
         }
-        // 200 但无明确状态：宽容视为成功（响应结构 R-9 已固化，仍保留兜底）
+        // 200 但无明确状态：宽容视为成功（响应结构 R-9 已固化，仍保留兜底）；
+        // 响应体读取失败（replayed/status 均不可判）同样维持成功但携带诊断信息
+        if read_failed {
+            return ("success".into(), format!("领取成功（{raw}）"), reward);
+        }
         return ("success".into(), "领取成功".into(), reward);
     }
     let msg = body
         .as_ref()
         .and_then(|b| fs_utils::dig(b, &["message", "msg"]))
         .map(|v| s_of(Some(v)))
-        .filter(|m| !m.is_empty());
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            // 服务端错误文案缺失时取 raw 头部兜底（含「响应体读取失败」标记，
+            // 不再退化为干瘪的「claim 失败（HTTP xxx）」）
+            let head: String = raw.chars().take(160).collect();
+            (!head.is_empty()).then_some(head)
+        });
     (
         "fail".into(),
         msg.unwrap_or_else(|| format!("claim 失败（HTTP {status}）")),
@@ -588,6 +614,26 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
 /// 签到整轮：逐账号串行处理，事件经 emit 回调逐条输出（NDJSON 管线复用）。
 /// 返回 done 事件（ok/already/failed 计数），供启动补签/调度静默路径直接消费。
 pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut dyn FnMut(&Value)) -> Value {
+    // 跨进程互斥（审查 P1）：schtasks CLI（--task-run qoder-checkin）与应用内调度器
+    // 默认同为 10:15 触发，双进程对同账号并发 ensure_fresh 会以同一 refresh_token
+    // 刷新（服务端一次性轮换下后到者误标 needs_relogin）。抢锁失败方幂等跳过
+    //（done 带 skipped_busy，调度器据此不记当日已跑）；3s 等待区分「瞬时竞争」
+    //（短暂等待后获取）与「对方长跑」（放弃跳过，重试幂等无损失）
+    let _cross = match qoder_common::CrossProcLock::try_acquire(&state.data_dir, "checkin", 3_000) {
+        Some(g) => g,
+        None => {
+            fs_utils::app_log(
+                &state.data_dir,
+                "[qoder] 另一进程正在执行 Qoder 签到（schtasks/CLI 与应用内调度器同刻），本轮幂等跳过",
+            );
+            let done = json!({
+                "type": "done", "ok": 0, "already": 0, "failed": 0,
+                "failed_empty_campaigns": 0, "skipped_busy": true,
+            });
+            emit(&done);
+            return done;
+        }
+    };
     // 设备指纹惰性回填（§5.10：GUI/CLI/启动补签三路共用本漏斗，一处 ensure 全覆盖；
     // 失败不阻塞签到，仅缺注入指纹）
     if let Err(e) = super::qoder_device::ensure_pool_profiles(state) {

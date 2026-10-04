@@ -135,7 +135,11 @@ pub fn make_wb_request(c: &WbCreds, body: &[u8]) -> Result<Box<dyn Read + Send>,
             let retry_after = resp
                 .header("retry-after")
                 .and_then(|v| v.trim().parse::<u64>().ok());
-            let body_text = resp.into_string().unwrap_or_default();
+            // 响应体读取失败须带错误标记（对齐 qoder_upstream 红线#7 同款修复）：
+            // 吞为空串会让错误分类无特征可判，排障信息全失
+            let body_text = resp
+                .into_string()
+                .unwrap_or_else(|e| format!("<响应体读取失败: {e}>"));
             Err((code, body_text, retry_after))
         }
         Err(e) => {

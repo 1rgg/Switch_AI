@@ -64,7 +64,8 @@ function aggregateTrends(records: QoderCheckinRecord[]): TrendPoint[] {
     const p = map.get(r.date) ?? { date: r.date, ok: 0, already: 0, failed: 0 };
     if (r.status === 'success') p.ok += 1;
     else if (r.status === 'already') p.already += 1;
-    else p.failed += 1;
+    else if (r.status === 'fail') p.failed += 1;
+    // 其余状态（skip 等）不计入任何桶——未知状态误计为失败会污染趋势图
     map.set(r.date, p);
   }
   return [...map.values()].sort((a, b) => a.date.localeCompare(b.date));

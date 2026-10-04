@@ -409,6 +409,41 @@ pub fn remove_token(state: &AppState, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 清除设备流凭证残留（疑点②审查修复）：PAT 导入成功后调用。
+/// refresh_token / refresh_expires_at_ms 为设备流专属字段——PAT 通道（pat 字段
+/// 非空即走 jobToken 重换）完全不消费；同账号此前经 OAuth/IDE 扫描入池时留下的
+/// 旧设备流 RT 会在 vault 中残留，形成「PAT 优先但 refresh 残留」混合态（敏感
+/// 凭证留驻且无任何使用方）。save_token_store 为非空字段合并，空值不覆盖，
+/// 无法经由其清除——须显式移除。machine_id/machine_token 保留：有效设备指纹
+/// 与凭证种类无关，PAT 通道请求头仍消费。
+pub fn clear_device_flow_creds(state: &AppState, id: &str) -> Result<(), String> {
+    let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // vault 条目：字段级移除后整体回写（ns_get 拿到的即明文 entry）
+    if let Some(mut entry) = crate::vault::ns_get(&state.data_dir, "qoder", id) {
+        if let Some(rm) = entry.as_object_mut() {
+            let had = rm.remove("refresh_token").is_some();
+            let had2 = rm.remove("refresh_expires_at_ms").is_some();
+            if had || had2 {
+                crate::vault::ns_set(&state.data_dir, "qoder", id, &entry)?;
+            }
+        }
+    }
+    // DB 行：与 remove_token 同口径读原始占位表（防明文整表写回），目标行移除字段
+    let mut store =
+        crate::store::docs::qoder_token_store_load(&crate::store::db(&state.data_dir));
+    if let Some(rec) = store
+        .get_mut("tokens")
+        .and_then(Value::as_object_mut)
+        .and_then(|t| t.get_mut(id))
+        .and_then(Value::as_object_mut)
+    {
+        rec.remove("refresh_token");
+        rec.remove("refresh_expires_at_ms");
+    }
+    crate::store::docs::qoder_token_store_save(&crate::store::db(&state.data_dir), &store)?;
+    Ok(())
+}
+
 // ── 统一请求头（§5.2：Cosy 头必带）─────────────────────────────────────────
 
 /// Bearer + Cosy-ClientType（缺失 → 服务端静默空列表）+ 可选设备头透传 + UA。
@@ -699,12 +734,12 @@ pub enum JobExchangeFail {
     Rejected,
 }
 
-pub fn exchange_job_token(
-    agent: &ureq::Agent,
-    pat: &str,
-    data_dir: &std::path::Path,
-) -> Result<QoderCreds, JobExchangeFail> {
-    let attempts: [(&str, Value, &str); 3] = [
+/// PAT→作业令牌探测通道（疑点① 单测锁定排序）：失败分类以首通道状态码为准，
+/// 已实证的 R-6 抓包路径 `/api/v1/me/jobToken` 必须居首（减少无效 404 请求），
+/// 未证实的 exchange 兜底通道仅落日志不参与分类。单测以假 pat 断言排序与
+/// body 形态，不发起真实请求。
+fn job_token_attempts(pat: &str) -> [(&'static str, Value, &'static str); 3] {
+    [
         (
             "/api/v1/me/jobToken",
             serde_json::json!({ "clientId": job_client_id(pat) }),
@@ -716,7 +751,15 @@ pub fn exchange_job_token(
             "exchange+pat",
         ),
         ("/api/v1/jobToken/exchange", serde_json::json!({}), "exchange"),
-    ];
+    ]
+}
+
+pub fn exchange_job_token(
+    agent: &ureq::Agent,
+    pat: &str,
+    data_dir: &std::path::Path,
+) -> Result<QoderCreds, JobExchangeFail> {
+    let attempts = job_token_attempts(pat);
     // 首通道（已证实 R-6 路径）状态码决定失败分类；None = 首通道未产生 HTTP 状态
     //（理论不可达——attempts 非空），按暂态兜底保守处理
     let mut first_status: Option<u16> = None;
@@ -781,6 +824,14 @@ pub fn exchange_job_token(
 
 // ── 惰性刷新（对齐 wb_common::ensure_fresh 语义）────────────────────────────
 
+/// PAT 通道判定（疑点① 单测锁定 jt- 换号链路）：access_token 为 pt- 前缀，或
+/// pat 备份字段非空。jt- 导入因同时写 pat 字段（qoder_account_import_pat）而
+/// 稳定落入 PAT 通道——否则 jt- 作业令牌 24h 过期后掉进客户端通道赌
+/// deviceToken/refresh 兼容性，直接 refresh_failed 需手工重导。
+fn is_pat_channel(creds: &QoderCreds) -> bool {
+    creds.access_token.starts_with("pt-") || !creds.pat.is_empty()
+}
+
 /// 惰性刷新：距过期 < lazy_hours 才刷；一次调用最多一次刷新。
 /// 返回 (creds, refreshed, note)，note ∈ no_credential/fresh/expired_needs_relogin/
 /// refreshed/refreshed_unsaved/refresh_failed/auth_dead/pat_rejected。
@@ -804,11 +855,11 @@ pub fn ensure_fresh(
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
     let is_pat = creds.access_token.starts_with("pt-");
-    let has_pat = !creds.pat.is_empty();
+    // PAT 通道判定收编为 is_pat_channel（疑点① 单测锁定 jt- 换号链路）
     // PAT 通道覆盖全部携带 pat 备份的凭证（含作业令牌）：其生命周期由原始 PAT
     // 重换管理（可靠自愈路径），不得掉入客户端通道赌 deviceToken/refresh 对
     // 作业令牌 refresh_token 的兼容性（旧门控 e<=now 使临期窗口误入该通道报 refresh_failed）。
-    if is_pat || has_pat {
+    if is_pat_channel(&creds) {
         // ── PAT 通道：确保作业令牌有效 ──
         let pat = if creds.pat.is_empty() {
             creds.access_token.clone()
@@ -984,6 +1035,74 @@ pub fn account_id_of(token: &str) -> String {
     format!("qd-{}", &hex[..12])
 }
 
+// ── 跨进程互斥（审查 P1：schtasks CLI 与应用内调度器同刻双进程）──────────────
+//
+// 进程内轮次锁（QODER_ROUND_LOCK）与每账号刷新锁（REFRESH_LOCKS）对
+// 「schtasks CLI（--task-run，main.rs 注释明确绕开单实例插件）+ 应用内调度器
+// 同刻（默认同为 10:15）双进程执行」无效：双进程对同账号并发 ensure_fresh →
+// 以同一 refresh_token 发起刷新 → 服务端一次性轮换下后到者 4xx → AuthDead →
+// 误标 needs_relogin。Windows 命名 Mutex 全局唯一，抢锁失败方幂等跳过
+//（签到/刷新均幂等，无损失）；锁名含 data_dir 短哈希（便携版多数据目录互不误伤）。
+
+/// 跨进程锁持有句柄（RAII：Drop 释放；进程崩溃由 OS 回收 Mutex）
+#[cfg(windows)]
+pub struct CrossProcLock {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl CrossProcLock {
+    /// 尝试在 wait_ms 内获取命名互斥体；被占/失败返回 None（调用方幂等跳过）
+    pub fn try_acquire(data_dir: &std::path::Path, scope: &str, wait_ms: u32) -> Option<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        // 锁名含 data_dir 短哈希：AIWORKDATA_DIR 指向不同目录的实例互不干扰
+        let mut h = Sha256::new();
+        h.update(data_dir.to_string_lossy().as_bytes());
+        let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let name: Vec<u16> = format!("Global\\AIWorkAssistant\\qoder\\{scope}\\{}", &hex[..16])
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY：name 以 NUL 结尾；CreateMutexW 不拥有调用方内存
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        // HANDLE 为 *mut c_void：null 即创建失败
+        if handle.is_null() {
+            return None;
+        }
+        // SAFETY：handle 由 CreateMutexW 返回且非 null
+        let waited = unsafe { WaitForSingleObject(handle, wait_ms) };
+        if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
+            // WAIT_ABANDONED：前持有进程崩溃退出，所有权已转移给本进程——正常获取
+            Some(Self { handle })
+        } else {
+            // WAIT_TIMEOUT（对方持有中）/WAIT_FAILED：释放句柄后放弃
+            unsafe { CloseHandle(handle) };
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CrossProcLock {
+    fn drop(&mut self) {
+        // SAFETY：handle 来自 CreateMutexW 且未被关闭；CloseHandle 释放所有权
+        //（Mutex 对象在所有句柄关闭后销毁）
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
+    }
+}
+
+/// 非 Windows 平台占位（本项目仅 Windows 发布，保 CI 单测可编译）
+#[cfg(not(windows))]
+pub struct CrossProcLock;
+
+#[cfg(not(windows))]
+impl CrossProcLock {
+    pub fn try_acquire(_data_dir: &std::path::Path, _scope: &str, _wait_ms: u32) -> Option<Self> {
+        Some(Self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,6 +1237,52 @@ mod tests {
             "/api/v1/deviceToken/refresh",
             "非 jrt- 前缀一律设备通道"
         );
+    }
+
+    /// 疑点①（jt- 换号链路，无法实测真实 token 故单测锁定代码行为）：
+    /// jt- 导入落库形态 = access_token 与 pat 双写（qoder_account_import_pat），
+    /// ensure_fresh 据此落入 PAT 通道走 jobToken 重换——「jt- 仅落 access_token」
+    /// 的旧形态必须被判为客户端通道（反例锁定，防止回归）
+    #[test]
+    fn pat_channel_covers_jt_via_pat_backup_field() {
+        // jt- + pat 双写（现行导入形态）→ PAT 通道（jobToken 重换自愈）
+        let imported = QoderCreds {
+            access_token: "jt-abc".into(),
+            pat: "jt-abc".into(),
+            kind: "pat".into(),
+            ..Default::default()
+        };
+        assert!(is_pat_channel(&imported), "jt- 双写形态必须走 PAT 通道");
+        // 反例锁定：jt- 无 pat 备份 → 客户端通道（正是双写修复前的坏行为）
+        let legacy = QoderCreds {
+            access_token: "jt-abc".into(),
+            ..Default::default()
+        };
+        assert!(
+            !is_pat_channel(&legacy),
+            "无 pat 备份的 jt- 不得误入 PAT 通道（需先经 jobToken 换取）"
+        );
+        // pt- 直接命中 PAT 通道；设备流凭证走客户端通道
+        assert!(is_pat_channel(&QoderCreds { access_token: "pt-x".into(), ..Default::default() }));
+        assert!(!is_pat_channel(&QoderCreds { access_token: "dt-x".into(), ..Default::default() }));
+        assert!(!is_pat_channel(&QoderCreds::default()));
+    }
+
+    /// 疑点①：PAT→作业令牌探测端点排序——已实证的 R-6 抓包路径必须居首
+    ///（失败分类以首通道状态码为准，且减少无效 404 请求）
+    #[test]
+    fn job_token_probe_orders_verified_endpoint_first() {
+        let attempts = job_token_attempts("pt-test");
+        assert_eq!(
+            attempts[0].0, "/api/v1/me/jobToken",
+            "已实证端点必须居首（失败分类以其状态码为准）"
+        );
+        assert_eq!(attempts[0].2, "me/jobToken");
+        // 首通道 body 携带 PAT 派生的稳定 clientId（R-6 抓包固化）
+        assert!(attempts[0].1.get("clientId").and_then(Value::as_str).is_some());
+        // 兜底通道仅两条且均指向 exchange（未证实路径，不参与失败分类）
+        assert_eq!(attempts[1].0, "/api/v1/jobToken/exchange");
+        assert_eq!(attempts[2].0, "/api/v1/jobToken/exchange");
     }
 
     // ── p3-3 gateway 可行性探针（#[ignore]：cargo test probe_gateway -- --ignored --nocapture）──

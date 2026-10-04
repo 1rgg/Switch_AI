@@ -53,13 +53,17 @@ pub fn qoder_checkin_start(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 qoder_checkin::run_checkin_round(&state2, &o, &mut |ev| emit_qoder_event(&app2, ev));
             }));
-            if result.is_err() {
-                fs_utils::app_log(&state2.data_dir, "Qoder 签到轮次线程 panic（已捕获，exit 终态仍下发）");
+            // P3 审查修复：panic 轮次的 exit 终态 ok=false——此前恒 true 会把「签到线程
+            // 崩溃」上报为成功轮次（结果失真）；前端仅按 type=="exit" 复位运行态，
+            // 不消费 ok 字段，语义收紧无破坏
+            let ok = result.is_ok();
+            if !ok {
+                fs_utils::app_log(&state2.data_dir, "Qoder 签到轮次线程 panic（已捕获，exit 终态 ok=false 下发）");
             }
             // 终态事件（前端据 "type":"exit" 复位运行态）：emit 失败落日志（issue #44 约定对齐）。
             // 契约同 wb：NDJSON **字符串** payload（listen<string> 后 JSON.parse），传对象会
             // 破坏 parseLine 导致 exit 事件被静默丢弃
-            let line = serde_json::json!({ "type": "exit", "ok": true }).to_string();
+            let line = serde_json::json!({ "type": "exit", "ok": ok }).to_string();
             crate::events::emit_logged(
                 &app2,
                 "qoder-checkin-progress",
@@ -289,12 +293,18 @@ pub fn startup_auto_checkin(app: &AppHandle, state: &AppState) {
         let opts = QoderCheckinOpts::daily();
         fs_utils::app_log(&state2.data_dir, "Qoder 启动补签：开始核验签到状态");
         let done = qoder_checkin::run_checkin_round(&state2, &opts, &mut |_| {});
-        let msg = format!(
-            "Qoder 启动补签完成: 成功 {}，已签 {}，失败 {}",
-            done["ok"].as_i64().unwrap_or(0),
-            done["already"].as_i64().unwrap_or(0),
-            done["failed"].as_i64().unwrap_or(0),
-        );
+        // skipped_busy：轮次锁已获取但跨进程锁被占（如 schtasks 同刻触发），幂等跳过；
+        // failed=0 本就不会触发失败推送，此处仅修正日志可读性（不再误记「成功 0 失败 0」）
+        let msg = if done["skipped_busy"].as_bool().unwrap_or(false) {
+            "Qoder 启动补签跳过：另一进程正在执行签到（跨进程锁占用）".to_string()
+        } else {
+            format!(
+                "Qoder 启动补签完成: 成功 {}，已签 {}，失败 {}",
+                done["ok"].as_i64().unwrap_or(0),
+                done["already"].as_i64().unwrap_or(0),
+                done["failed"].as_i64().unwrap_or(0),
+            )
+        };
         fs_utils::app_log(&state2.data_dir, &msg);
         let failed = done["failed"].as_i64().unwrap_or(0);
         // empty_campaigns（活动未开始/不可用）非用户可操作失败：重试也无解，仅记日志

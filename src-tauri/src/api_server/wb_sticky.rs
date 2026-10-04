@@ -63,7 +63,10 @@ impl SessionKey {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            return SessionKey::Explicit(cid.to_string());
+            // 审查 P3：cid 进 sticky 表做会话匹配并随绑定留档，超长值放大存储
+            // 体积——限长 128 字符；SessionKey 由 WB/Qoder 路由共用，两侧
+            // 确定性截断保证匹配一致性
+            return SessionKey::Explicit(cid.chars().take(128).collect());
         }
         SessionKey::Fingerprint(fingerprint_messages(body))
     }

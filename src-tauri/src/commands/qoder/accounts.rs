@@ -100,29 +100,60 @@ pub async fn qoder_accounts_list(state: State<'_, AppState>) -> Result<Vec<Qoder
 }
 
 /// 改名/备注（nickname 即展示名，可编辑覆盖 userinfo 值）。
-/// 账号变更联动网关池热重载（与 Trae 侧 accounts.rs 同惯例；服务未运行时 no-op）
+/// 账号变更联动网关池热重载（与 Trae 侧 accounts.rs 同惯例；服务未运行时 no-op）。
+/// 审查 P3：池 JSON 读改写为磁盘 IO，移入 spawn_blocking 不占 async worker
 #[tauri::command]
-pub fn qoder_account_save(
-    state: State<AppState>,
-    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+pub async fn qoder_account_save(
+    app: AppHandle,
+    state: State<'_, AppState>,
     user_id: String,
     name: Option<String>,
     note: Option<String>,
 ) -> Result<(), String> {
-    // I09：持锁读-改-写，防并发整池覆盖丢更新
-    with_pool_mut(&state, |accounts| {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        qoder_account_save_impl(&st, &app, user_id, name, note)
+    })
+    .await
+    .map_err(|e| format!("账号保存任务失败: {e}"))?
+}
+
+fn qoder_account_save_impl(
+    state: &AppState,
+    app: &AppHandle,
+    user_id: String,
+    name: Option<String>,
+    note: Option<String>,
+) -> Result<(), String> {
+    // I09：持锁读-改-写，防并发整池覆盖丢更新。
+    // 疑点③ 脏检查：值未实际变更时跳过落库后的网关池热重载——改名/改备注
+    // 不影响网关调度（网关池消费的是凭证与分组，不消费 nickname/note），
+    // 无变更重载会在调度进行中无谓打断并重建池连接
+    let changed = with_pool_mut(state, |accounts| {
         let Some(a) = accounts.iter_mut().find(|a| a.id == user_id) else {
             return Err(format!("账号不在池中: {user_id}"));
         };
+        let mut changed = false;
         if let Some(n) = name {
-            a.nickname = n.trim().to_string();
+            let n = n.trim().to_string();
+            if a.nickname != n {
+                a.nickname = n;
+                changed = true;
+            }
         }
         if let Some(n) = note {
-            a.note = n;
+            if a.note != n {
+                a.note = n;
+                changed = true;
+            }
         }
-        Ok(())
+        Ok(changed)
     })?;
-    crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
+    if !changed {
+        return Ok(());
+    }
+    let rt = app.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+    crate::commands::api_server::reload_pools_if_running(state, rt.inner());
     Ok(())
 }
 
@@ -130,21 +161,29 @@ pub fn qoder_account_save(
 /// 审查修复：① 池中无条目但 token store 有记录（导入中断产生的孤儿凭证）时
 /// 仍执行凭证清理——此前直接拒绝，孤儿真实凭证在 vault 中无任何 UI 清理出口；
 /// ② 凭证清理失败上抛 Err 透出（此前仅落日志返回 Ok，用户对凭证残留无感知）；
-/// ③ 账号变更联动网关池热重载（删除的账号即时退出调度，服务未运行时 no-op）
+/// ③ 账号变更联动网关池热重载（删除的账号即时退出调度，服务未运行时 no-op）。
+/// 审查 P3：vault 读写为磁盘 IO，移入 spawn_blocking 不占 async worker
 #[tauri::command]
-pub fn qoder_account_remove(
-    state: State<AppState>,
-    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+pub async fn qoder_account_remove(
+    app: AppHandle,
+    state: State<'_, AppState>,
     user_id: String,
 ) -> Result<(), String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || qoder_account_remove_impl(&st, &app, user_id))
+        .await
+        .map_err(|e| format!("账号移除任务失败: {e}"))?
+}
+
+fn qoder_account_remove_impl(state: &AppState, app: &AppHandle, user_id: String) -> Result<(), String> {
     fs_utils::ensure_uid_safe(&user_id)?;
     // 池外孤儿判定：token store 有记录即可清理（池删除接口对孤儿凭证是唯一出口）
-    let has_token = qoder_common::load_token_store(&state)
+    let has_token = qoder_common::load_token_store(state)
         .get("tokens")
         .and_then(|t| t.get(&user_id))
         .is_some();
     // I09：持锁读-改-写
-    let removed = with_pool_mut(&state, |accounts| {
+    let removed = with_pool_mut(state, |accounts| {
         let before = accounts.len();
         accounts.retain(|a| a.id != user_id);
         Ok(before != accounts.len())
@@ -152,8 +191,9 @@ pub fn qoder_account_remove(
     if !removed && !has_token {
         return Err(format!("账号不在池中: {user_id}"));
     }
+    let rt = app.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
     // I14：清理失败上抛（原先静默吞掉，悬空凭证难排查且用户无感知）
-    if let Err(e) = qoder_common::remove_token(&state, &user_id) {
+    if let Err(e) = qoder_common::remove_token(state, &user_id) {
         fs_utils::app_log(&state.data_dir, &format!("Qoder 账号 {user_id} 凭证清理失败: {e}"));
         let msg = if removed {
             format!("账号已从池中移除，但凭证清理失败：{e}（重新导入同一凭证后再次移除可重试）")
@@ -162,14 +202,14 @@ pub fn qoder_account_remove(
         };
         // 池移除已生效：无论凭证清理成败都必须热重载，网关侧即时剔除该账号
         //（否则残留账号凭 vault 旧凭证仍可被调度至下一次生命周期事件/重启）
-        crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
+        crate::commands::api_server::reload_pools_if_running(state, rt.inner());
         return Err(msg);
     }
     // Q3：主动回收该账号的全局刷新锁条目（仅摘表项无 DB 读；并发持有者的 Arc 由
     // 引用计数自然释放，若与并发刷新竞争，新到的 ensure_fresh 会重建条目，语义不变）
     qoder_common::refresh_lock_remove(&user_id);
     fs_utils::app_log(&state.data_dir, &format!("Qoder 账号已移除: {user_id}"));
-    crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
+    crate::commands::api_server::reload_pools_if_running(state, rt.inner());
     Ok(())
 }
 
@@ -220,8 +260,14 @@ pub async fn qoder_account_import_pat(
     let pat3 = pat;
     tauri::async_runtime::spawn_blocking(move || -> Result<QoderAccountView, String> {
         let (display, uid, nickname, plan) = (display, uid, nickname, plan);
-        with_pool_mut(&st, |accounts| {
-            if let Some(a) = accounts.iter_mut().find(|a| a.id == id2) {
+        // P2 审查修复：入池匹配补 uid 兜底（对齐 oauth import_device_creds / data_io
+        // merge_account 的 uid 优先语义）——同账号先经 OAuth/IDE 扫描入池（token 派生
+        // id 不同）后再导入 PAT 时，uid 命中保留原 id，防同 uid 重复账号
+        let effective_id = with_pool_mut(&st, |accounts| {
+            if let Some(a) = accounts
+                .iter_mut()
+                .find(|a| a.id == id2 || (!uid.is_empty() && a.uid == uid))
+            {
                 if let Some(d) = display {
                     a.nickname = d;
                 } else if a.nickname.is_empty() && !nickname.is_empty() {
@@ -235,10 +281,10 @@ pub async fn qoder_account_import_pat(
                 if !plan.is_empty() {
                     a.plan = plan.clone();
                 }
-                // P2 审查修复：credential_source 保守更新——本路径按 id（token 摘要）命中，
-                // 同 id 即同 token、凭证本体未变，仅来源字段为空时回填，防同账号多通道
-                // 导入时徽标随「最后导入者」漂移（与 uid/nickname 的保守回填策略一致）
-                if a.credential_source.is_empty() {
+                // P2 审查修复：credential_source 保守更新——id 命中即同 token、凭证本体
+                // 未变，仅来源字段为空时回填；uid 兜底命中且派生 id 不同 = 换了新凭证
+                // （OAuth/IDE → PAT），徽标随之更新（对齐 oauth.rs 同款判据）
+                if a.credential_source.is_empty() || a.id != id2 {
                     a.credential_source = "pat".into();
                 }
                 a.needs_relogin = false;
@@ -247,6 +293,7 @@ pub async fn qoder_account_import_pat(
                 if a.device_profile.is_none() {
                     a.device_profile = Some(crate::tasks::qoder_device::QoderDeviceProfile::generate());
                 }
+                Ok(a.id.clone())
             } else {
                 accounts.push(QoderAccount {
                     id: id2.clone(),
@@ -259,8 +306,8 @@ pub async fn qoder_account_import_pat(
                     device_profile: Some(crate::tasks::qoder_device::QoderDeviceProfile::generate()),
                     ..Default::default()
                 });
+                Ok(id2.clone())
             }
-            Ok(())
         })?;
         // 凭证入 token store（M1 单源）。
         // jt- 前缀（审查 L-jt）：同时写入 pat 字段——ensure_fresh 的 PAT 重换通道以
@@ -274,8 +321,19 @@ pub async fn qoder_account_import_pat(
             nickname: nickname.clone(),
             ..Default::default()
         };
-        qoder_common::save_token_store(&st, &id2, &creds)?;
-        fs_utils::app_log(&st.data_dir, &format!("Qoder PAT 账号已导入: {id2}"));
+        // 凭证按生效 id 落库（uid 兜底命中时为池内既有 id），与池条目对齐——
+        // 若按派生 id 落库则凭证与池条目错位，后续扫描/导入按 id 查不到新凭证
+        qoder_common::save_token_store(&st, &effective_id, &creds)?;
+        // 疑点②：清除旧设备流凭证残留（refresh_token 等）——该账号此前经
+        // OAuth/IDE 扫描入池时留下的 RT 对 PAT 通道完全无用，且 save_token_store
+        // 非空字段合并不清除旧值；失败不阻断导入（仅残留未清），落日志可感知
+        if let Err(e) = qoder_common::clear_device_flow_creds(&st, &effective_id) {
+            fs_utils::app_log(
+                &st.data_dir,
+                &format!("Qoder 账号 {effective_id} 旧设备流凭证残留清理失败: {e}"),
+            );
+        }
+        fs_utils::app_log(&st.data_dir, &format!("Qoder PAT 账号已导入: {effective_id}"));
         // 新账号/凭证变更联动网关池热重载（fail-open 新账号即时入池调度；服务未运行时 no-op）
         let rt = app2.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
         crate::commands::api_server::reload_pools_if_running(&st, rt.inner());
@@ -283,7 +341,7 @@ pub async fn qoder_account_import_pat(
         let tokens = qoder_common::load_token_store(&st);
         accounts
             .iter()
-            .find(|a| a.id == id2)
+            .find(|a| a.id == effective_id)
             .map(|a| view_of(a, &tokens))
             .ok_or_else(|| "导入后读取账号失败".into())
     })

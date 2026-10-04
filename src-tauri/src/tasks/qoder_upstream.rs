@@ -51,15 +51,23 @@ pub const QODER_CHAT_URL: &str = "https://gateway.qoder.com.cn/algo/api/v2/servi
 /// 对话上游 host（传输错误文案用）
 pub const QODER_CHAT_HOST: &str = "https://gateway.qoder.com.cn";
 
-/// Qoder SSE Agent：连接 10s / 写 30s / 空闲读 300s（对齐 wb_agent）
+/// Qoder SSE Agent：连接 10s / 写 30s / 空闲读 300s（对齐 wb_agent）。
+/// 进程级共享（审查 P2：原每请求新建 Agent，连接池配置随临时实例丢弃，
+/// 网关热路径每次对话全新 TCP+TLS 握手）。ureq::Agent 线程安全；HTTP 层
+/// 每请求独立携带凭证头，连接复用仅限传输层，无跨账号侧信道。
 pub fn qoder_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_read(std::time::Duration::from_secs(300))
-        .timeout_write(std::time::Duration::from_secs(30))
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .max_idle_connections(20)
-        .max_idle_connections_per_host(20)
-        .build()
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            ureq::AgentBuilder::new()
+                .timeout_read(std::time::Duration::from_secs(300))
+                .timeout_write(std::time::Duration::from_secs(30))
+                .timeout_connect(std::time::Duration::from_secs(10))
+                .max_idle_connections(20)
+                .max_idle_connections_per_host(20)
+                .build()
+        })
+        .clone()
 }
 
 /// 上游请求错误：(HTTP 状态 | 502 传输错误, body 摘要, Retry-After 秒)（同 wb_upstream）
@@ -320,8 +328,6 @@ fn entry(
 struct CatalogState {
     global: Vec<Value>,
     cn: Vec<Value>,
-    global_fetched_at: i64,
-    cn_fetched_at: i64,
 }
 
 /// 进程级目录句柄（OnceLock + RwLock，与 wb/聚合目录同模式）
@@ -350,8 +356,6 @@ pub(crate) fn catalog_test_reset() {
     let apply = |state: &mut CatalogState| {
         state.global = Vec::new();
         state.cn = Vec::new();
-        state.global_fetched_at = 0;
-        state.cn_fetched_at = 0;
     };
     match catalog().write() {
         Ok(mut guard) => apply(&mut guard),
@@ -402,16 +406,10 @@ fn catalog_for(state: &CatalogState, region: QoderRegion) -> Vec<Value> {
 /// 网络请求由接线层的刷新器发起（带 COSY 签名的 GET），本函数只做
 /// 「信封校验 + 解析 + 原子替换」。返回采纳的条目数。
 pub fn adopt_remote(region: QoderRegion, payload: &Value) -> Result<usize, String> {
-    fn apply(state: &mut CatalogState, region: QoderRegion, models: Vec<Value>, now: i64) {
+    fn apply(state: &mut CatalogState, region: QoderRegion, models: Vec<Value>) {
         match region {
-            QoderRegion::Global => {
-                state.global = models;
-                state.global_fetched_at = now;
-            }
-            QoderRegion::Cn => {
-                state.cn = models;
-                state.cn_fetched_at = now;
-            }
+            QoderRegion::Global => state.global = models,
+            QoderRegion::Cn => state.cn = models,
         }
     }
     if let Some(message) = envelope_error(payload) {
@@ -422,12 +420,11 @@ pub fn adopt_remote(region: QoderRegion, payload: &Value) -> Result<usize, Strin
         return Err("上游返回的模型目录为空".to_string());
     }
     let count = models.len();
-    let now = now_ms();
     // 读-改-写全程持写锁（P2 原子性）：原实现 read_state 克隆 → 修改 → write_state
     // 整体替换，双区并发采纳（Global/CN 同时刷新完成）会互相覆盖丢一区数据
     match catalog().write() {
-        Ok(mut guard) => apply(&mut guard, region, models, now),
-        Err(poisoned) => apply(&mut poisoned.into_inner(), region, models, now),
+        Ok(mut guard) => apply(&mut guard, region, models),
+        Err(poisoned) => apply(&mut poisoned.into_inner(), region, models),
     }
     Ok(count)
 }
@@ -485,8 +482,10 @@ pub fn resolve(model_id: &str, region: QoderRegion) -> Option<Value> {
             return Some(found);
         }
     }
-    // 远程目录在一边有、另一边没有的交错情形：兜底表也双区查一遍
-    for candidate_region in [other, region] {
+    // 远程目录在一边有、另一边没有的交错情形：兜底表也双区查一遍。
+    // 本区优先（审查 P3）：原序 [other, region] 与远程目录序相反，同名条目会
+    // 解析到对区兜底（倍率/档位不同）；对齐远程目录的 [region, other] 顺序
+    for candidate_region in [region, other] {
         let models = fallback(candidate_region);
         if let Some(found) = find_in(&models, &wanted) {
             return Some(found);
@@ -568,9 +567,9 @@ fn parse_catalog(payload: &Value) -> Vec<Value> {
         }
         seen.push(lowered);
 
-        let vision = item.get("is_vl").map(js_truthy).unwrap_or(false);
-        let reasoning = item.get("is_reasoning").map(js_truthy).unwrap_or(false)
-            || item.get("thinking_config").map(js_truthy).unwrap_or(false);
+        let vision = item.get("is_vl").map(truthy).unwrap_or(false);
+        let reasoning = item.get("is_reasoning").map(truthy).unwrap_or(false)
+            || item.get("thinking_config").map(truthy).unwrap_or(false);
         // 上游在该模型条目里声明支持的思考档位（键名即档位值），请求时白名单用
         let efforts: Vec<Value> = item
             .pointer("/thinking_config/enabled/efforts")
@@ -592,7 +591,7 @@ fn parse_catalog(payload: &Value) -> Vec<Value> {
             reasoning,
             &[],
             vision,
-            item.get("enable").map(js_truthy).unwrap_or(false),
+            item.get("enable").map(truthy).unwrap_or(false),
             context_window,
             source,
             &credits,
@@ -628,17 +627,6 @@ fn text_of(value: &Value, key: &str) -> String {
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::Bool(b)) => b.to_string(),
         _ => String::new(),
-    }
-}
-
-/// JS 真值判定（`Boolean(x)`）：null/false/0/"" 为假，其余为真
-fn js_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(flag) => *flag,
-        Value::Number(number) => number.as_f64().map(|item| item != 0.0).unwrap_or(false),
-        Value::String(text) => !text.is_empty(),
-        Value::Array(_) | Value::Object(_) => true,
     }
 }
 
@@ -854,8 +842,9 @@ fn seconds_of(value: &Value) -> Option<u64> {
     }
 }
 
-/// 分类层的真值助手（蓝本 errors.rs 引 super::protocol::truthy；本文件无该
-/// 模块，自带同语义实现——null/false/0/空串为假，数组/对象恒真）
+/// JS 真值判定（`Boolean(x)`；蓝本 errors.rs 引 super::protocol::truthy，本文件
+/// 无该模块自带同语义实现）：null/false/0/空串为假，数组/对象恒真。
+/// 目录解析（is_vl/is_reasoning/enable）与错误分类层共用（审查 P3 去重）
 fn truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -919,7 +908,10 @@ fn pricing_url_of(raw: &str) -> Option<String> {
             .find(|ch: char| ch == '"' || ch == '\\' || ch.is_whitespace())
             .unwrap_or(rest.len());
         let candidate = &rest[..end];
-        if candidate.to_lowercase().contains("/pricing") {
+        // 审查 P3：候选先过协议白名单——正文任意含 "/pricing" 的片段
+        // （如 "http://evil/x/pricing"）不该被当作升级链接展示给用户
+        let lc = candidate.to_lowercase();
+        if (lc.starts_with("http://") || lc.starts_with("https://")) && lc.contains("/pricing") {
             return Some(candidate.to_string());
         }
         search_from = start + 4;
@@ -956,7 +948,19 @@ pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
             pricing,
         );
     }
-    // ③ 额度关键词 / 定价页链接（蓝本判定链）
+    // ③ 状态码特判（审查 P1：前置于泛词链）——401/429 的语义由协议保证，
+    // 优先于文本猜测。此前泛词在前："credit" 子串命中 401 正文 "invalid
+    // credentials" 会误判 Quota（HardCredit 次日 04:00 才恢复探测，真鉴权失败
+    // 被封号一整天且不触发重登标记）；"exceeded" 命中 429 "rate limit exceeded"
+    // 同理把限流误判为额度耗尽
+    if status == 401 {
+        return ClassifiedError::new(UpstreamKind::Auth, "登录态已失效，请重新登录", None);
+    }
+    if status == 429 {
+        return ClassifiedError::new(UpstreamKind::Rate, "请求过于频繁，请稍后重试", None);
+    }
+    // ④ 额度关键词 / 定价页链接（蓝本判定链；401/429 已前置特判，
+    // 此处只兜 403/4xx 正文携带额度语义的形态）
     let quota_signals = [
         "pricingurl",
         "insufficient",
@@ -977,11 +981,8 @@ pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
             pricing,
         );
     }
-    if status == 429 || body.contains("rate limit") || body.contains("too many") {
+    if body.contains("rate limit") || body.contains("too many") {
         return ClassifiedError::new(UpstreamKind::Rate, "请求过于频繁，请稍后重试", None);
-    }
-    if status == 401 {
-        return ClassifiedError::new(UpstreamKind::Auth, "登录态已失效，请重新登录", None);
     }
     if status == 403 {
         // 走到这里没有排队、没有额度特征：按权限问题处理（**不**触发刷凭证）
@@ -994,7 +995,13 @@ pub fn classify_upstream_error(status: u16, text: &str) -> ClassifiedError {
     if status >= 500 {
         return ClassifiedError::new(UpstreamKind::Server, "上游服务异常", None);
     }
-    ClassifiedError::new(UpstreamKind::Unknown, "", None)
+    // 审查 P2：Unknown 兜底不再空文案——错误帧/last_error 面向用户与排障，
+    // 空串信息量为零（400 等无特征错误原样透传状态码）
+    ClassifiedError::new(
+        UpstreamKind::Unknown,
+        format!("上游返回未分类错误（HTTP {status}）"),
+        None,
+    )
 }
 
 /// 排队态面向客户端的文案（说明「不是登录态/额度问题」是关键：写成
@@ -1051,7 +1058,11 @@ pub fn make_qoder_request(
             let retry_after = resp
                 .header("retry-after")
                 .and_then(|v| v.trim().parse::<u64>().ok());
-            let body_text = resp.into_string().unwrap_or_default();
+            // 红线#7：响应体读取失败须带错误标记——吞为空串会让错误分类
+            //（classify_upstream_error）无特征可判，排障信息全失
+            let body_text = resp
+                .into_string()
+                .unwrap_or_else(|e| format!("<响应体读取失败: {e}>"));
             Err((code, body_text, retry_after))
         }
         Err(e) => {
@@ -1114,9 +1125,12 @@ pub fn parse_sse_line(data: &str) -> SseEvent {
                 Some(other) => other.to_string(),
                 None => String::new(),
             };
-            let classified = classify_upstream_error(status as u16, &raw);
+            // 审查 P3：statusCodeValue 是 i64，`as u16` 直接截断会把越界值映射
+            // 进合法状态码区间（如 65937 → 401 误入换号链）；越界一律按 502 网关错
+            let code = if (100..=599).contains(&status) { status as u16 } else { 502 };
+            let classified = classify_upstream_error(code, &raw);
             return SseEvent::Error {
-                status: status as u16,
+                status: code,
                 kind: classified.kind,
                 raw: raw.chars().take(500).collect(),
                 message: classified.message,
@@ -2151,12 +2165,19 @@ pub fn prepare_qoder_body(
     let messages = normalize_messages(&messages_v);
     let tools = normalize_tools(peek.get("tools"));
     let thinking = resolve_thinking(peek, entry);
-    let max_tokens = peek.get("max_tokens").and_then(Value::as_i64);
+    // 审查 P3：OpenAI 新客户端只发 max_completion_tokens（老键已弃用），
+    // 对齐 wb_upstream payload.rs 的键序兼容
+    let max_tokens = peek
+        .get("max_tokens")
+        .or_else(|| peek.get("max_completion_tokens"))
+        .and_then(Value::as_i64);
+    // 审查 P3：session_seed 进上游请求体，超长值放大请求体积——限长 128 字符
+    //（按字符截断，防非 ASCII 字节切片 panic）
     let session_seed = peek
         .get("session_id")
         .and_then(Value::as_str)
         .or_else(|| peek.get("user").and_then(Value::as_str))
-        .map(str::to_string);
+        .map(|s| s.chars().take(128).collect::<String>());
     let body = build_upstream_body(
         model_key,
         &config,
@@ -2575,6 +2596,22 @@ mod tests {
     fn status_429_is_rate() {
         let c = classify_upstream_error(429, "slow down");
         assert!(matches!(c.kind, UpstreamKind::Rate));
+    }
+
+    /// 审查 P1 防回归：401 正文含 "credentials"（泛词 credit 的超串）不得误判
+    /// Quota（HardCredit 封号一整天）——状态码特判须前置于额度泛词链
+    #[test]
+    fn status_401_with_credentials_word_is_auth_not_quota() {
+        let c = classify_upstream_error(401, r#"{"error":"invalid credentials"}"#);
+        assert!(matches!(c.kind, UpstreamKind::Auth), "实际: {:?}", c.kind);
+    }
+
+    /// 审查 P1 防回归：429 正文含 "rate limit exceeded"（泛词 exceeded 命中）
+    /// 不得误判 Quota——限流按 SoftRate 冷却而非封号到次日
+    #[test]
+    fn status_429_with_exceeded_word_is_rate_not_quota() {
+        let c = classify_upstream_error(429, "rate limit exceeded, please retry later");
+        assert!(matches!(c.kind, UpstreamKind::Rate), "实际: {:?}", c.kind);
     }
 
     #[test]

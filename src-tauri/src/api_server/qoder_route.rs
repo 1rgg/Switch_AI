@@ -469,7 +469,11 @@ fn run_qoder_stream(
         .and_then(Value::as_str)
         .or_else(|| peek.get("user").and_then(Value::as_str))
         .unwrap_or("-")
-        .to_string();
+        // 审查 P3：seed 进 sticky 存储做会话匹配，超长值放大留档体积——
+        // 限长 128 字符（与上游请求体 session_seed 同款确定性截断）
+        .chars()
+        .take(128)
+        .collect();
 
     // 首选：粘性 > 调度策略（F-77④：粘性账号 busy 且有空闲候选时让位）
     let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
@@ -511,8 +515,9 @@ fn run_qoder_stream(
                         "qoder", "POST", "/v1/chat/completions", model, true, 503, "none",
                         duration_ms, &key_name, "", Some("no healthy account"),
                     );
+                    // 审查 P3：错误消息面向客户端用户展示，中文化（code 保留机器可读）
                     let _ = tx.blocking_send(Ok(bytes::Bytes::from(
-                        "data: {\"error\":{\"message\":\"no healthy account available\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
+                        "data: {\"error\":{\"message\":\"Qoder 上游暂无可用账号（无健康账号可调度），请检查账号池或稍后重试\",\"type\":\"api_error\",\"code\":\"no_healthy_account\"}}\n\n",
                     )));
                     let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                     return;
@@ -934,7 +939,8 @@ pub async fn qoder_aggregate_chat(
                             0,
                             None,
                         );
-                        return Err("no healthy account available".to_string());
+                        // 审查 P3：错误消息面向客户端用户展示，中文化
+                        return Err("Qoder 上游暂无可用账号（无健康账号可调度），请检查账号池或稍后重试".to_string());
                     }
                 },
             };

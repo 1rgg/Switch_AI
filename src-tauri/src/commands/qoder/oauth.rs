@@ -147,6 +147,10 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<
                             emit_done(&app2, &state2.data_dir, false, "", "", "授权响应校验失败（nonce 不匹配或缺少令牌字段），请重试");
                             return;
                         };
+                        // 导入阶段进度事件（审查 P3）：import_device_creds 含网络请求
+                        //（userinfo/plan 拉取）与 vault 落库，慢网下 30s+ 无事件会被
+                        // 用户当作卡死而反复重试/取消——先报「已授权」再导入
+                        emit_progress(&app2, "importing", "授权成功，正在导入账号凭证…", None);
                         match import_device_creds(&state2, creds, &uid) {
                             Ok((id, nickname)) => {
                                 fs_utils::app_log(&state2.data_dir, &format!("qoder OAuth 登录成功: {id}"));

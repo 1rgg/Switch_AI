@@ -215,6 +215,12 @@ export default function QoderAccounts() {
   // 快照管理目标（审查修复：备份支持 QoderWork 落 profiles_qoder_work，但快照弹框
   // 原先固定读 Qoder IDE——Work 快照无查看/恢复/删除出口，半闭环）
   const [snapTarget, setSnapTarget] = useState<'Qoder' | 'QoderWork'>('Qoder');
+  // profile-done 监听仅注册一次，闭包捕获不到 snapTarget 最新值：
+  // 用 ref 转发，完成回调按「发起备份时的目标」刷新对应槽位列表
+  const snapTargetRef = useRef<'Qoder' | 'QoderWork'>('Qoder');
+  useEffect(() => {
+    snapTargetRef.current = snapTarget;
+  }, [snapTarget]);
 
   const refreshSnapshots = useCallback(async (target: 'Qoder' | 'QoderWork' = 'Qoder') => {
     try {
@@ -279,7 +285,10 @@ export default function QoderAccounts() {
     // 备份/恢复完成（全局 store 亦监听并 toast）：清 busy + 刷新快照列表
     void listen<ProfileDoneEvent>('profile-done', () => {
       setSnapBusy(null);
-      void refreshSnapshots();
+      // 审查修复：无参调用恒刷 Qoder IDE 槽位——目标为 Work 时，Work 完成事件
+      // 却刷新 IDE 列表，后续「恢复」会把 IDE 槽位内容恢复到 Work 目标（快照错位）；
+      // 按 ref 记录的当前目标刷新
+      void refreshSnapshots(snapTargetRef.current);
     }).then((u) => {
       if (disposed) u();
       else unlisten.current.push(u);
@@ -367,13 +376,20 @@ export default function QoderAccounts() {
   };
 
   const importPat = async () => {
-    if (!patValue.trim()) {
+    const token = patValue.trim();
+    if (!token) {
       pushToast('warn', '请粘贴 PAT（pt- 前缀，qoder.com.cn/account/integrations 创建）');
+      return;
+    }
+    // 前缀本地预检（对齐后端 accounts.rs 格式门禁）：pt- = 官方 PAT，jt- = 客户端
+    // job token；其余前缀多为误贴其他平台凭证，提前提示避免无谓请求
+    if (!token.startsWith('pt-') && !token.startsWith('jt-')) {
+      pushToast('warn', '凭证前缀不识别（应为 pt- PAT 或 jt- job token），请检查是否误贴其他平台凭证');
       return;
     }
     setImporting(true);
     try {
-      const v = await api.qoder.accountImportPat(patName.trim() || undefined, patValue.trim());
+      const v = await api.qoder.accountImportPat(patName.trim() || undefined, token);
       pushToast('success', `账号已导入：${v.nickname || v.id}`);
       closeImport();
       void refresh();
@@ -1288,6 +1304,7 @@ export default function QoderAccounts() {
       </Modal>
 
       {/* 含凭证导出二次确认弹框（审查 P0-2；禁 window.confirm，红线）：
+          红色警示框 + 「我已知晓风险」按钮（对齐 Accounts/BuddyAccounts 凭证导出标准）；
           强制设置导出密码（审查 P1-1），凭证以 AES-256-GCM 加密后才写入导出文件 */}
       <Modal
         open={credExportConfirm}
@@ -1299,22 +1316,23 @@ export default function QoderAccounts() {
               取消
             </button>
             <button
-              className="btn-primary"
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
               disabled={exportBusy || !exportPwdReady}
-              title={!exportPwdReady ? '需设置非空密码且两次输入一致' : '加密并导出'}
+              title={!exportPwdReady ? '需设置非空密码且两次输入一致' : '加密后导出凭证'}
               onClick={() => void doExport()}
             >
-              {exportBusy ? '导出中…' : '加密并导出'}
+              {exportBusy ? '导出中…' : '我已知晓风险，加密并导出'}
             </button>
           </>
         }
       >
         <div className="space-y-3 text-sm">
-          <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
+          <div className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-xs text-rose-700 dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300">
             <ShieldAlert size={14} className="mt-0.5 shrink-0" />
             <span>
-              导出文件将包含账号凭证（accessToken / refreshToken / PAT），将以 AES-256-GCM
-              加密后写入：不设置密码无法导出。请牢记密码并妥善保管文件，密码丢失将无法导入。
+              导出文件将包含账号凭证（accessToken / refreshToken / PAT，等同密码），将以
+              AES-256-GCM 加密后写入：不设置密码无法导出。请牢记密码并妥善保管文件，
+              密码丢失将无法导入，且切勿通过不可信渠道传输。
             </span>
           </div>
           <label className="block text-sm">
@@ -1348,7 +1366,12 @@ export default function QoderAccounts() {
       <Modal
         open={importPoolOpen}
         onClose={() => {
-          if (!importingBackup) setImportPoolOpen(false);
+          // 密码等同凭证：X/遮罩关闭同样清理，避免残留且重开预填（对齐取消按钮）
+          if (!importingBackup) {
+            setImportPoolOpen(false);
+            setImportPoolFile(null);
+            setImportPoolPwd('');
+          }
         }}
         title="导入 Qoder 账号池"
         footer={

@@ -66,6 +66,9 @@ fn validate_name(
 
 #[tauri::command]
 pub fn qoder_groups_create(state: State<AppState>, name: String, color: String) -> Result<String, String> {
+    // defs 读改写互斥（审查 P3）：与 update/remove/导入的 defs 写路径互斥防丢更新；
+    // 重名校验的读也须在锁内——否则校验通过的名称仍可能与锁外插入的同名分组冲突
+    let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut defs = load_defs(&state);
     let name = validate_name(&defs, &name, None)?;
     // P3：追加 4 位随机 hex 后缀——timestamp_millis 同毫秒并发可撞 id
@@ -90,6 +93,8 @@ pub fn qoder_groups_update(
     color: Option<String>,
     order: Option<i32>,
 ) -> Result<(), String> {
+    // defs 读改写互斥（审查 P3）：同 create——含重名校验的读也在锁内
+    let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut defs = load_defs(&state);
     // P2 审查修复：name 复用 create 同款校验（trim/非空/重名，重名排除自身 id）；
     // 先校验后可变借用，规避 defs 的 iter_mut 与校验读借用冲突
@@ -128,6 +133,10 @@ pub fn qoder_groups_remove(
         }
         Ok(())
     })?;
+    // defs 读改写互斥（审查 P3）：with_pool_mut 内部已获取并释放同一把锁，std Mutex
+    // 不可重入，故回落与 defs RMW 分两段持锁；窗口内仅存在「回落成功但定义残留」
+    // 可重试态（与函数头注释的最坏情形一致），无悬空引用
+    let _guard = state.qoder_pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut defs = load_defs(&state);
     defs.retain(|g| g.id != id);
     save_defs(&state, &defs)?;
@@ -143,10 +152,13 @@ pub fn qoder_groups_remove(
     Ok(())
 }
 
-/// 移动账号到分组（group_id=None 回落「未分组」）；user_id = 账号 id（qd- 前缀，与 save/remove 同键）
+/// 移动账号到分组（group_id=None 回落「未分组」）；user_id = 账号 id（qd- 前缀，与 save/remove 同键）。
+/// P2 审查修复：联动网关池热重载——api_pool 的 qoder_group_ids 按池内 group_id 过滤，
+/// 服务运行时移动跨组不重载则网关仍按旧组过滤调度（红线 7 缺口，对齐 save/remove 惯例）
 #[tauri::command]
 pub fn qoder_account_move(
     state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
@@ -163,5 +175,7 @@ pub fn qoder_account_move(
             .ok_or_else(|| format!("账号不在池中: {user_id}"))?;
         acct.group_id = group_id.unwrap_or_default();
         Ok(())
-    })
+    })?;
+    crate::commands::api_server::reload_pools_if_running(&state, &runtime);
+    Ok(())
 }

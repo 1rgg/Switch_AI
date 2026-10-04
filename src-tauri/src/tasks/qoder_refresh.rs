@@ -20,6 +20,19 @@ const LAZY_HOURS: i64 = 7;
 
 /// 调度器/CLI 共用入口：全池凭证兜底刷新 + 积分 fresh 拉取
 pub fn run_task(state: &AppState) -> Result<Value, String> {
+    // 跨进程互斥（审查 P1，同 qoder_checkin）：6h 调度 tick 与 schtasks CLI 同刻
+    // 双进程全池刷新，双进程对同账号并发 ensure_fresh 会以同一 refresh_token 刷新
+    //（服务端一次性轮换下后到者误标 needs_relogin）。抢锁失败幂等跳过
+    let _cross = match qoder_common::CrossProcLock::try_acquire(&state.data_dir, "refresh", 3_000) {
+        Some(g) => g,
+        None => {
+            crate::fs_utils::app_log(
+                &state.data_dir,
+                "[qoder] 另一进程正在执行 Qoder 凭证刷新，本轮幂等跳过",
+            );
+            return Ok(json!({ "ok": true, "skipped": "另一进程正在刷新，本轮跳过", "skipped_busy": true }));
+        }
+    };
     let pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
     let accounts: Vec<Value> = pool
         .get("accounts")

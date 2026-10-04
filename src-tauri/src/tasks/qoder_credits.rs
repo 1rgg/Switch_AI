@@ -60,7 +60,9 @@ fn deep_balance_dig(v: &Value, depth: usize) -> Option<f64> {
             for (k, val) in m {
                 let kl = k.to_ascii_lowercase();
                 if (kl.contains("remaining") || kl.contains("balance")) && !kl.contains("total") {
-                    if let Some(n) = num_or_none(Some(val)) {
+                    // 审查 P3：负余额钳 0——服务端脏数据（used>total、负 remaining）
+                    // 不该让看板出现「负积分」（与 quota_pair 推导路径同款守卫）
+                    if let Some(n) = num_or_none(Some(val)).map(|n| n.max(0.0)) {
                         return Some(n);
                     }
                 }
@@ -413,6 +415,10 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
     if changed {
         let _ = crate::store::docs::qoder_pool_save(&db, &pool);
     }
+    // 审查 P3：入口 now_ms 在逐账号网络拉取前取得（多账号可耗数分钟），快照 ts
+    // 与缓存 fetched_at_ms 沿用入口值会让拉取耗时「吃掉」缓存 TTL（10 分钟 TTL
+    // 实际仅剩 7 分钟）；此处影子重取，让快照与缓存 TTL 按完成时刻计
+    let now_ms = chrono::Utc::now().timestamp_millis();
     // 快照落库（同日覆盖 + 365 天裁剪；失败不阻塞返回）。
     // 仅「全量查询且全部成功」落快照：单账号 rows 会覆盖全量快照并污染缓存（过滤失效）；
     // 部分失败时 total_balance 偏低，落快照会污染差分基准且同日覆盖抹掉当日正确快照
@@ -469,6 +475,14 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
 }
 
 /// 每日快照任务（调度器/CLI 共用；fresh 拉取全部账号 + 快照落库，空池自然空转）
+/// 审查 P2：原实现永不返回 Err（fetch_credits 全路径 Ok），当日全部账号失败时
+/// （无缓存 → 空结果；有缓存 → stale 回退行内全 ok、failed 不可见）快照缺失且
+/// 调度器不冷却重试——当日快照点位不可后补，consumed 差分链断一环。现按行失败
+/// 性质分流（对齐 qoder_refresh 口径）：
+/// - 暂态失败（网络/5xx/结构异常；含 stale 回退整轮）→ Err 交调度器 30 分钟
+///   冷却重试（同日 UPSERT 覆盖，重试成功即补落当日快照）；
+/// - 仅永久失败（无凭证/4xx，401 自愈已试过）→ Ok 停止重试（重试无解，
+///   全天 48 次 tick 徒劳 + 误报通知），落日志提示人工处理。
 pub fn run_snapshot_task(state: &AppState) -> Result<Value, String> {
     let pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
     let n = pool.get("accounts").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
@@ -476,10 +490,50 @@ pub fn run_snapshot_task(state: &AppState) -> Result<Value, String> {
         return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号" }));
     }
     let parsed = fetch_credits(state, None, true)?;
-    Ok(json!({
-        "ok": parsed.get("ok").and_then(Value::as_bool).unwrap_or(false),
-        "accounts": n,
-    }))
+    // stale-on-error 缺口（审查修复）：fresh=true 下 cached=true 仅此一路——全部账号
+    // 本轮拉取失败、返回的是历史缓存行（行内全 ok=true，failed 为空），快照未落且
+    // 失败性质不可见。按暂态处理交调度器 30 分钟冷却重试，不能按「完成」记账
+    //（否则 mark_run 固化当日已跑，当日快照静默丢失且无重试）
+    if parsed.get("cached").and_then(Value::as_bool) == Some(true) {
+        return Err(
+            "积分快照本轮全部账号拉取失败（已回退历史缓存），未落当日快照，30 分钟后重试".into(),
+        );
+    }
+    let ok = parsed.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let rows = parsed
+        .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let failed: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r.get("ok").and_then(Value::as_bool) != Some(true))
+        .collect();
+    if failed.is_empty() && ok {
+        return Ok(json!({ "ok": true, "accounts": n }));
+    }
+    // 行级失败性质：http_status ∈ 4xx（401 自愈已试过）或 source=none（无凭证）为
+    // 永久；其余（0 网络不可达 / 5xx / 非 JSON / 结构未识别）为暂态
+    let is_permanent = |r: &Value| {
+        r.get("source").and_then(Value::as_str) == Some("none")
+            || r
+                .get("http_status")
+                .and_then(Value::as_i64)
+                .is_some_and(|s| (400..500).contains(&s))
+    };
+    let permanent = failed.iter().filter(|r| is_permanent(r)).count();
+    let transient = failed.len() - permanent;
+    if transient > 0 {
+        return Err(format!(
+            "积分快照拉取暂态失败 {transient}/{}（永久 {permanent}），未落当日快照，30 分钟后重试",
+            rows.len()
+        ));
+    }
+    crate::fs_utils::app_log(
+        &state.data_dir,
+        &format!("[qoder] 积分快照：{permanent} 个账号凭证永久失效，当日快照未落（需重新登录/更新 PAT）"),
+    );
+    Ok(json!({ "ok": false, "accounts": n, "needs_relogin": permanent }))
 }
 
 #[cfg(test)]

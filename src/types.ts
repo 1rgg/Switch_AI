@@ -1359,6 +1359,25 @@ export interface QoderCheckinRecord {
   campaigns?: { id?: string; name?: string; kind?: string; reward?: number | null }[];
 }
 
+/** qoder-checkin-progress NDJSON 单行：逐账号结果（index 为本轮序号，1 起） */
+export interface QoderCheckinLine {
+  index: number;
+  user_id: string;
+  name: string;
+  status: 'success' | 'already' | 'fail' | 'skip';
+  message?: string;
+  reward?: number;
+}
+
+/** 签到完成汇总（done 事件归约产物） */
+export interface QoderCheckinDone {
+  ok: number;
+  already: number;
+  failed: number;
+  /** failed 中「活动未开始/不可用」的非用户可操作失败数（口径对齐 Rust 侧） */
+  empty: number;
+}
+
 export interface QoderCreditPackage {
   amount: number | null;
   expire_at: string;

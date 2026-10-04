@@ -113,9 +113,10 @@ export default function QoderSettings() {
 
   /** 右上角统一保存（对齐 BuddySettings）：路径 + 时刻 + 快照开关 + 签到行为，一次提交 */
   const save = async () => {
-    // qoder-settings 未加载成功时禁止保存：否则签到开关静默跳过 settingsSet，误报「已保存」
-    if (settingsErr) {
-      pushToast('error', 'qoder-settings 加载失败，签到开关暂不可保存；请点「重新检测」重试');
+    // qoder-settings 未就绪（加载失败或仍在初始加载）时禁止保存：
+    // 否则签到开关静默跳过 settingsSet，误报「配置已保存」而实际开关丢失
+    if (settingsErr || !qoderSettings) {
+      pushToast('error', 'qoder-settings 未就绪，签到开关暂不可保存；请点「重新检测」后重试');
       return;
     }
     if (!isValidHHMM(checkinHhmm)) {
@@ -138,7 +139,7 @@ export default function QoderSettings() {
             qoder_credits_sync_enabled: creditsSyncEnabled,
             qoder_token_renew_enabled: tokenRenewEnabled,
           }),
-          qoderSettings ? api.qoder.settingsSet(qoderSettings) : Promise.resolve(),
+          api.qoder.settingsSet(qoderSettings),
         ]),
         800,
       );
