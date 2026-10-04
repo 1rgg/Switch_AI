@@ -352,6 +352,7 @@ fn main() {
             commands::qoder::qoder_groups_update,
             commands::qoder::qoder_groups_remove,
             commands::qoder::qoder_account_import_pat,
+            commands::qoder::qoder_account_refresh_token,
             commands::qoder::qoder_ide_scan,
             commands::qoder::qoder_cli_status,
             commands::qoder::qoder_live_logins,

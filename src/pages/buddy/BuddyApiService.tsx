@@ -69,15 +69,6 @@ const WB_PARAM_FIELDS: {
   unit: string;
 }[] = [
   {
-    key: 'wbHedgeThresholdMs',
-    label: '竞速对冲阈值',
-    desc: '流式首字节超过该时长即向第二账号发对冲请求，先出首字者胜；0 = 关闭（有效范围 1s–8s，与后端对齐）',
-    min: 0,
-    max: 8_000,
-    step: 500,
-    unit: 'ms',
-  },
-  {
     key: 'wbAccountConcurrencyLimit',
     label: '账号并发上限',
     desc: '单账号在途请求数达到上限即让位其他账号（全部 busy 时取负载最小者）；0 = 不限',
@@ -103,6 +94,15 @@ const WB_PARAM_FIELDS: {
     max: 86_400,
     step: 60,
     unit: '秒',
+  },
+  {
+    key: 'wbHedgeThresholdMs',
+    label: '竞速对冲阈值',
+    desc: '流式首字节超过该时长即向第二账号发对冲请求，先出首字者胜；0 = 关闭（有效范围 1s–8s，与后端对齐）',
+    min: 0,
+    max: 8_000,
+    step: 500,
+    unit: 'ms',
   },
 ];
 

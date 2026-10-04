@@ -62,10 +62,33 @@ type QoderConfirm =
   | { kind: 'delete'; slot: string; name: string }
   | null;
 
+/** 到期时间格式化 + 剩余天数色阶（对齐 BuddyAccounts tokenTone/fmtExpire；秒级时间戳） */
+function fmtExpire(ts: number | null | undefined): string {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  return `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function tokenExpireTone(ts: number | null | undefined): string {
+  if (ts == null) return 'text-slate-400';
+  const days = (ts * 1000 - Date.now()) / 86400000;
+  if (days < 0) return 'text-rose-500';
+  if (days < 1) return 'text-amber-500';
+  return 'text-emerald-600 dark:text-emerald-400';
+}
+
+/** Token 状态：状态徽标 + 到期时间（PAT 长期凭证无过期信息时标注「长期有效」） */
 function TokenBadge({ a }: { a: QoderAccountView }) {
   if (!a.has_credential) return <Badge tone="red">无凭证</Badge>;
-  if (a.needs_relogin) return <Badge tone="red">需重新登录</Badge>;
-  return <Badge tone="green">{a.token_kind === 'pat' ? 'PAT 有效' : '凭证有效'}</Badge>;
+  if (a.needs_relogin) return <Badge tone="red" title={a.relogin_reason}>需重新登录</Badge>;
+  return (
+    <div className="flex flex-col items-start gap-0.5">
+      <Badge tone="green">{a.token_kind === 'pat' ? 'PAT 有效' : 'Token 有效'}</Badge>
+      <span className={`text-[11px] tabular-nums ${tokenExpireTone(a.token_expires_at)}`}>
+        {a.token_expires_at != null ? fmtExpire(a.token_expires_at) : a.token_kind === 'pat' ? '长期有效' : '—'}
+      </span>
+    </div>
+  );
 }
 
 /** 设备指纹徽标（§5.10）：machine_id 前 8 位，点击查看完整指纹 */
@@ -122,6 +145,8 @@ export default function QoderAccounts() {
   const [patName, setPatName] = useState('');
   const [patValue, setPatValue] = useState('');
   const [importing, setImporting] = useState(false);
+  // 行内凭证续期（对照 BuddyAccounts rowOp refresh）：执行中该行按钮 spinner + 禁用
+  const [renewingId, setRenewingId] = useState<string | null>(null);
   // 编辑弹框（改名/备注）
   const [editing, setEditing] = useState<QoderAccountView | null>(null);
   const [editName, setEditName] = useState('');
@@ -450,6 +475,23 @@ export default function QoderAccounts() {
   // 移除账号 / 恢复快照 / 删除快照：先弹确认弹框（禁 window.confirm，红线），确认后由 confirmDestructive 执行
   const removeAccount = (a: QoderAccountView) => {
     setConfirmTarget({ kind: 'remove-account', account: a });
+  };
+
+  // 凭证续期（对照 BuddyAccounts handleRefreshToken）：force 恒刷，成功用返回的最新视图原位更新行
+  const handleRenewToken = async (a: QoderAccountView) => {
+    setRenewingId(a.id);
+    try {
+      const view = await api.qoder.accountRefreshToken(a.id);
+      setAccounts((prev) => prev.map((x) => (x.id === a.id ? view : x)));
+      pushToast('success', `「${a.nickname || a.id}」凭证已续期`);
+    } catch (err) {
+      pushToast('error', `续期失败：${String(err)}`);
+      // 失败也可能已回写 needs_relogin 等状态：静默重取对齐
+      //（不走 refresh()，避免整表 loading 行闪烁）
+      api.qoder.accountsList().then(setAccounts).catch(() => {});
+    } finally {
+      setRenewingId(null);
+    }
   };
 
   const backupSnapshot = async (a: QoderAccountView, targetApp: 'Qoder' | 'QoderWork') => {
@@ -803,7 +845,7 @@ export default function QoderAccounts() {
                   <th className="px-4 py-2 text-left">分组</th>
                   <th className="px-4 py-2 text-left">套餐</th>
                   <th className="px-4 py-2 text-left">凭证来源</th>
-                  <th className="px-4 py-2 text-left">凭证状态</th>
+                  <th className="px-4 py-2 text-left">Token 状态</th>
                   <th className="px-4 py-2 text-left">设备指纹</th>
                   <th className="px-4 py-2 text-right">积分余额</th>
                   <th className="px-4 py-2 text-right">操作</th>
@@ -876,6 +918,14 @@ export default function QoderAccounts() {
                           onClick={(e) => openAppMenu(a, 'save', e)}
                         >
                           {snapBusy === a.id ? <Loader2 size={14} className="animate-spin" /> : <DatabaseBackup size={14} />}
+                        </button>
+                        <button
+                          className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-500/10"
+                          title={renewingId === a.id ? '凭证续期中…' : '凭证续期（PAT 重换作业令牌 / refresh_token 换新 access_token）'}
+                          disabled={renewingId != null || !a.has_credential}
+                          onClick={() => void handleRenewToken(a)}
+                        >
+                          {renewingId === a.id ? <Loader2 size={14} className="animate-spin" /> : <KeyRound size={14} />}
                         </button>
                         <button
                           className="btn-ghost !p-2"

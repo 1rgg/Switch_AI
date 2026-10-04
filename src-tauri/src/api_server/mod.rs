@@ -67,6 +67,9 @@ pub struct ApiSharedState {
     /// 慢请求竞速对冲阈值毫秒（F-76③，0 = 关闭；默认 8000，运行时 clamp 1s–8s）：
     /// 流式首字节超过该阈值且池内有其他健康账号时向第二账号发对冲请求
     pub wb_hedge_threshold_ms: std::sync::atomic::AtomicU64,
+    /// Trae 池慢请求竞速对冲阈值毫秒（0 = 关闭；默认 8000，运行时 clamp 1s–8s），
+    /// 与 Buddy/Qoder 池互不共享
+    pub trae_hedge_threshold_ms: std::sync::atomic::AtomicU64,
     /// 池粘性 TTL 秒（F-76② per-pool，默认 300）：TTL 内同会话必落同一池同账号，
     /// 上游 KV cache 复用直接砍 prefill 时间。三池各自配置，record_sticky 按
     /// 胜出池取对应值（旧版单字段三池共用已拆分）
@@ -628,6 +631,7 @@ mod inflight_tests {
             wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
             wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
             wb_hedge_threshold_ms: AtomicU64::new(0),
+            trae_hedge_threshold_ms: AtomicU64::new(0),
             trae_pool_sticky_ttl_secs: AtomicU64::new(0),
             wb_pool_sticky_ttl_secs: AtomicU64::new(0),
             qoder_pool_sticky_ttl_secs: AtomicU64::new(0),

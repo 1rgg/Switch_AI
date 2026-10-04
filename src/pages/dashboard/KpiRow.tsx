@@ -69,7 +69,13 @@ export default function KpiRow({
       <StatCard
         label="积分包总数"
         value={String(kpi.packages)}
-        hint={platform === 'trae' ? '积分包 + 会员包计数' : '剩余积分包（已用完不计）'}
+        hint={
+          platform === 'trae'
+            ? '积分包 + 会员包计数'
+            : platform === 'qoder'
+              ? '剩余积分包 + Plan 订阅重置 · 已用完不计（与到期日历一致）'
+              : '剩余积分包（已用完不计）'
+        }
         tone="amber"
       />
       <StatCard

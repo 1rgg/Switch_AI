@@ -369,20 +369,25 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
     let expiring = 0;
     for (const a of accs) {
       totalCredits += a.total ?? 0;
-      // 包明细已含 plan 订阅配额包（R-11 逐包口径）→ 独立 Plan 条目不重复计入
-      let hasPlanPkg = false;
+      // 包明细已含 plan 订阅配额包（R-11 逐包口径）→ 独立 Plan 条目不重复计入；
+      // 判定与到期日历同款（some 不过滤 amount）：plan 包已用完也视为「明细已含」
+      const hasPlanPkg = (a.packages ?? []).some((p) => p.source === 'plan');
       for (const p of a.packages ?? []) {
         // 包计数与到期日历对齐：剩余未知或 > 0 计入，已用完不计
         if (p.amount != null && p.amount <= 0) continue;
         packages += 1;
-        if (p.source === 'plan') hasPlanPkg = true;
         const endTs = dateStrToEndTs(p.expire_at);
         if (endTs != null && endTs > nowSec && endTs <= horizon) expiring += p.amount ?? 0;
       }
       // 7 天内到期含 Plan 订阅重置额度：订阅周期在窗口内到期，plan 剩余全额计入
       if (!hasPlanPkg) {
         const planEnd = dateStrToEndTs(a.plan_expires_at);
-        if (planEnd != null && planEnd > nowSec && planEnd <= horizon) expiring += a.plan_credits ?? 0;
+        if (planEnd != null && (a.plan_credits ?? 0) > 0) {
+          // 包计数与到期日历口径对齐：包明细缺 plan 包（明细接口失败/老缓存回退
+          // 聚合口径）时，日历会补一条「Plan 订阅重置」独立条目 → 此处同步 +1
+          packages += 1;
+          if (planEnd > nowSec && planEnd <= horizon) expiring += a.plan_credits ?? 0;
+        }
       }
     }
     // 今日新增：快照 earned（签到合计）优先，回退签到日志 reward 聚合（fetch 未落快照时）

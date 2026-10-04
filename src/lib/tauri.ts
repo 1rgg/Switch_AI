@@ -437,6 +437,9 @@ export const api = {
     /** PAT 手工导入（M1 最可靠凭证通道；qoder.com.cn/account/integrations 自建，pt- 前缀）。pat 后端必填 */
     accountImportPat: (name: string | undefined, pat: string) =>
       invoke<QoderAccountView>('qoder_account_import_pat', { name: name ?? null, pat }),
+    /** 单账号凭证续期（手动按钮，force 恒刷；成功返回续期后的最新账号视图） */
+    accountRefreshToken: (accountId: string) =>
+      invoke<QoderAccountView>('qoder_account_refresh_token', { accountId }),
     /** OAuth 设备流登录（浏览器授权页 + deviceToken/poll 轮询；事件 qoder-oauth-progress/done）。
      *  compat=true = 兼容模式（授权 URL 不带 client_id）：官方 client_id 常量被
      *  Qoder 轮换导致授权页「参数无效」时的降级链路；前端在授权超时后自动切换重试 */
@@ -532,6 +535,8 @@ export const api = {
         traePoolStickyTtlSecs?: number;
         /** Trae 池会话粘性 TTL 秒（显式 conversationId 绑定有效期）；null/未传 = 保留原值 */
         traeStickyTtlSecs?: number;
+        /** Trae 池竞速对冲阈值毫秒（0 = 关闭）；null/未传 = 保留原值 */
+        traeHedgeThresholdMs?: number;
         /** Buddy 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
         wbAccountConcurrencyLimit?: number;
         /** Buddy 池粘性 TTL 秒；null/未传 = 保留原值 */
@@ -579,6 +584,7 @@ export const api = {
         traeAccountConcurrencyLimit: wbFlags?.traeAccountConcurrencyLimit ?? null,
         traePoolStickyTtlSecs: wbFlags?.traePoolStickyTtlSecs ?? null,
         traeStickyTtlSecs: wbFlags?.traeStickyTtlSecs ?? null,
+        traeHedgeThresholdMs: wbFlags?.traeHedgeThresholdMs ?? null,
         wbAccountConcurrencyLimit: wbFlags?.wbAccountConcurrencyLimit ?? null,
         wbPoolStickyTtlSecs: wbFlags?.wbPoolStickyTtlSecs ?? null,
         wbStickyTtlSecs: wbFlags?.wbStickyTtlSecs ?? null,

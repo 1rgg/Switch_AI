@@ -52,6 +52,8 @@ export default function ApiService() {
   const [traeAccountConcurrencyLimit, setTraeAccountConcurrencyLimit] = useState(1);
   const [traePoolStickyTtlSecs, setTraePoolStickyTtlSecs] = useState(300);
   const [traeStickyTtlSecs, setTraeStickyTtlSecs] = useState(1800);
+  // Trae 池竞速对冲阈值毫秒（0 = 关闭；缺省对齐后端 serde default 8s）
+  const [traeHedgeThresholdMs, setTraeHedgeThresholdMs] = useState(8_000);
   // 池文件（api_pool.json）：资源开关与调度参数面板的共用热参数只读透传取值源
   const [poolFile, setPoolFile] = useState<ApiPoolFile | null>(null);
   const [groups, setGroups] = useState<GroupView[]>([]);
@@ -193,10 +195,12 @@ export default function ApiService() {
       setEnabledUids(new Set(pool.enabled_uids));
       setPoolGroups(new Set(pool.group_ids ?? []));
       setTraeEnabled(pool.trae_enabled ?? true);
-      // per-pool 调度参数回显（缺省对齐后端 serde default：并发 1 / 池粘性 300s / 会话粘性 1800s）
+      // per-pool 调度参数回显（缺省对齐后端 serde default：并发 1 / 池粘性 300s /
+      // 会话粘性 1800s / 对冲 8s）
       setTraeAccountConcurrencyLimit(pool.trae_account_concurrency_limit ?? 1);
       setTraePoolStickyTtlSecs(pool.trae_pool_sticky_ttl_secs ?? 300);
       setTraeStickyTtlSecs(pool.trae_sticky_ttl_secs ?? 1800);
+      setTraeHedgeThresholdMs(pool.trae_hedge_threshold_ms ?? 8_000);
     } catch {
       // 初始化加载失败静默保留空列表；手动点击刷新失败需给出提示
       if (manual) toast('error', '加载账号池失败，请重试');
@@ -271,6 +275,7 @@ export default function ApiService() {
           traeAccountConcurrencyLimit: traeAccountConcurrencyLimit,
           traePoolStickyTtlSecs: traePoolStickyTtlSecs,
           traeStickyTtlSecs,
+          traeHedgeThresholdMs,
         }),
       );
       toast('success', `账号池已更新（Trae 池${traeEnabled ? '启用' : '停用'}，服务运行中即时生效）`);
@@ -729,9 +734,33 @@ export default function ApiService() {
                         <span className="text-[11px] text-slate-400">秒</span>
                       </span>
                     </div>
-                    <p className="text-[11px] text-slate-400 dark:text-zinc-500">
-                      仅影响 Trae 池；Buddy / Qoder 池参数在各自「资源调度」页独立配置。
-                    </p>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          竞速对冲阈值
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          流式首字节超过该时长即向第二账号发对冲请求，先出首字者胜；
+                          0 = 关闭（有效范围 1s–8s，与后端对齐）
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={8000}
+                          step={500}
+                          value={traeHedgeThresholdMs}
+                          onChange={(e) =>
+                            setTraeHedgeThresholdMs(
+                              Math.max(0, Math.min(8000, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">ms</span>
+                      </span>
+                    </div>
                   </div>
                 </div>
                 <p className="mt-3 text-xs text-slate-400 dark:text-zinc-500">

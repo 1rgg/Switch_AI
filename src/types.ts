@@ -593,6 +593,8 @@ export interface ApiPoolFile {
   trae_pool_sticky_ttl_secs?: number;
   /** Trae 池显式会话粘性 TTL 秒（per-pool 三参数之一）：显式 conversationId 绑定账号的有效期（默认 1800） */
   trae_sticky_ttl_secs?: number;
+  /** Trae 池慢请求竞速对冲阈值毫秒：流式首字节超阈值时向第二账号发对冲请求，先出首字者胜；0 = 关闭（默认 8000） */
+  trae_hedge_threshold_ms?: number;
   /** Buddy 池显式会话粘性 TTL 秒（F-76②，per-pool 三参数之一） */
   wb_sticky_ttl_secs?: number;
   /** Buddy 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */

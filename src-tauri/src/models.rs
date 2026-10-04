@@ -621,6 +621,11 @@ pub struct ApiPoolFile {
     /// 旧版 Trae 池无显式绑定机制，新增对齐 Buddy/Qoder 能力
     #[serde(default = "default_sticky_ttl_secs")]
     pub trae_sticky_ttl_secs: u64,
+    /// Trae 池慢请求竞速对冲阈值毫秒（F-76③ 同构）：流式首字节超阈值且有其他
+    /// 健康账号时向第二账号发对冲请求，先出首字者胜；0 = 关闭。
+    /// 默认 8000 与 Buddy/Qoder 对冲阈值同默认（运行时 clamp 1s–8s）
+    #[serde(default = "default_hedge_threshold_ms")]
+    pub trae_hedge_threshold_ms: u64,
     /// WB 显式绑定 TTL 秒（F-76②；wb_sticky 会话粘性，per-pool 三参数之一）：
     /// 显式 conversationId 绑定 Buddy 账号的有效期，覆盖原 1800s 常量
     #[serde(default = "default_wb_sticky_ttl_secs")]
@@ -711,6 +716,7 @@ impl Default for ApiPoolFile {
             trae_account_concurrency_limit: default_account_concurrency_limit(),
             trae_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),
             trae_sticky_ttl_secs: default_sticky_ttl_secs(),
+            trae_hedge_threshold_ms: default_hedge_threshold_ms(),
             wb_sticky_ttl_secs: default_wb_sticky_ttl_secs(),
             wb_account_concurrency_limit: default_account_concurrency_limit(),
             wb_pool_sticky_ttl_secs: default_pool_sticky_ttl_secs(),

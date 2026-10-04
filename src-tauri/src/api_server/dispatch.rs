@@ -895,6 +895,7 @@ mod tests {
             wb_bg_downgrade: AtomicBool::new(false),
             wb_longctx_downgrade: AtomicBool::new(false),
             wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            trae_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
             trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),

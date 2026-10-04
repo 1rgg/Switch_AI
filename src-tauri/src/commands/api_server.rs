@@ -253,6 +253,8 @@ pub async fn do_start(
         // F-76/F-77 新开关（api_pool.json，serde default 兼容旧文件）
         wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(pool_file.wb_longctx_downgrade),
         wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(pool_file.wb_hedge_threshold_ms),
+        // Trae 池竞速对冲阈值（F-76③ 同构，per-pool 独立配置）
+        trae_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(pool_file.trae_hedge_threshold_ms),
         // per-pool 三参数：池粘性 TTL 三池各自配置（record_sticky 按胜出池取值）
         trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(
             pool_file.trae_pool_sticky_ttl_secs,
@@ -719,6 +721,8 @@ fn merge_pool_set(
     // 池粘性/会话粘性 TTL；None = 保留原值。旧共用参数 account_concurrency_limit /
     // pool_sticky_ttl_secs 已退役（Trae 池按默认值落地，不沿用旧共享值）
     trae_sticky_ttl_secs: Option<u64>,
+    // Trae 池竞速对冲阈值毫秒（0 = 关闭）；None = 保留原值
+    trae_hedge_threshold_ms: Option<u64>,
     wb_account_concurrency_limit: Option<u32>,
     wb_pool_sticky_ttl_secs: Option<u64>,
     qoder_account_concurrency_limit: Option<u32>,
@@ -776,6 +780,7 @@ fn merge_pool_set(
         trae_pool_sticky_ttl_secs: trae_pool_sticky_ttl_secs
             .unwrap_or(existing.trae_pool_sticky_ttl_secs),
         trae_sticky_ttl_secs: trae_sticky_ttl_secs.unwrap_or(existing.trae_sticky_ttl_secs),
+        trae_hedge_threshold_ms: trae_hedge_threshold_ms.unwrap_or(existing.trae_hedge_threshold_ms),
         wb_sticky_ttl_secs: wb_sticky_ttl_secs.unwrap_or(existing.wb_sticky_ttl_secs),
         wb_account_concurrency_limit: wb_account_concurrency_limit
             .unwrap_or(existing.wb_account_concurrency_limit),
@@ -823,6 +828,8 @@ pub fn pool_set(
     wb_sticky_ttl_secs: Option<u64>,
     // per-pool 三参数拆分（F-76②/F-77，旧共用参数已退役）；None = 保留原值
     trae_sticky_ttl_secs: Option<u64>,
+    // Trae 池竞速对冲阈值毫秒（0 = 关闭）；None = 保留原值
+    trae_hedge_threshold_ms: Option<u64>,
     wb_account_concurrency_limit: Option<u32>,
     wb_pool_sticky_ttl_secs: Option<u64>,
     qoder_account_concurrency_limit: Option<u32>,
@@ -864,6 +871,7 @@ pub fn pool_set(
         trae_pool_sticky_ttl_secs,
         wb_sticky_ttl_secs,
         trae_sticky_ttl_secs,
+        trae_hedge_threshold_ms,
         wb_account_concurrency_limit,
         wb_pool_sticky_ttl_secs,
         qoder_account_concurrency_limit,
@@ -905,6 +913,11 @@ pub fn pool_set(
         rt.shared
             .trae_sticky
             .set_explicit_ttl(pool_file.trae_sticky_ttl_secs as i64);
+        // Trae 池竞速对冲阈值热应用（F-76③ 同构，per-pool 独立配置）
+        rt.shared.trae_hedge_threshold_ms.store(
+            pool_file.trae_hedge_threshold_ms,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         rt.shared.wb_sticky.set_explicit_ttl(pool_file.wb_sticky_ttl_secs as i64);
         rt.shared
             .qoder_sticky
@@ -1580,6 +1593,7 @@ mod pool_merge_tests {
             trae_account_concurrency_limit: 2,
             trae_pool_sticky_ttl_secs: 600,
             trae_sticky_ttl_secs: 2400,
+            trae_hedge_threshold_ms: 5000,
             wb_sticky_ttl_secs: 3600,
             wb_account_concurrency_limit: 2,
             wb_pool_sticky_ttl_secs: 620,
@@ -1603,7 +1617,7 @@ mod pool_merge_tests {
         let m = merge_pool_set(
             &existing(),
             vec!["u2".into()],
-            None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
         );
@@ -1623,6 +1637,7 @@ mod pool_merge_tests {
         assert_eq!(m.trae_account_concurrency_limit, 2);
         assert_eq!(m.trae_pool_sticky_ttl_secs, 600);
         assert_eq!(m.trae_sticky_ttl_secs, 2400);
+        assert_eq!(m.trae_hedge_threshold_ms, 5000);
         assert_eq!(m.wb_sticky_ttl_secs, 3600);
         // per-pool 三参数未传 → 各自保留原值
         assert_eq!(m.wb_account_concurrency_limit, 2);
@@ -1648,7 +1663,7 @@ mod pool_merge_tests {
         let m = merge_pool_set(
             &legacy,
             vec!["1001".into(), "wb-abc".into(), "1002".into(), "wb-def".into()],
-            None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
         );
@@ -1716,8 +1731,9 @@ mod pool_merge_tests {
             None,
             None,
             None,
-            // per-pool 三参数（trae_sticky / wb 并发 / wb 池粘性 / qoder 并发 /
-            // qoder 池粘性 / qoder 会话粘性）未传 → 保留原值
+            // per-pool 三参数 + 对冲阈值（trae_sticky / trae 对冲 / wb 并发 /
+            // wb 池粘性 / qoder 并发 / qoder 池粘性 / qoder 会话粘性）未传 → 保留原值
+            None,
             None,
             None,
             None,
@@ -1803,8 +1819,9 @@ mod pool_merge_tests {
             Some(60),
             Some(120),
             // per-pool 三参数显式传入 → 覆盖（trae 显式粘性 / wb 并发 / wb 池粘性 /
-            // qoder 并发 / qoder 池粘性 / qoder 会话粘性）
+            // qoder 并发 / qoder 池粘性 / qoder 会话粘性）；trae 对冲阈值未传 → 保留
             Some(90),
+            None,
             Some(2),
             Some(240),
             Some(3),
@@ -1833,8 +1850,9 @@ mod pool_merge_tests {
         assert_eq!(m.trae_account_concurrency_limit, 0);
         assert_eq!(m.trae_pool_sticky_ttl_secs, 60);
         assert_eq!(m.wb_sticky_ttl_secs, 120);
-        // per-pool 三参数显式传入 → 覆盖
+        // per-pool 三参数显式传入 → 覆盖；trae 对冲阈值未传 → 保留原值
         assert_eq!(m.trae_sticky_ttl_secs, 90);
+        assert_eq!(m.trae_hedge_threshold_ms, 5000);
         assert_eq!(m.wb_account_concurrency_limit, 2);
         assert_eq!(m.wb_pool_sticky_ttl_secs, 240);
         assert_eq!(m.qoder_account_concurrency_limit, 3);
@@ -1850,7 +1868,7 @@ mod pool_merge_tests {
             vec!["u1".into(), "u3".into()],
             None, None, Some(vec!["g2".into()]), None, None, None, None,
             None, None, None, None, None, None, None, None, None, None, None,
-            None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None,
         );
         assert_eq!(m.enabled_uids.len(), 2);
         assert_eq!(m.group_ids, vec!["g2".to_string()]);
@@ -1866,7 +1884,7 @@ mod pool_merge_tests {
         let m = merge_pool_set(
             &ApiPoolFile::default(),
             vec!["u1".into()],
-            None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None, None, None, None, None,
             None, None, None, None, None, None,
         );
@@ -1881,6 +1899,7 @@ mod pool_merge_tests {
         assert_eq!(m.wb_sticky_ttl_secs, 1800);
         // per-pool 三参数 serde default：三池并发 1 / 池粘性 300s / 显式粘性 1800s
         assert_eq!(m.trae_sticky_ttl_secs, 1800);
+        assert_eq!(m.trae_hedge_threshold_ms, 8000);
         assert_eq!(m.wb_account_concurrency_limit, 1);
         assert_eq!(m.wb_pool_sticky_ttl_secs, 300);
         assert_eq!(m.qoder_account_concurrency_limit, 1);

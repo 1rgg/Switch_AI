@@ -348,3 +348,56 @@ pub async fn qoder_account_import_pat(
     .await
     .map_err(|e| format!("PAT 账号落库任务失败: {e}"))?
 }
+
+/// 单账号凭证续期（手动按钮，对照 workbuddy_refresh_token 同语义）：
+/// force 恒刷（lazy_hours=i64::MAX 走 ensure_fresh 无条件重换路径，PAT 通道重换
+/// 作业令牌、客户端通道 deviceToken/refresh 续期）；每账号互斥由 refresh_lock_for
+/// 兜底（并发触发同账号串行排队，后到者命中「他人已刷新落库」二次检查直接复用）。
+/// 成功回读视图（到期时间/登录态即时刷新）；失败按 ensure_fresh note 分类中文归因。
+#[tauri::command]
+pub async fn qoder_account_refresh_token(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<QoderAccountView, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if load_pool(&st).iter().all(|a| a.id != account_id) {
+            return Err(format!("账号不在池中: {account_id}"));
+        }
+        let agent = crate::tasks::http_agent(30);
+        let (creds, _did, note) = qoder_common::ensure_fresh(&st, &agent, &account_id, i64::MAX);
+        match note {
+            // 成功路径（本次刷新 / 本已新鲜被复用）→ 回读最新视图
+            "refreshed" | "fresh" => {
+                // 续期后回写池到期时间/登录态再回读——ensure_fresh 自身不回写池
+                // （高频惰性路径的开销考量，回写由签到/余额刷新/手动续期等调用方
+                // 负责），缺这步则视图 token_expires_at 停留旧值（PAT 账号恒
+                // 「长期有效」），前端到期时间点续期后不刷新
+                qoder_common::sync_pool_expiry(&st, &account_id, &creds);
+                let accounts = load_pool(&st);
+                let tokens = qoder_common::load_token_store(&st);
+                accounts
+                    .iter()
+                    .find(|a| a.id == account_id)
+                    .map(|a| view_of(a, &tokens))
+                    .ok_or_else(|| "续期后回读失败".to_string())
+            }
+            "no_credential" => Err("该账号无可用凭证，请先导入 PAT 或重新登录".into()),
+            // 暂态失败（网络/服务端抖动）：可重试
+            "refresh_failed" => Err("续期失败：网络或服务端异常，请稍后重试".into()),
+            // 刷新成功但落库失败（refresh_token 一次性轮换，旧 RT 已作废）：
+            // 新凭证仅本轮内存有效，重启后须重新导入/续期——如实告知不谎报成功
+            "refreshed_unsaved" => {
+                Err("续期已执行但落库失败（重启后需重新续期），请检查磁盘空间后重试".into())
+            }
+            "pat_rejected" => Err("续期失败：PAT 已被拒绝，请更新 PAT 后重试".into()),
+            // 永久失败：ensure_fresh 内已回写池 needs_relogin，视图随之展示
+            "expired_needs_relogin" | "auth_dead" => {
+                Err("凭证已失效且无法自动续期，请重新登录客户端或更新 PAT".into())
+            }
+            other => Err(format!("续期未执行（{other}）")),
+        }
+    })
+    .await
+    .map_err(|e| format!("凭证续期任务失败: {e}"))?
+}

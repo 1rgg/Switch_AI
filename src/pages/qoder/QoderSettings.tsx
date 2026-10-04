@@ -332,6 +332,30 @@ export default function QoderSettings() {
             <span className="text-xs text-slate-400">应用内调度器 + Windows 计划任务双轨</span>
           </div>
 
+          {/* Token 定时续期（qoder-refresh 内置调度任务，2026-10-02 从「无 UI 恒开」升级为可配置） */}
+          <div className="flex items-center justify-between">
+            <h3 className="font-medium">Token 定时续期</h3>
+            <span className="text-xs text-slate-400">开关随右上角「保存配置」生效</span>
+          </div>
+          <p className="mb-3 mt-1 text-xs text-slate-400">
+            应用内调度器每 6 小时为全部含刷新凭证的账号自动续期登录凭证（如 JWT Token）；
+            客户端令牌惰性窗 7 小时大于 6 小时调度间隔，过期前必被续上。关闭后凭证仅在
+            实际使用（余额刷新 / 签到 / 网关调用）时惰性刷新。无账号时空转不计失败。
+          </p>
+          <div className="flex flex-wrap items-center gap-4 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <input
+                type="checkbox"
+                checked={tokenRenewEnabled}
+                onChange={(e) => setTokenRenewEnabled(e.target.checked)}
+              />
+              启用
+            </label>
+            <span className="text-xs text-slate-400">内置任务 · 每 6 小时 · 无需注册计划任务</span>
+          </div>
+
+          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
           {/* 每日自动签到（对齐 Buddy「Windows 计划任务」盒子样式） */}
           <div className="rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
             <h3 className="mb-2 font-medium">每日自动签到</h3>
@@ -372,30 +396,6 @@ export default function QoderSettings() {
                 )}
               </div>
             </div>
-          </div>
-
-          <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
-
-          {/* Token 定时续期（qoder-refresh 内置调度任务，2026-10-02 从「无 UI 恒开」升级为可配置） */}
-          <div className="flex items-center justify-between">
-            <h3 className="font-medium">Token 定时续期</h3>
-            <span className="text-xs text-slate-400">开关随右上角「保存配置」生效</span>
-          </div>
-          <p className="mb-3 mt-1 text-xs text-slate-400">
-            应用内调度器每 6 小时为全部含刷新凭证的账号自动续期登录凭证（如 JWT Token）；
-            客户端令牌惰性窗 7 小时大于 6 小时调度间隔，过期前必被续上。关闭后凭证仅在
-            实际使用（余额刷新 / 签到 / 网关调用）时惰性刷新。无账号时空转不计失败。
-          </p>
-          <div className="flex flex-wrap items-center gap-4 rounded-lg border border-slate-100 p-3 dark:border-zinc-800">
-            <label className="flex items-center gap-2 text-sm font-medium">
-              <input
-                type="checkbox"
-                checked={tokenRenewEnabled}
-                onChange={(e) => setTokenRenewEnabled(e.target.checked)}
-              />
-              启用
-            </label>
-            <span className="text-xs text-slate-400">内置任务 · 每 6 小时 · 无需注册计划任务</span>
           </div>
 
           <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
