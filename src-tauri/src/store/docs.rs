@@ -315,6 +315,18 @@ mod tests {
         f.expire_times.insert("u1".into(), 1790000000);
         f.work.insert("u1".into(), 50.0);
         f.total_limit.insert("u2".into(), 2000.0);
+        // 包明细（到期日历包级口径）：含长期有效哨兵；u2 空数组（刷新成功但无可用包）
+        f.packs.insert(
+            "u1".into(),
+            vec![crate::models::CreditPackDetail {
+                kind: "通用".into(),
+                source: "每日签到".into(),
+                remaining: 88.5,
+                total: 100.0,
+                expire_time: 4102444800,
+            }],
+        );
+        f.packs.insert("u2".into(), vec![]);
         f.updated_at = Some("2026-09-15T10:00:00".into());
         remaining_credits_save(&s, &f).unwrap();
         let got = remaining_credits_load(&s);
@@ -323,6 +335,16 @@ mod tests {
         assert_eq!(got.work.get("u1"), Some(&50.0));
         assert_eq!(got.total_limit.get("u2"), Some(&2000.0));
         assert!(got.general.is_empty());
+        let packs = got.packs.get("u1").expect("u1 packs 应有值");
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].kind, "通用");
+        assert_eq!(packs[0].source, "每日签到");
+        assert_eq!(packs[0].remaining, 88.5);
+        assert_eq!(packs[0].total, 100.0);
+        assert_eq!(packs[0].expire_time, 4102444800);
+        // 空数组也是有效状态（区分「无包」与「未刷新」）
+        assert!(got.packs.get("u2").map_or(false, |v| v.is_empty()));
+        assert!(got.packs.get("u3").is_none());
         assert_eq!(got.updated_at.as_deref(), Some("2026-09-15T10:00:00"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -684,6 +706,14 @@ pub fn remaining_credits_load(s: &Store) -> RemainingCreditsFile {
         if let Some(v) = get_i("membership_next_billing") {
             f.membership_next_billing.insert(uid.clone(), v);
         }
+        // 积分包明细（按包口径到期计算用）；解析失败的条目跳过不阻断
+        if let Some(arr) = data.get("packs").and_then(Value::as_array) {
+            let packs: Vec<crate::models::CreditPackDetail> = arr
+                .iter()
+                .filter_map(|p| serde_json::from_value(p.clone()).ok())
+                .collect();
+            f.packs.insert(uid.clone(), packs);
+        }
     }
     f.updated_at = s.kv_get::<Option<String>>("remaining_credits_updated_at");
     f
@@ -710,6 +740,11 @@ pub fn remaining_credits_save(s: &Store, f: &RemainingCreditsFile) -> Result<(),
             }
         }
     }
+    for k in f.packs.keys() {
+        if !uids.iter().any(|u| u == k) {
+            uids.push(k.clone());
+        }
+    }
     let rows: Vec<(String, Value)> = uids
         .into_iter()
         .map(|uid| {
@@ -731,6 +766,10 @@ pub fn remaining_credits_save(s: &Store, f: &RemainingCreditsFile) -> Result<(),
             ins_f(&mut obj, "total_limit", &f.total_limit);
             ins_i(&mut obj, "membership_expire", &f.membership_expire);
             ins_i(&mut obj, "membership_next_billing", &f.membership_next_billing);
+            // 积分包明细：有值才写（含空数组，空 = 刷新成功但无可用包）；老缓存无键 → load 侧无记录回退账号级口径
+            if let Some(v) = f.packs.get(&uid) {
+                obj.insert("packs".into(), json!(v));
+            }
             (uid, Value::Object(obj))
         })
         .collect();

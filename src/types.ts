@@ -83,6 +83,10 @@ export interface AccountView {
   refresh_token_invalid?: boolean;
   /** 凭证最近一次落盘时间（OAuth 登录/导入/刷新成功时更新，F-78 批次 3 收尾） */
   auth_saved_at?: string | null;
+  /** 积分包明细（剩余 > 0 且未过期，按到期时间升序；来自 remaining_credits 缓存）：
+   *  到期日历与「7 天内到期」KPI 按包口径展示/计算；刷新过积分即有值（可为空数组），
+   *  缺省 undefined = 老缓存未刷新过 → 前端回退账号级汇总口径 */
+  credit_packs?: CreditPackDetail[];
 }
 
 // ---- 积分消耗历史（Trae Work query_user_usage_group_by_session，按本地日聚合 + 增量拉取） ----
@@ -200,6 +204,8 @@ export interface CreditPackDetail {
   /** 来源名称（如「每日签到」「每月登录积分」） */
   source: string;
   remaining: number;
+  /** 本周期总额度（credits_limit；到期日历「剩余 X / 总 Y」口径，对齐 Buddy） */
+  total: number;
   /** 过期时间（Unix 秒） */
   expire_time: number;
 }

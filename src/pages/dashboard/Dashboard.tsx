@@ -224,13 +224,25 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
     let expiring = 0;
     for (const a of accounts) {
       totalCredits += a.remaining_credits ?? 0;
-      // 积分包总数：积分包 + 会员包计数（expiryItems 口径）
-      if (a.credits_expire_at != null) packages += 1;
-      if (a.membership_expire != null) packages += 1;
-      // 7 天内到期：按剩余积分额度合计（非包数）；下限 now 排除已过期包
-      if (a.credits_expire_at != null && a.credits_expire_at > nowSec && a.credits_expire_at <= horizon) {
-        expiring += a.remaining_credits ?? 0;
+      // 积分包总数 + 7 天内到期：有包明细 → 包级口径（逐包过滤 + 累计，
+      // 与 Buddy buddyKpi 循环同构）；无明细（老缓存）→ 回退账号级汇总（原实现）
+      if (a.credit_packs != null) {
+        for (const p of a.credit_packs ?? []) {
+          // 包计数与到期日历对齐：remaining > 0 才计（已用完不计，Buddy 同款口径）
+          if (p.remaining <= 0) continue;
+          packages += 1;
+          // 长期有效哨兵（2100-01-01）远大于 horizon 自然排除；下限 now 排除已过期包
+          if (p.expire_time > nowSec && p.expire_time <= horizon) {
+            expiring += p.remaining;
+          }
+        }
+      } else if (a.credits_expire_at != null) {
+        packages += 1;
+        if (a.credits_expire_at > nowSec && a.credits_expire_at <= horizon) {
+          expiring += a.remaining_credits ?? 0;
+        }
       }
+      if (a.membership_expire != null) packages += 1;
     }
     // 今日新增：快照 earned 优先（积分包 CycleStartTime 归日口径），回退签到 history delta
     const snap = creditsDaily.find((s) => s.date === today);
