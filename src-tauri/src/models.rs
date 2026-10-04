@@ -60,8 +60,10 @@ pub struct AccountView {
     pub jwt_uid: Option<String>,
     /// 积分包明细（仅剩余 > 0 且未过期，按到期时间升序；来自 remaining_credits.json 缓存）：
     /// 到期日历与「7 天内到期」KPI 按包口径展示/计算（对齐 Buddy packages[]）；
-    /// 刷新过积分即有值，无包/全用完为空数组，老缓存缺省 → 前端回退账号级汇总口径
-    #[serde(default)]
+    /// 刷新过积分即有值，无包/全用完为空数组，老缓存缺省 → 前端回退账号级汇总口径。
+    /// 序列化时空数组同样缺省（前端 `!= null` 判定回退）：无可用包时 credits_expire_at
+    /// 必为空（earliest_expire 仅统计剩余 > 0 的包），回退分支不会虚增展示，两条路径等价
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credit_packs: Vec<CreditPackDetail>,
 }
 
