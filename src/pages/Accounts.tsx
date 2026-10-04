@@ -507,18 +507,30 @@ export default function Accounts() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex justify-end gap-1">
-                        <button title="编辑账号" onClick={() => setEditTarget(a)} className="btn-ghost !p-2">
-                          <Pencil size={14} />
-                        </button>
-                        {a.cooldown_type && (
+                        <div className="relative flex items-center">
                           <button
-                            title="解除冷却"
-                            onClick={() => void cooldownClear(a.user_id)}
-                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
+                            title={switchingTo ? (switchingTo === a.user_id ? '切换中…' : '正在切换其他账号') : '切换此账号（选择目标应用）'}
+                            onClick={(e) => {
+                              const r = e.currentTarget.getBoundingClientRect();
+                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'switch' ? null : { userId: a.user_id, kind: 'switch', x: r.right, y: r.bottom });
+                            }}
+                            disabled={busy}
+                            className={`btn-ghost !p-2 ${switchingTo === a.user_id ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${(switchingTo && switchingTo !== a.user_id) || savingLogin ? 'opacity-40 cursor-not-allowed' : ''}`}
                           >
-                            <Snowflake size={14} />
+                            {switchingTo === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
                           </button>
-                        )}
+                          <button
+                            title={savingLogin ? (savingLogin === a.user_id ? '保存中…' : '正在保存其他账号') : '保存当前登录态（选择目标应用）'}
+                            onClick={(e) => {
+                              const r = e.currentTarget.getBoundingClientRect();
+                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'save' ? null : { userId: a.user_id, kind: 'save', x: r.right, y: r.bottom });
+                            }}
+                            disabled={busy}
+                            className={`btn-ghost !p-2 ${savingLogin === a.user_id ? 'text-amber-500' : ''} ${(savingLogin && savingLogin !== a.user_id) || switchingTo ? 'opacity-40 cursor-not-allowed' : ''}`}
+                          >
+                            {savingLogin === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                          </button>
+                        </div>
                         {/* SessionDead（JWT 被服务端吊销）时 exp 往往未到，必须常显续期入口，
                             否则与签到/切换失败的「点续期 JWT」指引断链（issue #9 审查项） */}
                         {(a.jwt_exp_hours === null || a.jwt_exp_hours <= 24 || a.cooldown_type === 'SessionDead') && (
@@ -540,30 +552,15 @@ export default function Accounts() {
                             <Zap size={14} />
                           </button>
                         )}
-                        <div className="relative flex items-center">
+                        {a.cooldown_type && (
                           <button
-                            title={switchingTo ? (switchingTo === a.user_id ? '切换中…' : '正在切换其他账号') : '切换此账号（选择目标应用）'}
-                            onClick={(e) => {
-                              const r = e.currentTarget.getBoundingClientRect();
-                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'switch' ? null : { userId: a.user_id, kind: 'switch', x: r.right, y: r.bottom });
-                            }}
-                            disabled={busy}
-                            className={`btn-ghost !p-2 ${switchingTo === a.user_id ? 'text-amber-500' : ''} ${(switchingTo && switchingTo !== a.user_id) || savingLogin ? 'opacity-40 cursor-not-allowed' : ''}`}
+                            title="解除冷却"
+                            onClick={() => void cooldownClear(a.user_id)}
+                            className="btn-ghost !p-2 text-sky-500 hover:bg-sky-50 dark:hover:bg-sky-500/10"
                           >
-                            {switchingTo === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
+                            <Snowflake size={14} />
                           </button>
-                          <button
-                            title={savingLogin ? (savingLogin === a.user_id ? '保存中…' : '正在保存其他账号') : '保存当前登录态（选择目标应用）'}
-                            onClick={(e) => {
-                              const r = e.currentTarget.getBoundingClientRect();
-                              setAppMenu(appMenu?.userId === a.user_id && appMenu.kind === 'save' ? null : { userId: a.user_id, kind: 'save', x: r.right, y: r.bottom });
-                            }}
-                            disabled={busy}
-                            className={`btn-ghost !p-2 ${savingLogin === a.user_id ? 'text-amber-500' : ''} ${(savingLogin && savingLogin !== a.user_id) || switchingTo ? 'opacity-40 cursor-not-allowed' : ''}`}
-                          >
-                            {savingLogin === a.user_id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
-                          </button>
-                        </div>
+                        )}
                         <button
                           title={switchingTo || savingLogin ? '切换/保存进行中，暂不能重置' : '重置设备 ID'}
                           onClick={() => void resetDevice(a.user_id)}
@@ -571,6 +568,9 @@ export default function Accounts() {
                           className="btn-ghost !p-2 disabled:cursor-not-allowed disabled:opacity-40"
                         >
                           <RotateCcw size={14} />
+                        </button>
+                        <button title="编辑账号" onClick={() => setEditTarget(a)} className="btn-ghost !p-2">
+                          <Pencil size={14} />
                         </button>
                         <button title="删除" onClick={() => void onDelete(a)} className="btn-ghost !p-2 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-500/10">
                           <Trash2 size={14} />

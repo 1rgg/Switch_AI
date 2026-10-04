@@ -850,7 +850,7 @@ export default function ApiService() {
                     <th className="pb-2 pr-3 font-medium">模型 ID</th>
                     <th className="pb-2 pr-3 font-medium">展示名</th>
                     <th className="pb-2 pr-3 font-medium">厂商</th>
-                    <th className="pb-2 pr-3 text-right font-medium">积分倍率</th>
+                    <th className="pb-2 pr-3 text-right font-medium">倍率</th>
                     <th className="pb-2 pr-3 font-medium">思考档位</th>
                     <th className="pb-2 pr-3 text-right font-medium">上下文</th>
                     <th className="pb-2 pr-3 text-center font-medium">图片</th>
@@ -864,6 +864,14 @@ export default function ApiService() {
                       className="border-b border-slate-100 last:border-0 dark:border-zinc-800"
                     >
                       <td className="py-2 pr-3 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
+                        {m.max_mode && (
+                          <span
+                            className="mr-1 inline-block rounded bg-brand-50 px-1 text-[10px] font-bold leading-4 text-brand-700 dark:bg-brand-500/15 dark:text-brand-300"
+                            title="支持 Max Mode（1M 上下文）"
+                          >
+                            Max
+                          </span>
+                        )}
                         {m.id}
                       </td>
                       <td className="py-2 pr-3 text-slate-600 dark:text-zinc-300">
@@ -901,11 +909,11 @@ export default function ApiService() {
                       </td>
                       <td className="py-2 text-right">
                         <button
-                          className="btn-ghost inline-flex items-center gap-1 text-xs"
+                          className="btn-ghost !p-2"
+                          title="编辑模型元数据"
                           onClick={() => void openEdit(m)}
                         >
-                          <Pencil size={12} />
-                          编辑
+                          <Pencil size={14} />
                         </button>
                       </td>
                     </tr>

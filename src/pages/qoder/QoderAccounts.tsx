@@ -5,7 +5,7 @@ import {
   AppWindow,
   Archive,
   ArchiveRestore,
-  DatabaseBackup,
+  Save,
   Download,
   ExternalLink,
   Fingerprint,
@@ -904,7 +904,7 @@ export default function QoderAccounts() {
                     <td className="px-4 py-3 text-right">
                       <div className="flex justify-end gap-1">
                         <button
-                          className="btn-ghost !p-2 text-emerald-600"
+                          className={`btn-ghost !p-2 ${switchingTo === a.id ? 'text-amber-500' : 'text-emerald-600 dark:text-emerald-400'} ${busy && switchingTo !== a.id ? 'opacity-40 cursor-not-allowed' : ''}`}
                           title="切换此账号到…（Qoder Work / Qoder IDE 双目标）"
                           disabled={busy}
                           onClick={(e) => openAppMenu(a, 'switch', e)}
@@ -912,12 +912,12 @@ export default function QoderAccounts() {
                           {switchingTo === a.id ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
                         </button>
                         <button
-                          className="btn-ghost !p-2"
+                          className={`btn-ghost !p-2 ${snapBusy === a.id ? 'text-amber-500' : ''} ${(snapBusy != null || busy) && snapBusy !== a.id ? 'opacity-40 cursor-not-allowed' : ''}`}
                           title="保存当前登录态到该账号槽位（Qoder Work / Qoder IDE 双目标）"
                           disabled={snapBusy != null || busy}
                           onClick={(e) => openAppMenu(a, 'save', e)}
                         >
-                          {snapBusy === a.id ? <Loader2 size={14} className="animate-spin" /> : <DatabaseBackup size={14} />}
+                          {snapBusy === a.id ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
                         </button>
                         <button
                           className="btn-ghost !p-2 text-amber-500 hover:bg-amber-50 dark:hover:bg-amber-500/10"
@@ -939,7 +939,7 @@ export default function QoderAccounts() {
                           <Pencil size={14} />
                         </button>
                         <button
-                          className="btn-ghost !p-2 text-rose-500"
+                          className="btn-ghost !p-2 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-500/10"
                           title="移除账号"
                           onClick={() => removeAccount(a)}
                         >

@@ -105,13 +105,18 @@ export default function ExpiryTab({
         }
         // 最近到期含 Plan 订阅周期（到期即重置；仅剩余额度 > 0 计入，与到期日历一致）
         const planEnd = dateStrToEndTs(a.plan_expires_at);
+        // 包数与到期日历/KPI 口径对齐：明细缺 plan 包（逐包接口回退聚合口径）时，
+        // 日历会补一条「Plan 订阅重置」条目 → 此处同步 +1，避免日历 2 条/明细行显示 1
+        const hasPlanPkg = (a.packages ?? []).some((p) => p.source === 'plan');
+        const pkgCount =
+          activePkgs.length + (!hasPlanPkg && planEnd != null && (a.plan_credits ?? 0) > 0 ? 1 : 0);
         if (planEnd != null && (a.plan_credits ?? 0) > 0) expires.push(planEnd);
         out.push({
           key: `qoder-${a.user_id}`,
           platform: 'Qoder',
           name: a.name,
           balance: a.total,
-          packages: activePkgs.length,
+          packages: pkgCount,
           nearestExpire: expires.length > 0 ? Math.min(...expires) : null,
           ok: a.ok,
           status: a.ok ? '正常' : a.message || '查询失败',
