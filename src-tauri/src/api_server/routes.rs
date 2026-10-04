@@ -20,6 +20,7 @@ use super::usage::{extract_tokens, KeyId};
 use super::wb_catalog;
 use super::wb_model_route;
 use super::wb_route;
+use super::wb_sticky::SessionKey;
 use super::{classify_error, classify_solo_error, streaming_agent, ApiSharedState, ErrKind,
             InflightGuard,
             AGENT_HOST, APP_ID, EP_LLM_CHAT, IDE_VERSION, IDE_VERSION_CODE, REFERER_BASE};
@@ -1444,6 +1445,41 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             // Responses 仅走 WB 上游；solo 管线不会收到，兜底给 resp_ id
             Protocol::Responses => format!("resp_{}", now_ts()),
         };
+        // 会话→账号粘性（per-pool 三参数批次，对齐 Buddy/Qoder）：显式
+        // conversationId / 消息指纹命中且账号健康 → 首选粘住账号（上游 KV cache
+        // 复用；busy 且有空闲候选时让位，F-77④ 同构）。子 Key 限定上游不含
+        // 粘性账号时忽略粘性
+        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or_else(|_| json!({}));
+        let sticky_key = SessionKey::from_body(&peek);
+        // 空指纹（无 messages / 无 conversation_id）不可粘
+        let sticky_usable = !sticky_key.cache_key().ends_with(':');
+        let sticky0: Option<String> = if sticky_usable {
+            state
+                .trae_sticky
+                .resolve(&sticky_key, now_ts() as i64)
+                .and_then(|b| {
+                    if trae_allowed.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
+                        return None;
+                    }
+                    state.pool.pick_by_uid(&b.uid).map(|_| b.uid)
+                })
+        } else {
+            None
+        };
+        // 首选：粘性 > 调度策略；绑定回写用会话键占位 conv_id（Trae 上游无
+        // 会话 id 复用语义，仅落库留档满足非空校验）
+        let sticky_conv = sticky_key.cache_key();
+        let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
+            state
+                .pool
+                .pick_sticky_yield(u, trae_allowed.as_ref())
+                .map(|(p, ev)| {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                })
+        });
         let mut tried = HashSet::new();
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
@@ -1457,12 +1493,17 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             if tx.is_closed() {
                 return;
             }
-            let mut picked = match state
-                .pool
-                .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
-            {
+            // 取号：粘性命中优先（每请求仅首轮），否则按 Key 约束 + 调度策略；
+            // 换号重试后仅走策略
+            let mut picked = match first_pick.take() {
                 Some(p) => p,
-                None => break,
+                None => match state
+                    .pool
+                    .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
+                {
+                    Some(p) => p,
+                    None => break,
+                },
             };
             tried.insert(picked.uid.clone());
             // F-77 账号级在途计数：取号即绑定（换号时 bind_account 自动解绑旧账号）
@@ -1600,6 +1641,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             }
                         } else {
                             state.pool.note_success(&picked.uid);
+                            // 绑定会话→账号粘性（仅 clean success；save 1s 节流）
+                            if sticky_usable {
+                                state.trae_sticky.bind(&sticky_key, &picked.uid, &sticky_conv, now_ts() as i64);
+                                state.trae_sticky.save(&state.data_dir);
+                            }
                             state.logger.log_request_ttfb(
                                 "trae", "POST", proto.log_path(), &model, stream,
                                 200, &picked.uid, duration_ms, ttfb_ms, &key_name,
@@ -1821,6 +1867,39 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let mut guard = guard;
         // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
         let key_name = super::api_keys::key_name_for(&state.data_dir, &key_id);
+        // 会话→账号粘性（per-pool 三参数批次，与流式路径同构）：显式
+        // conversationId / 消息指纹命中且账号健康 → 首选粘住账号；子 Key 限定
+        // 上游不含粘性账号时忽略粘性
+        let peek: Value = serde_json::from_slice(&body_vec).unwrap_or_else(|_| json!({}));
+        let sticky_key = SessionKey::from_body(&peek);
+        // 空指纹（无 messages / 无 conversation_id）不可粘
+        let sticky_usable = !sticky_key.cache_key().ends_with(':');
+        let sticky0: Option<String> = if sticky_usable {
+            state
+                .trae_sticky
+                .resolve(&sticky_key, now_ts() as i64)
+                .and_then(|b| {
+                    if trae_allowed.as_ref().is_some_and(|a| !a.contains(&b.uid)) {
+                        return None;
+                    }
+                    state.pool.pick_by_uid(&b.uid).map(|_| b.uid)
+                })
+        } else {
+            None
+        };
+        // 首选：粘性 > 调度策略；绑定回写用会话键占位 conv_id（仅落库留档）
+        let sticky_conv = sticky_key.cache_key();
+        let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
+            state
+                .pool
+                .pick_sticky_yield(u, trae_allowed.as_ref())
+                .map(|(p, ev)| {
+                    if let Some(ev) = ev {
+                        state.logger.log_sched_event(&ev);
+                    }
+                    p
+                })
+        });
         let mut tried = HashSet::new();
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
@@ -1830,12 +1909,17 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let templates = super::wb_route::load_templates(&state);
 
         for _ in 0..MAX_ROTATE {
-            let mut picked = match state
-                .pool
-                .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
-            {
+            // 取号：粘性命中优先（每请求仅首轮），否则按 Key 约束 + 调度策略；
+            // 换号重试后仅走策略
+            let mut picked = match first_pick.take() {
                 Some(p) => p,
-                None => break,
+                None => match state
+                    .pool
+                    .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
+                {
+                    Some(p) => p,
+                    None => break,
+                },
             };
             tried.insert(picked.uid.clone());
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
@@ -1893,6 +1977,11 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                     duration_ms, pt, ct,
                                 );
                                 state.pool.note_success(&picked.uid);
+                                // 绑定会话→账号粘性（仅 clean success；save 1s 节流）
+                                if sticky_usable {
+                                    state.trae_sticky.bind(&sticky_key, &picked.uid, &sticky_conv, now_ts() as i64);
+                                    state.trae_sticky.save(&state.data_dir);
+                                }
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     200, &picked.uid, duration_ms, &key_name,
@@ -2407,8 +2496,9 @@ mod tests {
             wb_bg_downgrade: std::sync::atomic::AtomicBool::new(false),
             wb_longctx_downgrade: std::sync::atomic::AtomicBool::new(false),
             wb_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
-            account_concurrency_limit: std::sync::atomic::AtomicU32::new(0),
-            pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            trae_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            wb_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
+            qoder_pool_sticky_ttl_secs: std::sync::atomic::AtomicU64::new(300),
             wb_sticky: super::super::wb_sticky::StickyStore::default(),
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             default_model: "deepseek-v4-flash".into(),
@@ -2432,6 +2522,7 @@ mod tests {
             qoder_hedge_threshold_ms: std::sync::atomic::AtomicU64::new(0),
             qoder_sticky_enabled: std::sync::atomic::AtomicBool::new(false),
             qoder_sticky: super::super::wb_sticky::StickyStore::default(),
+            trae_sticky: super::super::wb_sticky::StickyStore::default(),
         });
         WlFixture { dir, state }
     }

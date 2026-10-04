@@ -387,8 +387,9 @@ fn fatal_line(msg: &str) -> String {
 /// - icube：命令层预探测优先（Qoder 保存链 vscdb secret://userInfo 解密传入，唯一
 ///   可靠源）；空则日志探测回退——仅 TraeWork/Trae（Qoder 池 id 为 qd-<hex> 形态，
 ///   与日志数字 uid 永不相等，回退会把「格式不同」误判为「登录了别的账号」恒拒保存）
-/// - electron_root（QoderWork）：预探测（客户端 Cookies qoderuid 解密）非空才校验；
-///   空（未登录/Cookie 缺失/解密失败）= fail-open 放行
+/// - electron_root（QoderWork）：预探测（命令层 live_work_account_id 解密 auth.v1.dat
+///   user.id；2026-10-04 实测修正——Cookies 库无 qoderuid cookie，原探测恒空守卫失效）
+///   非空才校验；空（未登录/文件缺失/解密失败）= fail-open 放行
 /// - 其余布局（chromium/authfile）无 icube 型身份防线，直接放行
 fn save_identity_guard(
     sess: &mut Session,

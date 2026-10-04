@@ -15,6 +15,7 @@ import {
 import PageHeader from '../../components/PageHeader';
 import { Spinner, StatCard, Badge } from '../../components/ui';
 import { api } from '../../lib/tauri';
+import { dateStrToEndTs } from '../../lib/format';
 import { useAppStore } from '../../store';
 import { useIsDark } from '../../lib/useIsDark';
 import type {
@@ -158,8 +159,32 @@ export default function QoderOverview() {
       .map((a) => a.id),
   );
   const reloginSet = new Set(accounts.filter((a) => a.needs_relogin).map((a) => a.id));
-  // 并集去重：同一账号可能既 token 临期又需重登，相加会重复计数
-  const alertCount = new Set([...tokenSoonSet, ...reloginSet]).size;
+  // 凭证类告警并集去重：同一账号可能既 token 临期又需重登，相加会重复计数
+  const credAlertSet = new Set([...tokenSoonSet, ...reloginSet]);
+  // 积分 7 天内到期账号数（口径对齐到期日历 ExpiryTab：剩余未知或 > 0 的包计入，
+  // 无 plan 包明细回退 plan_expires_at 兜底；plan 包随订阅周期重置同样计入）
+  const windowEnd = nowSec + 7 * 86400;
+  const creditsSoonSet = new Set(
+    (credits?.accounts ?? [])
+      .filter((a) => {
+        if (!a.ok) return false;
+        const pkgs = (a.packages ?? []).filter((p) => p.amount == null || p.amount > 0);
+        const pkgSoon = pkgs.some((p) => {
+          const end = dateStrToEndTs(p.expire_at);
+          return end != null && end <= windowEnd;
+        });
+        if (pkgSoon) return true;
+        // 老缓存无包明细时回退聚合口径：plan 剩余 > 0 且订阅周期 7 天内到期
+        const hasPlanPkg = pkgs.some((p) => p.source === 'plan');
+        if (hasPlanPkg || !(a.plan_credits ?? 0)) return false;
+        const planEnd = dateStrToEndTs(a.plan_expires_at);
+        return planEnd != null && planEnd <= windowEnd;
+      })
+      .map((a) => a.user_id),
+  );
+  // 告警账号数 = 凭证类 ∪ 积分到期类并集去重（P3 审查修复：同账号可能跨类别
+  // 双计；hint 分项计数保持独立展示，主数值口径为「去重后的告警账号数」）
+  const alertCount = new Set([...credAlertSet, ...creditsSoonSet]).size;
 
   // 积分榜 Top（按余额降序，对齐 Buddy 概述）
   const top = useMemo(
@@ -271,13 +296,13 @@ export default function QoderOverview() {
         <StatCard
           label="本机套餐"
           value={loginPlan ?? '—'}
-          hint={loginPlan ? '当前登录账号的套餐（userinfo 口径）' : '套餐随登录账号变化'}
+          hint={loginPlan ? '当前登录账号的套餐' : '套餐随登录账号变化'}
           tone="violet"
         />
         <StatCard
           label="告警提醒"
           value={alertCount}
-          hint={`Token 24h 内过期 ${tokenSoonSet.size} · 需重新登录 ${reloginSet.size}`}
+          hint={`Token 24h 内过期 ${tokenSoonSet.size} · 需重新登录 ${reloginSet.size} · 积分 7 天内到期 ${creditsSoonSet.size}`}
           tone={alertCount > 0 ? 'red' : 'slate'}
         />
       </div>

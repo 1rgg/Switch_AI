@@ -354,6 +354,7 @@ fn main() {
             commands::qoder::qoder_account_import_pat,
             commands::qoder::qoder_ide_scan,
             commands::qoder::qoder_cli_status,
+            commands::qoder::qoder_live_logins,
             commands::qoder::qoder_checkin_start,
             commands::qoder::qoder_checkin_results,
             commands::qoder::qoder_checkin_task_register,

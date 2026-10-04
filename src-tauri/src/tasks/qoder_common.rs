@@ -25,6 +25,10 @@ use crate::state::AppState;
 /// OpenAPI 基址（CN 域；端点常量集中可改，R-7 主备域探测位预留）
 pub const OPEN_API_BASE: &str = "https://openapi.qoder.com.cn";
 
+/// 官网 Web 域（R-11 抓包 2026-10-04：账户页 `/api/v2/me/usages/big_model_credits`
+/// 端点在此域，Bearer 鉴权与 openapi 同源；openapi 主机无该路由——实测 alb 503）
+pub const WEB_BASE: &str = "https://qoder.cn";
+
 /// `Cosy-ClientType` 真实值（R-4 已闭合：2026-09-27 抓包实测主进程恒带 `cosy-clienttype: 10`）
 pub const COSY_CLIENT_TYPE: &str = "10";
 
@@ -1050,17 +1054,51 @@ pub struct CrossProcLock {
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
+/// 跨进程锁获取失败原因（可观测：创建失败 ≠ 真被占用——2026-10-04 排查教训：
+/// 锁名误用多段路径时 CreateMutexW 恒报 ERROR_PATH_NOT_FOUND(3)，旧实现一律
+/// 误报「另一进程正在执行」，调度器每分钟空转 skip 且刷新永不执行）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossProcLockFail {
+    /// CreateMutexW 失败（内核错误码）——锁机制本身不可用，非他方占用
+    CreateFailed(u32),
+    /// 对方持有中，等待 wait_ms 超时——真占用，幂等跳过无损失
+    Busy,
+    /// WaitForSingleObject 系统级失败（内核错误码）
+    WaitFailed(u32),
+}
+
+impl CrossProcLockFail {
+    /// 人类可读描述（调用方拼进 skip 日志，便于一眼区分误报与真占用）
+    pub fn describe(&self) -> String {
+        match self {
+            Self::CreateFailed(e) => format!("锁创建失败（Win32 err={e}，非他方占用）"),
+            Self::Busy => "他方进程持有中（等待超时）".to_string(),
+            Self::WaitFailed(e) => format!("锁等待系统失败（Win32 err={e}）"),
+        }
+    }
+}
+
 #[cfg(windows)]
 impl CrossProcLock {
-    /// 尝试在 wait_ms 内获取命名互斥体；被占/失败返回 None（调用方幂等跳过）
-    pub fn try_acquire(data_dir: &std::path::Path, scope: &str, wait_ms: u32) -> Option<Self> {
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
+    /// 尝试在 wait_ms 内获取命名互斥体；成功返回 Some(guard)，失败返回
+    /// None + 具体原因（调用方按原因落日志：Busy 幂等跳过，CreateFailed 需人工排查）
+    pub fn try_acquire(
+        data_dir: &std::path::Path,
+        scope: &str,
+        wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
         use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
-        // 锁名含 data_dir 短哈希：AIWORKDATA_DIR 指向不同目录的实例互不干扰
+        // 锁名含 data_dir 短哈希：AIWORKDATA_DIR 指向不同目录的实例互不干扰。
+        // ⚠️ 必须单段名（点分隔）：内核对象命名空间下 `\BaseNamedObjects` 不存在
+        // 中间对象目录，多段名 `Global\a\b\c` 直接 STATUS_OBJECT_PATH_NOT_FOUND
+        //（Win32 err=3）——2026-10-04 实测复现，曾致锁自合入起从未获取成功
         let mut h = Sha256::new();
         h.update(data_dir.to_string_lossy().as_bytes());
         let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        let name: Vec<u16> = format!("Global\\AIWorkAssistant\\qoder\\{scope}\\{}", &hex[..16])
+        let name: Vec<u16> = format!("Global\\AIWorkAssistant.qoder.{scope}.{}", &hex[..16])
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -1068,17 +1106,25 @@ impl CrossProcLock {
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         // HANDLE 为 *mut c_void：null 即创建失败
         if handle.is_null() {
-            return None;
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return (None, Some(CrossProcLockFail::CreateFailed(err)));
         }
         // SAFETY：handle 由 CreateMutexW 返回且非 null
         let waited = unsafe { WaitForSingleObject(handle, wait_ms) };
         if waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED {
             // WAIT_ABANDONED：前持有进程崩溃退出，所有权已转移给本进程——正常获取
-            Some(Self { handle })
+            (Some(Self { handle }), None)
         } else {
             // WAIT_TIMEOUT（对方持有中）/WAIT_FAILED：释放句柄后放弃
+            let fail = if waited == WAIT_TIMEOUT {
+                CrossProcLockFail::Busy
+            } else {
+                CrossProcLockFail::WaitFailed(unsafe {
+                    windows_sys::Win32::Foundation::GetLastError()
+                })
+            };
             unsafe { CloseHandle(handle) };
-            None
+            (None, Some(fail))
         }
     }
 }
@@ -1086,6 +1132,11 @@ impl CrossProcLock {
 #[cfg(windows)]
 impl Drop for CrossProcLock {
     fn drop(&mut self) {
+        // SAFETY：wait 成功（OBJECT_0/ABANDONED）即本线程拥有所有权，ReleaseMutex
+        // 释放之。仅 CloseHandle 不 Release 时：若他方进程尚持打开句柄（等待中），
+        // 互斥体对象不销毁且所有权仍挂在（可能长期存活的）本线程上——后续竞争者
+        // 全部超时假 busy 直到本线程退出
+        unsafe { windows_sys::Win32::System::Threading::ReleaseMutex(self.handle) };
         // SAFETY：handle 来自 CreateMutexW 且未被关闭；CloseHandle 释放所有权
         //（Mutex 对象在所有句柄关闭后销毁）
         unsafe { windows_sys::Win32::Foundation::CloseHandle(self.handle) };
@@ -1098,8 +1149,12 @@ pub struct CrossProcLock;
 
 #[cfg(not(windows))]
 impl CrossProcLock {
-    pub fn try_acquire(_data_dir: &std::path::Path, _scope: &str, _wait_ms: u32) -> Option<Self> {
-        Some(Self)
+    pub fn try_acquire(
+        _data_dir: &std::path::Path,
+        _scope: &str,
+        _wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        (Some(Self), None)
     }
 }
 
@@ -1107,6 +1162,26 @@ impl CrossProcLock {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 跨进程锁名可用性回归（2026-10-04）：锁名误用多段路径 `Global\a\b\c` 时，
+    /// 内核对象命名空间 `\BaseNamedObjects` 下无中间对象目录 → CreateMutexW 恒
+    /// ERROR_PATH_NOT_FOUND(3) → try_acquire 永久返回假 busy（日志误报「另一进程
+    /// 正在执行」54+ 分钟、刷新任务全天未执行）。修复后：单段名创建必成功；
+    /// Windows 互斥体对同线程递归可重入（二次等待立即成功），Drop 释放后句柄清零
+    #[test]
+    #[cfg(windows)]
+    fn cross_proc_lock_name_valid_and_acquirable() {
+        let tmp = std::env::temp_dir().join(format!("aiwork-lock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let (g1, fail1) = CrossProcLock::try_acquire(&tmp, "checkin", 0);
+        assert!(g1.is_some(), "首次获取失败: {fail1:?}");
+        // 同线程二次等待：Windows 互斥体递归可重入 → 不阻塞立即成功
+        let (g2, fail2) = CrossProcLock::try_acquire(&tmp, "checkin", 0);
+        assert!(g2.is_some(), "同线程重入失败: {fail2:?}");
+        drop(g2);
+        drop(g1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     /// 套餐档位映射：openapi 展示名 / Web 端枚举 / 定价档位名 → 体验/专业/高级/旗舰版
     #[test]

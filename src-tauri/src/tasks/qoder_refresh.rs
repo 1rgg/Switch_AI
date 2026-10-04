@@ -22,16 +22,19 @@ const LAZY_HOURS: i64 = 7;
 pub fn run_task(state: &AppState) -> Result<Value, String> {
     // 跨进程互斥（审查 P1，同 qoder_checkin）：6h 调度 tick 与 schtasks CLI 同刻
     // 双进程全池刷新，双进程对同账号并发 ensure_fresh 会以同一 refresh_token 刷新
-    //（服务端一次性轮换下后到者误标 needs_relogin）。抢锁失败幂等跳过
-    let _cross = match qoder_common::CrossProcLock::try_acquire(&state.data_dir, "refresh", 3_000) {
-        Some(g) => g,
-        None => {
-            crate::fs_utils::app_log(
-                &state.data_dir,
-                "[qoder] 另一进程正在执行 Qoder 凭证刷新，本轮幂等跳过",
-            );
-            return Ok(json!({ "ok": true, "skipped": "另一进程正在刷新，本轮跳过", "skipped_busy": true }));
-        }
+    //（服务端一次性轮换下后到者误标 needs_relogin）。抢锁失败幂等跳过；
+    // 失败原因落日志与返回值——锁创建失败（机制不可用）≠ 他方占用，混报会掩盖根因
+    //（2026-10-04 锁名多段路径 err=3 曾致每分钟空转 skip 54+ 分钟）
+    let (_cross, lock_fail) = qoder_common::CrossProcLock::try_acquire(&state.data_dir, "refresh", 3_000);
+    let Some(_cross) = _cross else {
+        let reason = lock_fail.as_ref().map(|f| f.describe()).unwrap_or_default();
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder] Qoder 凭证刷新未执行（{reason}），本轮幂等跳过"),
+        );
+        // skipped 文案与日志同源（P3 审查修复）：写死「另一进程正在刷新」会在
+        // 锁创建失败时误导 CLI/--task-run 输出与日志矛盾
+        return Ok(json!({ "ok": true, "skipped": format!("{reason}，本轮幂等跳过"), "skipped_busy": true }));
     };
     let pool: Value = crate::store::docs::qoder_pool_load(&crate::store::db(&state.data_dir));
     let accounts: Vec<Value> = pool

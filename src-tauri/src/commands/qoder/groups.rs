@@ -143,7 +143,9 @@ pub fn qoder_groups_remove(
     // 清理 api_pool 对该分组的筛选引用：被删分组的 id 在资源调度页无 chip 可取消
     // （幽灵筛选），残留会使 Qoder 池被静默清空且 UI 无出口。有引用变更时联动热重载。
     let store = crate::store::db(&state.data_dir);
-    let mut pool_file: crate::models::ApiPoolFile = store.kv_get("api_pool");
+    // 读改写基线统一走迁移入口（P1 审查修复）：per-pool 拆分后 Buddy 池旧共享值
+    // 靠读取侧回填，直读 kv_get 落 serde default，整表写回会把迁移值静默覆盖丢失
+    let mut pool_file = crate::commands::api_server::load_pool_file(&state.data_dir);
     if pool_file.qoder_group_ids.iter().any(|g| g == &id) {
         pool_file.qoder_group_ids.retain(|g| g != &id);
         store.kv_set("api_pool", &pool_file)?;

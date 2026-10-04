@@ -48,6 +48,10 @@ export default function ApiService() {
   const [poolGroups, setPoolGroups] = useState<Set<string>>(new Set());
   // Trae 池参与调度开关（每池自管开关；默认开 = 历史恒可用行为）
   const [traeEnabled, setTraeEnabled] = useState(true);
+  // per-pool 调度参数（Trae 池专属，与 Buddy/Qoder 互不共享）：并发 0 = 不限、池粘性 0 = 关
+  const [traeAccountConcurrencyLimit, setTraeAccountConcurrencyLimit] = useState(1);
+  const [traePoolStickyTtlSecs, setTraePoolStickyTtlSecs] = useState(300);
+  const [traeStickyTtlSecs, setTraeStickyTtlSecs] = useState(1800);
   // 池文件（api_pool.json）：资源开关与调度参数面板的共用热参数只读透传取值源
   const [poolFile, setPoolFile] = useState<ApiPoolFile | null>(null);
   const [groups, setGroups] = useState<GroupView[]>([]);
@@ -94,14 +98,14 @@ export default function ApiService() {
     }
   }, []);
 
-  // 统一模型目录：过滤 sources 含 Trae 或 Qoder 池的条目（§5.5，聚合视图实时派生；
-  // Qoder 与 Trae 共用本页模型目录视图，Qoder 页管理其上游开关与目录同步）
+  // 统一模型目录：仅过滤 sources 含 Trae 池的条目（§5.5，聚合视图实时派生；
+  // Qoder 模型由 Qoder 页「模型目录（Qoder）」独立展示与同步，本页不再混入）
   const loadModels = useCallback(
     async (manual = false) => {
       setLoadingModels(true);
       try {
         const list = await withMinDelay(api.apiServer.unifiedModels(), 250);
-        setModels(list.filter((m) => m.sources.some((s) => s.pool === 'trae' || s.pool === 'qoder')));
+        setModels(list.filter((m) => m.sources.some((s) => s.pool === 'trae')));
       } catch {
         // 初始化失败静默保留空列表；手动点击刷新失败需给出提示
         if (manual) toast('error', '加载模型目录失败，请重试');
@@ -189,6 +193,10 @@ export default function ApiService() {
       setEnabledUids(new Set(pool.enabled_uids));
       setPoolGroups(new Set(pool.group_ids ?? []));
       setTraeEnabled(pool.trae_enabled ?? true);
+      // per-pool 调度参数回显（缺省对齐后端 serde default：并发 1 / 池粘性 300s / 会话粘性 1800s）
+      setTraeAccountConcurrencyLimit(pool.trae_account_concurrency_limit ?? 1);
+      setTraePoolStickyTtlSecs(pool.trae_pool_sticky_ttl_secs ?? 300);
+      setTraeStickyTtlSecs(pool.trae_sticky_ttl_secs ?? 1800);
     } catch {
       // 初始化加载失败静默保留空列表；手动点击刷新失败需给出提示
       if (manual) toast('error', '加载账号池失败，请重试');
@@ -256,10 +264,13 @@ export default function ApiService() {
     setSavingPool(true);
     try {
       // 调度策略已收口至全局 API 管理「调度策略中心」，本页只保存成员/分组/本池开关
-      //（未传字段后端保留原值）
+      // 与 Trae 池专属调度参数（未传字段后端保留原值，保存后运行中热生效）
       await withMinDelay(
         api.apiServer.poolSet([...enabledUids], undefined, [...poolGroups], {
           traeEnabled,
+          traeAccountConcurrencyLimit: traeAccountConcurrencyLimit,
+          traePoolStickyTtlSecs: traePoolStickyTtlSecs,
+          traeStickyTtlSecs,
         }),
       );
       toast('success', `账号池已更新（Trae 池${traeEnabled ? '启用' : '停用'}，服务运行中即时生效）`);
@@ -537,7 +548,10 @@ export default function ApiService() {
                 </span>
               </div>
 
-              <div className="flex-1 space-y-1">
+              {/* 不用 flex-1：两列 items-stretch 下 flex-1 会吃掉剩余高度，
+                  账号少时列表与「资源开关与调度参数」之间被撑出大片空白；
+                  自然高度让参数区块紧贴列表，账号增多时随流式布局自然下移 */}
+              <div className="space-y-1">
                 {poolAccounts.map((a) => {
                   const checked = enabledUids.has(a.user_id);
                   const poolItem = poolStatus.find((p) => p.uid === a.user_id);
@@ -628,32 +642,95 @@ export default function ApiService() {
                     </span>
                   </label>
                 </div>
-                {/* 调度参数（F-77/F-76② 三池共用热参数，只读透传；编辑入口在 Buddy「资源调度」页） */}
+                {/* 调度参数（Trae 池专属，与 Buddy/Qoder 互不共享）：数值热参数，保存即热生效 */}
                 <div className="mt-4">
                   <div className="mb-2 flex items-center gap-2">
                     <Gauge size={15} className="text-brand-500" />
                     <span className="text-sm font-medium">调度参数</span>
-                    <span className="text-xs text-slate-400">三池共用 · 本页只读</span>
+                    <span className="text-xs text-slate-400">Trae 池专属 · 保存即热生效</span>
                   </div>
-                  <div className="space-y-2 rounded-lg bg-slate-50 p-3 text-[11px] dark:bg-zinc-800/50">
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-500 dark:text-zinc-400">账号并发上限</span>
-                      <span className="tabular-nums text-slate-600 dark:text-zinc-300">
-                        {poolFile?.account_concurrency_limit
-                          ? `${poolFile.account_concurrency_limit} 并发/账号`
-                          : '不限（默认）'}
+                  <div className="space-y-3 rounded-lg bg-slate-50 p-3 dark:bg-zinc-800/50">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          账号并发上限
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          单账号在途请求数达到上限即让位其他账号（全部 busy 时取负载最小者）；
+                          0 = 不限
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={32}
+                          step={1}
+                          value={traeAccountConcurrencyLimit}
+                          onChange={(e) =>
+                            setTraeAccountConcurrencyLimit(
+                              Math.max(0, Math.min(32, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">并发</span>
                       </span>
                     </div>
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-500 dark:text-zinc-400">池粘性 TTL</span>
-                      <span className="tabular-nums text-slate-600 dark:text-zinc-300">
-                        {poolFile?.pool_sticky_ttl_secs
-                          ? `${poolFile.pool_sticky_ttl_secs}s（TTL 内同会话落同账号）`
-                          : '默认'}
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          池粘性 TTL
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          TTL 内同会话落同一账号（上游 KV cache 复用）；0 = 关闭
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={3600}
+                          step={30}
+                          value={traePoolStickyTtlSecs}
+                          onChange={(e) =>
+                            setTraePoolStickyTtlSecs(
+                              Math.max(0, Math.min(3600, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">秒</span>
                       </span>
                     </div>
-                    <p className="text-slate-400 dark:text-zinc-500">
-                      如需调整请到 Buddy「资源调度」页（三池共用，改动影响所有渠道）。
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="min-w-0">
+                        <span className="block text-xs text-slate-700 dark:text-zinc-200">
+                          会话粘性 TTL
+                        </span>
+                        <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                          显式 conversationId / 消息指纹绑定账号的有效期
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-1.5">
+                        <input
+                          type="number"
+                          min={0}
+                          max={86400}
+                          step={60}
+                          value={traeStickyTtlSecs}
+                          onChange={(e) =>
+                            setTraeStickyTtlSecs(
+                              Math.max(0, Math.min(86400, Number(e.target.value) || 0)),
+                            )
+                          }
+                          className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                        />
+                        <span className="text-[11px] text-slate-400">秒</span>
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-400 dark:text-zinc-500">
+                      仅影响 Trae 池；Buddy / Qoder 池参数在各自「资源调度」页独立配置。
                     </p>
                   </div>
                 </div>
@@ -742,7 +819,6 @@ export default function ApiService() {
                 <thead>
                   <tr className="border-b border-slate-200 text-left text-xs text-slate-500 dark:border-zinc-700 dark:text-zinc-400">
                     <th className="pb-2 pr-3 font-medium">模型 ID</th>
-                    <th className="pb-2 pr-3 font-medium">来源</th>
                     <th className="pb-2 pr-3 font-medium">展示名</th>
                     <th className="pb-2 pr-3 font-medium">厂商</th>
                     <th className="pb-2 pr-3 text-right font-medium">积分倍率</th>
@@ -760,27 +836,6 @@ export default function ApiService() {
                     >
                       <td className="py-2 pr-3 font-mono text-xs font-medium text-slate-700 dark:text-zinc-200">
                         {m.id}
-                      </td>
-                      <td className="py-2 pr-3">
-                        {/* §5.5 来源徽标：展示该模型全部池来源（多源同名并列；本页行
-                            范围 = trae/qoder，buddy/custom 仅作来源展示不在此维护） */}
-                        <div className="flex gap-0.5">
-                          {m.sources.map((s) => {
-                            const tag =
-                              s.pool === 'trae'
-                                ? { label: 'Trae', tone: 'blue' as const }
-                                : s.pool === 'buddy'
-                                  ? { label: 'Buddy', tone: 'green' as const }
-                                  : s.pool === 'qoder'
-                                    ? { label: 'Qoder', tone: 'violet' as const }
-                                    : { label: '自定义', tone: 'slate' as const };
-                            return (
-                              <Badge key={s.pool} tone={tag.tone} className="!px-1.5 !text-[10px]">
-                                {tag.label}
-                              </Badge>
-                            );
-                          })}
-                        </div>
                       </td>
                       <td className="py-2 pr-3 text-slate-600 dark:text-zinc-300">
                         {m.display || '—'}

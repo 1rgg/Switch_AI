@@ -36,6 +36,43 @@ use super::qoder_common;
 /// 缓存 TTL（秒）
 const CACHE_TTL_SECS: i64 = 600;
 
+/// 逐包明细探测失败负缓存 TTL：双端点全失败后 30 分钟内不再重复探测。
+/// 2026-10-04 实测：qoder.cn 对 openapi Bearer 恒 401（账户页端点走 Web 会话
+/// 鉴权，与 R-11 抓包「Bearer 同源」假设不符；携带 Referer/Origin/浏览器 UA
+/// 仍 401）、openapi 主机恒 503（alb 无路由）——反复探测只产生日志噪音
+///（实测看板 8 秒内 4 轮 × 2 账号 × 2 端点空打 16 次 + 8 条重复 warn）。
+/// TTL 过后自动复探：服务端放开鉴权/路由即自愈
+const PER_PACK_FAIL_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// 逐包明细失败负缓存（进程内内存态：账号 id → 首败时刻）
+fn per_pack_fail_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 负缓存命中：TTL 内本轮跳过双端点探测
+fn per_pack_fail_hit(aid: &str) -> bool {
+    per_pack_fail_cache()
+        .lock()
+        .map(|c| c.get(aid).is_some_and(|t| t.elapsed() < PER_PACK_FAIL_TTL))
+        .unwrap_or(false)
+}
+
+fn per_pack_fail_mark(aid: &str) {
+    if let Ok(mut c) = per_pack_fail_cache().lock() {
+        c.insert(aid.to_string(), std::time::Instant::now());
+    }
+}
+
+fn per_pack_fail_clear(aid: &str) {
+    if let Ok(mut c) = per_pack_fail_cache().lock() {
+        c.remove(aid);
+    }
+}
+
 fn s_of(v: Option<&Value>) -> String {
     v.and_then(Value::as_str).unwrap_or("").to_string()
 }
@@ -144,6 +181,67 @@ fn parse_usage(b: &Value) -> UsageParsed {
             "source": "addon",
         }));
     }
+    // 专属/组织资源包逐包明细（2026-10-04 Work 客户端 app.asar 解析器 Upt 反推，
+    // sash usage 响应原生携带）：[{total, used, remaining, expires_at|expiresAt(ms),
+    // status: "QUOTA_DETAIL_STATUS_*", name | display_labels[].value}]
+    // 口径对齐 parse_big_model：已用完（remaining ≤ 0）、非激活（status 非空且非
+    // ACTIVE）不进明细；expires_at 缺失/0 视为随订阅周期（plan_expires_at 兜底）。
+    // 逐包与 addon 聚合并存——聚合供余额链路，逐包供到期日历
+    if let Some(arr) = q
+        .and_then(|v| {
+            v.get("dedicated_resource_packages")
+                .or_else(|| v.get("dedicatedResourcePackages"))
+        })
+        .and_then(Value::as_array)
+    {
+        for d in arr {
+            let used = num_or_none(d.get("used"));
+            // remaining 缺失时 total-used 推导并钳 0（同 quota_pair 负余额防护）
+            let amount = num_or_none(d.get("remaining"))
+                .or_else(|| num_or_none(d.get("total")).map(|t| (t - used.unwrap_or(0.0)).max(0.0)));
+            // 已用完的包无到期提醒价值，不进明细（Trae/Buddy 同款口径）
+            if amount.map(|a| a <= 0.0).unwrap_or(true) {
+                continue;
+            }
+            let status = s_of(d.get("status"));
+            // sash 侧 status 为枚举全前缀形态（QUOTA_DETAIL_STATUS_ACTIVE，Work 客户端
+            // 同款），web big_model 侧为裸 ACTIVE——剥离前缀后归一比较
+            let status = status.strip_prefix("QUOTA_DETAIL_STATUS_").unwrap_or(&status);
+            if !status.is_empty() && status != "ACTIVE" {
+                continue;
+            }
+            let exp_ms = d
+                .get("expires_at")
+                .or_else(|| d.get("expiresAt"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let expire_at = if exp_ms > 0 { ms_to_date(exp_ms) } else { plan_expires_at.clone() };
+            // 包名取值序：name → display_labels[0].value → 「专属资源包」（Work 客户端同款）
+            let name = {
+                let n = s_of(d.get("name"));
+                if !n.is_empty() {
+                    n
+                } else {
+                    d.get("display_labels")
+                        .or_else(|| d.get("displayLabels"))
+                        .and_then(Value::as_array)
+                        .and_then(|a| a.first())
+                        .and_then(|l| l.get("value"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("专属资源包")
+                        .to_string()
+                }
+            };
+            packages.push(json!({
+                "amount": amount,
+                "total": num_or_none(d.get("total")),
+                "expire_at": expire_at,
+                "source": "dedicated",
+                "name": name,
+            }));
+        }
+    }
     // 宽容兜底：数组形态积分包（结构变更时尽力展示）
     if packages.is_empty() {
         for key in ["packages", "creditPackages", "credit_packages", "items", "resources"] {
@@ -165,7 +263,8 @@ fn parse_usage(b: &Value) -> UsageParsed {
 }
 
 // ── 逐包明细端点（R-11 抓包 2026-10-04，官网 account/usage 页）─────────────
-// `GET {open_api}/api/v2/me/usages/big_model_credits`
+// `GET {WEB_BASE}/api/v2/me/usages/big_model_credits`（端点在官网域 qoder.cn，
+// Bearer 鉴权与 openapi 同源；openapi 主机无此路由——实测 alb 503，保留兜底）
 // 响应四族配额：plan_quota（订阅配额）/ resource_package_quota（个人资源包）/
 // dedicated_resource_package_quota（专属资源包）/ total_quota（全量合并视图），
 // 每族 { quota_summary, quota_detail[] }；detail 条目含
@@ -269,7 +368,13 @@ pub fn fetch_usage_balance(agent: &ureq::Agent, headers: &[(String, String)]) ->
 }
 
 /// 单账号积分查询（token 直调 usage 通道）。creds 由调用方解析（需要 AppState 读 token store）。
-fn fetch_account(agent: &ureq::Agent, acct: &Value, creds: &qoder_common::QoderCreds) -> Value {
+/// data_dir 仅用于明细端点全失败时的 warn 日志（app_log）。
+fn fetch_account(
+    agent: &ureq::Agent,
+    acct: &Value,
+    creds: &qoder_common::QoderCreds,
+    data_dir: &std::path::Path,
+) -> Value {
     let aid = s_of(acct.get("id"));
     let name = acct
         .get("nickname")
@@ -324,41 +429,70 @@ fn fetch_account(agent: &ureq::Agent, acct: &Value, creds: &qoder_common::QoderC
     row["total"] = json!(p.total);
     row["plan_expires_at"] = json!(p.plan_expires_at);
     row["packages"] = json!(p.packages);
-    // 逐包明细增强（R-11）：big_model_credits 提供 PLAN 订阅配额 + 个人资源包逐包
-    // 明细（到期日历包级展示数据源）。字段级覆盖——新接口有值才覆盖，缺失/失败
-    //（非 200、非 JSON、结构异常）静默回退 sash 聚合口径，不影响既有余额链路
-    let big_url = format!("{}/api/v2/me/usages/big_model_credits", qoder_common::OPEN_API_BASE);
-    let (bs, bb, _) = qoder_common::get_json(agent, &big_url, &headers);
-    if bs == 200 {
-        if let Some(bv) = bb {
-            let bm = parse_big_model(&bv, &p.plan_expires_at);
-            if let Some(v) = bm.total {
-                row["total"] = json!(v);
+    // 逐包明细增强（R-11）：端点在官网域（WEB_BASE）——openapi 主机无此路由
+    //（实测 alb 503），保留为兜底（未来开放即生效）。任一主机 200 即解析；
+    // 字段级覆盖——新接口有值才覆盖，缺失/失败（非 200、非 JSON）静默回退
+    // sash 聚合口径，不影响既有余额链路；双端点全失败记 warn（首败一次）。
+    // 负缓存：TTL 内命中跳过探测（2026-10-04 实测双端点对现有凭证恒 401/503，
+    // 详见 PER_PACK_FAIL_TTL 注释）
+    let mut big_body: Option<Value> = None;
+    let mut tried: Vec<String> = Vec::new();
+    let fail_cached = per_pack_fail_hit(&aid);
+    if !fail_cached {
+        for host in [qoder_common::WEB_BASE, qoder_common::OPEN_API_BASE] {
+            let big_url = format!("{host}/api/v2/me/usages/big_model_credits");
+            let (bs, bb, _) = qoder_common::get_json(agent, &big_url, &headers);
+            if bs == 200 {
+                if bb.is_some() {
+                    big_body = bb;
+                    break;
+                }
+                tried.push(format!("{host} HTTP 200 非 JSON"));
+            } else {
+                tried.push(format!("{host} HTTP {bs}"));
             }
-            if let Some(v) = bm.plan {
-                row["plan_credits"] = json!(v);
-            }
-            if let Some(v) = bm.plan_used {
-                row["plan_used"] = json!(v);
-            }
-            if let Some(v) = bm.addon {
-                row["addon_credits"] = json!(v);
-            }
-            if let Some(v) = bm.addon_used {
-                row["addon_used"] = json!(v);
-            }
-            if !bm.packages.is_empty() {
-                row["packages"] = json!(bm.packages);
-            }
-            // sash 侧 expiresAt 缺失时以 nextResetAt 兜底订阅周期到期日
-            if p.plan_expires_at.is_empty() {
-                if let Some(nr) = bm.next_reset_ms {
-                    if nr > 0 {
-                        row["plan_expires_at"] = json!(ms_to_date(nr));
-                    }
+        }
+    }
+    if let Some(bv) = big_body {
+        per_pack_fail_clear(&aid);
+        let bm = parse_big_model(&bv, &p.plan_expires_at);
+        if let Some(v) = bm.total {
+            row["total"] = json!(v);
+        }
+        if let Some(v) = bm.plan {
+            row["plan_credits"] = json!(v);
+        }
+        if let Some(v) = bm.plan_used {
+            row["plan_used"] = json!(v);
+        }
+        if let Some(v) = bm.addon {
+            row["addon_credits"] = json!(v);
+        }
+        if let Some(v) = bm.addon_used {
+            row["addon_used"] = json!(v);
+        }
+        if !bm.packages.is_empty() {
+            row["packages"] = json!(bm.packages);
+        }
+        // sash 侧 expiresAt 缺失时以 nextResetAt 兜底订阅周期到期日
+        if p.plan_expires_at.is_empty() {
+            if let Some(nr) = bm.next_reset_ms {
+                if nr > 0 {
+                    row["plan_expires_at"] = json!(ms_to_date(nr));
                 }
             }
         }
+    } else if !tried.is_empty() {
+        // 首败落 warn 并记负缓存；TTL 内静默（负缓存命中本轮 tried 恒空，不达此处）
+        per_pack_fail_mark(&aid);
+        fs_utils::app_log(
+            data_dir,
+            &format!(
+                "qoder_credits: 账号 {name} 逐包明细端点均不可用（{}），回退聚合口径；{} 分钟内不再探测",
+                tried.join("；"),
+                PER_PACK_FAIL_TTL.as_secs() / 60
+            ),
+        );
     }
     // source 徽标：PAT 通道（access_token 已换为作业令牌，kind 恒为 pat）/ 客户端 token（dt- 等）
     row["source"] = json!(if creds.kind == "pat" || creds.access_token.starts_with("pt-") { "pat" } else { "client_token" });
@@ -442,7 +576,7 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
         .map(|a| {
             let aid = a.get("id").and_then(Value::as_str).unwrap_or("");
             let creds = qoder_common::effective_creds(state, aid);
-            let row = fetch_account(&agent, a, &creds);
+            let row = fetch_account(&agent, a, &creds, &state.data_dir);
             // 401 自愈：令牌失效时强制刷新一次并重试（lazy_hours=MAX 恒走刷新；
             // PAT 通道 is_pat||has_pat 恒覆盖有备份的凭证）。刷新失败/令牌未变则
             // 保留原失败行，不二次重试（对齐 F-09 禁二次刷新）。
@@ -461,7 +595,7 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
                         // 401 自愈成功：回写池过期时间/登录态（原自愈路径只刷新不回写，
                         // 池内 token_expires_at 仍是旧值，到期看板会误报「已过期」）
                         qoder_common::sync_pool_expiry(state, aid, &new_creds);
-                        let retry_row = fetch_account(&agent, a, &new_creds);
+                        let retry_row = fetch_account(&agent, a, &new_creds, &state.data_dir);
                         (new_creds, retry_row)
                     } else {
                         (creds, row)
@@ -842,5 +976,64 @@ mod tests {
         let p = parse_big_model(&b, "");
         assert_eq!(p.total, Some(30.0));
         assert!(p.packages.is_empty());
+    }
+
+    #[test]
+    fn parse_usage_dedicated_packages_per_pack() {
+        // 专属/组织资源包逐包（sash usage 原生携带，Work 客户端 Upt 解析器同款字段）：
+        // ACTIVE + 剩余 > 0 进明细；已用完 / 非激活过滤；snake/camel 键宽容；
+        // name 缺失走 display_labels 兜底；expires_at 缺失/0 → 订阅周期到期日兜底；
+        // addon 聚合条目并存
+        let b = json!({
+            "qoderUsage": {
+                "userQuota": {"total": 300.0, "used": 19.0},
+                "addOnQuota": {"total": 500.0, "used": 0.0},
+                "expiresAt": 1791673619906i64,
+                "dedicated_resource_packages": [
+                    // 标准 ACTIVE 包（snake 键 + name + 枚举全前缀 status）
+                    {"total": 1000.0, "used": 200.0, "remaining": 800.0,
+                     "expires_at": 1793535788250i64, "status": "QUOTA_DETAIL_STATUS_ACTIVE", "name": "企业专属包A"},
+                    // 已用完 → 过滤
+                    {"total": 100.0, "used": 100.0, "remaining": 0.0,
+                     "expires_at": 1793535788250i64, "status": "QUOTA_DETAIL_STATUS_ACTIVE", "name": "用完包"},
+                    // status 非 ACTIVE → 过滤
+                    {"total": 100.0, "used": 10.0, "remaining": 90.0,
+                     "expires_at": 1793535788250i64, "status": "QUOTA_DETAIL_STATUS_SUSPENDED", "name": "停用包"},
+                    // remaining 缺失 → total-used 推导；camel expiresAt；无 name → display_labels 兜底
+                    {"total": 50.0, "used": 20.0, "expiresAt": 1793190775403i64,
+                     "status": "QUOTA_DETAIL_STATUS_ACTIVE", "display_labels": [{"dimension": "pkg", "value": "企业专属包B"}]},
+                    // expires_at=0 → 订阅周期到期日兜底
+                    {"total": 30.0, "remaining": 30.0, "expires_at": 0,
+                     "status": "QUOTA_DETAIL_STATUS_ACTIVE", "name": "周期包"}
+                ]
+            }
+        });
+        let p = parse_usage(&b);
+        assert_eq!(p.packages.len(), 4); // addon 聚合 1 + dedicated 3
+        assert_eq!(p.packages[0]["source"], json!("addon"));
+        // 标准 ACTIVE 包
+        assert_eq!(p.packages[1]["source"], json!("dedicated"));
+        assert_eq!(p.packages[1]["amount"], json!(800.0));
+        assert_eq!(p.packages[1]["total"], json!(1000.0));
+        assert_eq!(p.packages[1]["expire_at"], json!(ms_to_date(1793535788250)));
+        assert_eq!(p.packages[1]["name"], json!("企业专属包A"));
+        // remaining 缺失 → total-used 推导；display_labels 兜底名；camel expiresAt
+        assert_eq!(p.packages[2]["amount"], json!(30.0));
+        assert_eq!(p.packages[2]["name"], json!("企业专属包B"));
+        assert_eq!(p.packages[2]["expire_at"], json!(ms_to_date(1793190775403)));
+        // expires_at=0 → 订阅周期（qoderUsage.expiresAt）兜底
+        assert_eq!(p.packages[3]["expire_at"], json!(ms_to_date(1791673619906)));
+    }
+
+    #[test]
+    fn parse_usage_dedicated_packages_absent_and_malformed() {
+        // 无 dedicated 数组 → 仅 addon 条目（行为与旧版一致）
+        let b = json!({"qoderUsage": {"userQuota": {"total": 10.0}, "addOnQuota": {"total": 5.0}}});
+        let p = parse_usage(&b);
+        assert_eq!(p.packages.len(), 1);
+        assert_eq!(p.packages[0]["source"], json!("addon"));
+        // dedicated 非数组（null/对象）→ 不 panic，仅 addon
+        let b2 = json!({"qoderUsage": {"addOnQuota": {"total": 5.0}, "dedicated_resource_packages": null}});
+        assert_eq!(parse_usage(&b2).packages.len(), 1);
     }
 }

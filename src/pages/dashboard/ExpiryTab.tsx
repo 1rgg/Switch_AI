@@ -183,12 +183,20 @@ export default function ExpiryTab({
       for (const acc of qoderCredits?.accounts ?? []) {
         // 积分包明细（R-11 逐包口径，展示结构对齐 Buddy 包级样式）：
         // plan = 订阅配额（随订阅周期重置）、bonus = 个人资源包、
+        // dedicated = 专属/组织资源包（sash usage 逐包，自有到期时间）、
         // addon = 旧聚合口径（addOnQuota 总额，随订阅周期展示）
         (acc.packages ?? []).forEach((p, i) => {
           if (p.amount != null && p.amount <= 0) return;
           const isPlan = p.source === 'plan';
           const isAddon = p.source === 'addon';
-          const pkgName = isPlan ? 'Plan 订阅配额' : isAddon ? 'Add-on 包' : '个人资源包';
+          const isDedicated = p.source === 'dedicated';
+          const pkgName = isPlan
+            ? 'Plan 订阅配额'
+            : isAddon
+              ? 'Add-on 包'
+              : isDedicated
+                ? p.name || '专属资源包'
+                : '个人资源包';
           const resetNote = isPlan || isAddon ? '（随订阅周期重置）' : '';
           items.push({
             key: `qoder-${acc.user_id}-pack-${i}`,

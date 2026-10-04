@@ -618,21 +618,22 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
     // 默认同为 10:15 触发，双进程对同账号并发 ensure_fresh 会以同一 refresh_token
     // 刷新（服务端一次性轮换下后到者误标 needs_relogin）。抢锁失败方幂等跳过
     //（done 带 skipped_busy，调度器据此不记当日已跑）；3s 等待区分「瞬时竞争」
-    //（短暂等待后获取）与「对方长跑」（放弃跳过，重试幂等无损失）
-    let _cross = match qoder_common::CrossProcLock::try_acquire(&state.data_dir, "checkin", 3_000) {
-        Some(g) => g,
-        None => {
-            fs_utils::app_log(
-                &state.data_dir,
-                "[qoder] 另一进程正在执行 Qoder 签到（schtasks/CLI 与应用内调度器同刻），本轮幂等跳过",
-            );
-            let done = json!({
-                "type": "done", "ok": 0, "already": 0, "failed": 0,
-                "failed_empty_campaigns": 0, "skipped_busy": true,
-            });
-            emit(&done);
-            return done;
-        }
+    //（短暂等待后获取）与「对方长跑」（放弃跳过，重试幂等无损失）。
+    // 失败原因落日志：锁创建失败（机制不可用）≠ 他方占用（2026-10-04 err=3 教训）
+    let (_cross, lock_fail) =
+        qoder_common::CrossProcLock::try_acquire(&state.data_dir, "checkin", 3_000);
+    let Some(_cross) = _cross else {
+        let reason = lock_fail.as_ref().map(|f| f.describe()).unwrap_or_default();
+        fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder] Qoder 签到未执行（{reason}），本轮幂等跳过"),
+        );
+        let done = json!({
+            "type": "done", "ok": 0, "already": 0, "failed": 0,
+            "failed_empty_campaigns": 0, "skipped_busy": true,
+        });
+        emit(&done);
+        return done;
     };
     // 设备指纹惰性回填（§5.10：GUI/CLI/启动补签三路共用本漏斗，一处 ensure 全覆盖；
     // 失败不阻塞签到，仅缺注入指纹）

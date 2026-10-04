@@ -252,14 +252,7 @@ export default function QoderCheckin() {
         </div>
       </div>
 
-      {/* 活动档期日历（F-80-余 v2，通用组件）：双活动领取结果按日可视化，辅助校验排期决策 */}
-      <CheckinCalendarCard
-        title="活动档期日历"
-        days={calDays}
-        footnote="档期：0:00 每日签到刷新 · 10:00 登录奖励开窗 · 10:15 应用内调度"
-      />
-
-      {/* 实时进度卡 */}
+      {/* 实时进度卡（紧随一键签到：执行时逐账号结果即时可见，无需滚过日历） */}
       {(running || lines.length > 0) && (
         <div className="mt-4 card p-4">
           <div className="mb-3 flex items-center justify-between">
@@ -307,6 +300,13 @@ export default function QoderCheckin() {
           </div>
         </div>
       )}
+
+      {/* 活动档期日历（F-80-余 v2，通用组件）：双活动领取结果按日可视化，辅助校验排期决策 */}
+      <CheckinCalendarCard
+        title="活动档期日历"
+        days={calDays}
+        footnote="档期：0:00 每日签到刷新 · 10:00 登录奖励开窗 · 10:15 应用内调度"
+      />
     </div>
   );
 }

@@ -40,6 +40,7 @@ import type {
   ProfileInfo,
   QoderAccountView,
   QoderCliStatus,
+  QoderLiveLogins,
   QoderOauthDone,
   QoderOauthProgress,
   QoderResetItem,
@@ -141,6 +142,8 @@ export default function QoderAccounts() {
   const [scanningIde, setScanningIde] = useState(false);
   // CLI 登录状态（M4 status 只读桥：available=false 时展示 reason）
   const [cliStatus, setCliStatus] = useState<QoderCliStatus | null>(null);
+  // 双客户端实时登录标记（Work=auth.v1.dat / IDE=state.vscdb 解密；解密失败/未登录 → null）
+  const [liveLogins, setLiveLogins] = useState<QoderLiveLogins | null>(null);
   // 快照管理弹框（M3 Icube 档案：data/profiles_qoder/<account_id>/）
   const [showSnapshots, setShowSnapshots] = useState(false);
   const [snapshotSlots, setSnapshotSlots] = useState<ProfileInfo[]>([]);
@@ -176,6 +179,8 @@ export default function QoderAccounts() {
   const unlisten = useRef<(() => void)[]>([]);
   // OAuth 完成延迟关弹框的定时器（卸载时清理，防卸载后 setState）
   const oauthTimers = useRef<number[]>([]);
+  // 实时登录标记的延迟刷新定时器（切换后客户端启动重写凭据文件需数秒，卸载时清理）
+  const liveTimers = useRef<number[]>([]);
 
   // 切换 90s 看门狗（对齐 Accounts/Buddy/Doubao 页，issue #44 合并审查补齐）：
   // switch-done 事件异常缺失（桥挂死/事件丢失/后台线程 panic）时 switchingTo 永久
@@ -210,6 +215,11 @@ export default function QoderAccounts() {
       setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 实时登录标记刷新（切换/恢复快照后 Work·IDE 登录身份变化；失败静默 → 不展示徽标）
+  const refreshLiveLogins = useCallback(() => {
+    api.qoder.liveLogins().then(setLiveLogins).catch(() => setLiveLogins(null));
   }, []);
 
   // 快照管理目标（审查修复：备份支持 QoderWork 落 profiles_qoder_work，但快照弹框
@@ -249,7 +259,18 @@ export default function QoderAccounts() {
     reloadGroups();
     // CLI 状态只读桥（M4）：拉取失败静默置空，不打扰主列表
     api.qoder.cliStatus().then(setCliStatus).catch(() => setCliStatus(null));
+    // 双客户端实时登录标记（Work/IDE 徽标）：拉取失败静默
+    refreshLiveLogins();
     let disposed = false;
+    // 切换完成后刷新登录标记；客户端启动重写凭据文件需数秒，延迟再刷一次兜底
+    // （对齐 store onSwitchDone 的 localEntitlement 双刷模式）
+    void listen('switch-done', () => {
+      refreshLiveLogins();
+      liveTimers.current.push(window.setTimeout(refreshLiveLogins, 8000));
+    }).then((u) => {
+      if (disposed) u();
+      else unlisten.current.push(u);
+    });
     void listen<QoderOauthProgress>('qoder-oauth-progress', (ev) => {
       const p = ev.payload;
       setOauthMsg(p.message);
@@ -289,6 +310,8 @@ export default function QoderAccounts() {
       // 却刷新 IDE 列表，后续「恢复」会把 IDE 槽位内容恢复到 Work 目标（快照错位）；
       // 按 ref 记录的当前目标刷新
       void refreshSnapshots(snapTargetRef.current);
+      // 恢复快照会改写客户端登录身份，同步刷新登录标记
+      refreshLiveLogins();
     }).then((u) => {
       if (disposed) u();
       else unlisten.current.push(u);
@@ -299,6 +322,8 @@ export default function QoderAccounts() {
       unlisten.current = [];
       oauthTimers.current.forEach((t) => clearTimeout(t));
       oauthTimers.current = [];
+      liveTimers.current.forEach((t) => clearTimeout(t));
+      liveTimers.current = [];
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refresh, refreshSnapshots]);
@@ -793,7 +818,20 @@ export default function QoderAccounts() {
                 filtered.map((a) => (
                   <tr key={a.id} className="row-hover border-t border-slate-200 dark:border-zinc-800">
                     <td className="px-4 py-3">
-                      <div className="font-medium">{a.nickname || a.id}</div>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="font-medium">{a.nickname || a.id}</span>
+                        {/* 客户端当前登录标记：本机 auth.v1.dat/state.vscdb 解密 uid 与池匹配（对齐 Trae 双徽标） */}
+                        {liveLogins?.work && (a.id === liveLogins.work || a.uid === liveLogins.work) && (
+                          <Badge tone="violet" title="当前 Qoder Work 客户端登录的账号">
+                            Work 登录中
+                          </Badge>
+                        )}
+                        {liveLogins?.ide && (a.id === liveLogins.ide || a.uid === liveLogins.ide) && (
+                          <Badge tone="brand" title="当前 Qoder IDE 客户端登录的账号">
+                            IDE 登录中
+                          </Badge>
+                        )}
+                      </div>
                       <div className="text-xs text-slate-400">{[a.uid, a.note].filter(Boolean).join(' · ') || a.id}</div>
                     </td>
                     <td className="px-4 py-3">

@@ -166,7 +166,11 @@ pub fn app_log(data_dir: &Path, msg: &str) {
         .append(true)
         .open(&log_path)
     {
-        let _ = writeln!(f, "[{}] {}", now_ts(), msg);
+        // 先整行格式化再一次 write_all：writeln! 对多片段格式串会拆成多次
+        // write 系统调用，多线程/多进程并发追加时行中交错（2026-10-04 实测
+        // 出现两行前缀互相嵌入的串行错乱行）；单次 write_all 同行不拆分
+        let line = format!("[{}] {}\n", now_ts(), msg);
+        let _ = f.write_all(line.as_bytes());
     }
 }
 

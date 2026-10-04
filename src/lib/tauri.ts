@@ -76,6 +76,7 @@ import type {
   QoderAccountView,
   QoderCheckinRecord,
   QoderCliStatus,
+  QoderLiveLogins,
   QoderCreditsResult,
   QoderCreditsSnapshot,
   QoderEnvCheck,
@@ -446,6 +447,8 @@ export const api = {
     ideScan: () => invoke<QoderIdeScanResult>('qoder_ide_scan'),
     /** CLI 登录状态只读桥（M4；~/.qoder-cn/.qoder-app-status.json 白名单透传，无凭证） */
     cliStatus: () => invoke<QoderCliStatus>('qoder_cli_status'),
+    /** 两个客户端当前实际登录的账号 id（徽标用；IDE=state.vscdb / Work=auth.v1.dat 解密） */
+    liveLogins: () => invoke<QoderLiveLogins>('qoder_live_logins'),
     settingsGet: () => invoke<QoderSettings>('qoder_settings_get'),
     settingsSet: (patch: QoderSettings) => invoke('qoder_settings_set', { patch }),
     checkinStart: (opts?: { user_ids?: string[]; skip_checked_in?: boolean; lazy_hours?: number }) =>
@@ -523,12 +526,24 @@ export const api = {
         wbLongctxDowngrade?: boolean;
         /** F-76③ 竞速对冲阈值毫秒（0 = 关闭） */
         wbHedgeThresholdMs?: number;
-        /** F-77 账号并发上限（0 = 不限） */
-        accountConcurrencyLimit?: number;
-        /** F-76② 池粘性 TTL 秒 */
-        poolStickyTtlSecs?: number;
-        /** F-76② WB 会话粘性 TTL 秒 */
+        /** Trae 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        traeAccountConcurrencyLimit?: number;
+        /** Trae 池粘性 TTL 秒；null/未传 = 保留原值 */
+        traePoolStickyTtlSecs?: number;
+        /** Trae 池会话粘性 TTL 秒（显式 conversationId 绑定有效期）；null/未传 = 保留原值 */
+        traeStickyTtlSecs?: number;
+        /** Buddy 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        wbAccountConcurrencyLimit?: number;
+        /** Buddy 池粘性 TTL 秒；null/未传 = 保留原值 */
+        wbPoolStickyTtlSecs?: number;
+        /** Buddy 会话粘性 TTL 秒；null/未传 = 保留原值 */
         wbStickyTtlSecs?: number;
+        /** Qoder 池账号并发上限（0 = 不限）；null/未传 = 保留原值 */
+        qoderAccountConcurrencyLimit?: number;
+        /** Qoder 池粘性 TTL 秒；null/未传 = 保留原值 */
+        qoderPoolStickyTtlSecs?: number;
+        /** Qoder 会话粘性 TTL 秒（显式 conversationId 绑定有效期）；null/未传 = 保留原值 */
+        qoderStickyTtlSecs?: number;
         /** Buddy 池入池白名单（wb- 前缀账号 id）；null/未传 = 保留原值（含旧数据迁移） */
         wbUids?: string[] | null;
         /** Buddy 池分组筛选；null/未传 = 保留原值，空数组 = 清空（不限分组） */
@@ -561,9 +576,15 @@ export const api = {
         wbBgDowngrade: wbFlags?.wbBgDowngrade ?? null,
         wbLongctxDowngrade: wbFlags?.wbLongctxDowngrade ?? null,
         wbHedgeThresholdMs: wbFlags?.wbHedgeThresholdMs ?? null,
-        accountConcurrencyLimit: wbFlags?.accountConcurrencyLimit ?? null,
-        poolStickyTtlSecs: wbFlags?.poolStickyTtlSecs ?? null,
+        traeAccountConcurrencyLimit: wbFlags?.traeAccountConcurrencyLimit ?? null,
+        traePoolStickyTtlSecs: wbFlags?.traePoolStickyTtlSecs ?? null,
+        traeStickyTtlSecs: wbFlags?.traeStickyTtlSecs ?? null,
+        wbAccountConcurrencyLimit: wbFlags?.wbAccountConcurrencyLimit ?? null,
+        wbPoolStickyTtlSecs: wbFlags?.wbPoolStickyTtlSecs ?? null,
         wbStickyTtlSecs: wbFlags?.wbStickyTtlSecs ?? null,
+        qoderAccountConcurrencyLimit: wbFlags?.qoderAccountConcurrencyLimit ?? null,
+        qoderPoolStickyTtlSecs: wbFlags?.qoderPoolStickyTtlSecs ?? null,
+        qoderStickyTtlSecs: wbFlags?.qoderStickyTtlSecs ?? null,
         wbUids: wbFlags?.wbUids ?? null,
         qoderEnabled: wbFlags?.qoderEnabled ?? null,
         qoderHedgeThresholdMs: wbFlags?.qoderHedgeThresholdMs ?? null,

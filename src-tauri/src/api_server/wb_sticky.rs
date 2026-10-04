@@ -120,7 +120,7 @@ pub fn fingerprint_messages(body: &serde_json::Value) -> String {
 /// key 不以任何已登记命名空间开头。**新增池命名空间时必须在此登记**，
 /// load 过滤与 save 范围删除随之生效（审查 P1：两个 store 整表替换会互删
 /// 对方运行期新增的绑定，范围化后各写各的键集）。
-const NAMESPACES: &[&str] = &["q:"];
+const NAMESPACES: &[&str] = &["q:", "t:"];
 
 /// 该 store 是否拥有持久化键 key（load_ns 过滤与 save 范围删除共用同一判定）
 fn owns_key(ns: &str, key: &str) -> bool {
@@ -209,12 +209,15 @@ impl StickyStore {
         );
     }
 
-    /// 清理全部过期绑定，返回清理条数（save 落库前调用，控制绑定表无界增长）
+    /// 清理全部过期绑定，返回清理条数（save 落库前调用，控制绑定表无界增长）。
+    /// 显式模式 TTL 读运行时配置值（per-pool 可配后固定 1800 会在用户调大 TTL 时
+    /// 提前删除仍有效的绑定，F-76② per-pool 版修正）
     pub fn evict_expired(&self, now: i64) -> usize {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let before = map.len();
+        let explicit_ttl = self.effective_explicit_ttl();
         map.retain(|_, b| {
-            let ttl = if b.explicit { EXPLICIT_TTL_SECS } else { FINGERPRINT_WINDOW_SECS };
+            let ttl = if b.explicit { explicit_ttl } else { FINGERPRINT_WINDOW_SECS };
             now - b.last_seen <= ttl
         });
         before - map.len()

@@ -587,18 +587,30 @@ export interface ApiPoolFile {
   wb_enabled_uids?: string[];
   /** Buddy 池分组筛选（wb_group_ids）：非空 = 仅所选分组的 WB 账号参与调度；空 = 不限分组 */
   wb_group_ids?: string[];
-  /** 账号并发上限（F-77）：单账号在途请求数达到上限视为 busy；0 = 不限 */
-  account_concurrency_limit?: number;
-  /** 池粘性 TTL 秒（F-76②）：TTL 内同会话落同一池同账号（KV cache 复用） */
-  pool_sticky_ttl_secs?: number;
-  /** WB 显式会话粘性 TTL 秒（F-76②） */
+  /** Trae 池账号并发上限（F-77，per-pool 三参数之一）：单账号在途请求数达到上限视为 busy；0 = 不限。旧三池共用字段已退役，Trae 池按默认值 1 落地 */
+  trae_account_concurrency_limit?: number;
+  /** Trae 池粘性 TTL 秒（F-76②，per-pool 三参数之一）：TTL 内同会话落同一池同账号（KV cache 复用；默认 300） */
+  trae_pool_sticky_ttl_secs?: number;
+  /** Trae 池显式会话粘性 TTL 秒（per-pool 三参数之一）：显式 conversationId 绑定账号的有效期（默认 1800） */
+  trae_sticky_ttl_secs?: number;
+  /** Buddy 池显式会话粘性 TTL 秒（F-76②，per-pool 三参数之一） */
   wb_sticky_ttl_secs?: number;
+  /** Buddy 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
+  wb_account_concurrency_limit?: number;
+  /** Buddy 池粘性 TTL 秒（per-pool 三参数之一，默认 300） */
+  wb_pool_sticky_ttl_secs?: number;
   /** Qoder 上游开关（p3-3）：开启后 Qoder 目录模型路由到 Qoder 账号池（默认关） */
   qoder_enabled?: boolean;
   /** Qoder 竞速对冲阈值毫秒（F-80-余 v2）：首字节超阈值向第二账号发对冲请求；0 = 关闭 */
   qoder_hedge_threshold_ms?: number;
   /** Qoder 会话粘性开关（F-80-余 v2）：同会话 TTL 内绑定同一 Qoder 账号（默认关） */
   qoder_sticky_enabled?: boolean;
+  /** Qoder 池账号并发上限（per-pool 三参数之一，默认 1；0 = 不限） */
+  qoder_account_concurrency_limit?: number;
+  /** Qoder 池粘性 TTL 秒（per-pool 三参数之一，默认 300） */
+  qoder_pool_sticky_ttl_secs?: number;
+  /** Qoder 池显式会话粘性 TTL 秒（per-pool 三参数之一，默认 1800；仅会话粘性开启时生效） */
+  qoder_sticky_ttl_secs?: number;
   /** Qoder 池内调度策略；空 = 跟随 Trae 池（同 wb_strategy 语义） */
   qoder_strategy?: string;
   /** Qoder 池入池白名单（qd- 账号 id）；空 = fail-open 全部含凭证账号入池 */
@@ -1353,6 +1365,14 @@ export interface QoderCliStatus {
   reason?: string;
 }
 
+/** 两个 Qoder 客户端当前实际登录的账号 id（池反查；解密失败/未登录 → null） */
+export interface QoderLiveLogins {
+  /** Qoder IDE（state.vscdb 真源） */
+  ide: string | null;
+  /** Qoder Work（auth.v1.dat 真源） */
+  work: string | null;
+}
+
 export interface QoderCheckinRecord {
   date: string;
   time: string;
@@ -1390,8 +1410,11 @@ export interface QoderCreditPackage {
   total?: number | null;
   expire_at: string;
   /** 包来源：plan = 订阅配额（随订阅周期重置）；bonus = 个人资源包（R-11 逐包明细）；
+   *  dedicated = 专属/组织资源包（sash usage 逐包，自有到期时间）；
    *  addon = 旧聚合口径（addOnQuota 总额，随订阅周期展示） */
   source: string;
+  /** 包名（dedicated 专属/组织包原生携带；其余来源无此值） */
+  name?: string | null;
 }
 
 export interface QoderCreditAccount {

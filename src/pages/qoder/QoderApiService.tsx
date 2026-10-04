@@ -35,6 +35,10 @@ export default function QoderApiService() {
   // F-80-余 v2：竞速对冲阈值（0 = 关闭）+ 会话粘性开关（默认关）
   const [qoderHedgeThresholdMs, setQoderHedgeThresholdMs] = useState(8_000);
   const [qoderStickyEnabled, setQoderStickyEnabled] = useState(false);
+  // per-pool 调度参数（Qoder 池专属，与 Trae/Buddy 互不共享）：并发 0 = 不限、池粘性 0 = 关
+  const [qoderAccountConcurrencyLimit, setQoderAccountConcurrencyLimit] = useState(1);
+  const [qoderPoolStickyTtlSecs, setQoderPoolStickyTtlSecs] = useState(300);
+  const [qoderStickyTtlSecs, setQoderStickyTtlSecs] = useState(1800);
   // 账号池选择（对齐 Buddy）：null = 未自定义（fail-open 全量，显示为全选）；
   // 值域 = a.id（qd- 前缀账号 id）；分组筛选空集 = 不限分组
   const [qoderUids, setQoderUids] = useState<string[] | null>(null);
@@ -76,6 +80,10 @@ export default function QoderApiService() {
         // F-80-余 v2 参数回显（缺省对齐后端 serde default：对冲 8s / 粘性关）
         setQoderHedgeThresholdMs(pf.qoder_hedge_threshold_ms ?? 8_000);
         setQoderStickyEnabled(pf.qoder_sticky_enabled ?? false);
+        // per-pool 调度参数回显（缺省对齐后端 serde default：并发 1 / 池粘性 300s / 会话粘性 1800s）
+        setQoderAccountConcurrencyLimit(pf.qoder_account_concurrency_limit ?? 1);
+        setQoderPoolStickyTtlSecs(pf.qoder_pool_sticky_ttl_secs ?? 300);
+        setQoderStickyTtlSecs(pf.qoder_sticky_ttl_secs ?? 1800);
         // 空数组 = fail-open（全部自动入池）→ 视为未自定义，显示为全选（对齐 Buddy）
         setQoderUids(pf.qoder_enabled_uids?.length ? pf.qoder_enabled_uids : null);
         // 分组筛选：空 = 不限（全部参与）
@@ -148,6 +156,9 @@ export default function QoderApiService() {
           qoderEnabled,
           qoderHedgeThresholdMs,
           qoderStickyEnabled,
+          qoderAccountConcurrencyLimit,
+          qoderPoolStickyTtlSecs,
+          qoderStickyTtlSecs,
           // null = 未自定义（后端保留原值保持 fail-open）；数组 = 白名单覆盖（[] = 清空恢复全量）
           ...(qoderUids !== null ? { qoderUids } : {}),
           qoderGroupIds: Array.from(qoderPoolGroups),
@@ -301,9 +312,11 @@ export default function QoderApiService() {
         />
       </div>
 
-      {/* 账号池选择（全宽置顶，对齐 Buddy「资源调度」布局）：勾选白名单 + 分组筛选 + 账号清单；
-          「保存」位于面板右上角，一次提交账号池选择/资源开关/调度参数 */}
-      <div className="mt-4 card p-4">
+      {/* 左列：账号池选择 + 资源开关与调度参数（合并面板）｜右列：模型目录（Qoder），同行两列各占 1/2（Buddy 同构） */}
+      <div className="mt-4 grid grid-cols-12 items-start gap-4">
+        {/* 左列：账号池选择（上）+ 资源开关与调度参数（下）合并面板，共用右上角「保存」 */}
+        <div className="col-span-6">
+          <div className="card p-4">
             {/* 面板头＝账号池选择；「保存」位于面板整体右上角，一次保存账号池选择/资源开关/调度参数 */}
             <div className="mb-3 flex items-center justify-between gap-2">
               <div className="flex items-center gap-2">
@@ -440,14 +453,10 @@ export default function QoderApiService() {
               保存后即时生效；Trae 池的成员/分组与调度策略在 Trae「资源调度」页配置，Buddy 池配置在
               Buddy「资源调度」页，本页不改动。
             </p>
-      </div>
 
-      {/* 下方两列：资源开关与调度参数 ｜ 模型目录（Qoder），同行两列各占 1/2 */}
-      <div className="mt-4 grid grid-cols-12 items-start gap-4">
-        <div className="col-span-6">
-          <div className="card p-4">
-            <div className="mb-3 flex items-center gap-2">
-              <Activity size={16} className="text-brand-500" />
+            {/* 资源开关与调度参数（与账号池选择同面板分节，共用右上角「保存」；Buddy 同构） */}
+            <div className="mt-4 flex items-center gap-2 border-t border-slate-100 pt-3 dark:border-zinc-800">
+              <ToggleLeft size={16} className="text-brand-500" />
               <span className="text-sm font-medium">资源开关与调度参数</span>
             </div>
             {/* 资源开关（Qoder v1 仅上游总开关；池成员 fail-open 全量入池，无白名单/分组） */}
@@ -479,19 +488,79 @@ export default function QoderApiService() {
                 池间调度序为 Buddy → Trae → Qoder（Qoder 尾部接管），池内策略在全局 API
                 管理「调度策略中心」配置。
               </p>
-              {/* 账号并发上限（只读透传，§4.1）：三池共用热参数，本页不提供编辑 */}
-              <div className="flex items-center justify-between px-1.5 pt-1 text-[11px]">
-                <span className="text-slate-400 dark:text-zinc-500">账号并发上限</span>
-                <span className="tabular-nums text-slate-600 dark:text-zinc-300">
-                  {pool?.account_concurrency_limit
-                    ? `${pool.account_concurrency_limit} 并发/账号`
-                    : '不限（默认）'}
+              {/* per-pool 调度参数（Qoder 池专属，与 Trae/Buddy 互不共享）：保存即热生效 */}
+              <div className="flex items-center justify-between gap-3 px-1.5 pt-1">
+                <span className="min-w-0">
+                  <span className="block text-xs text-slate-700 dark:text-zinc-200">账号并发上限</span>
+                  <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                    单账号在途请求数达到上限即让位其他账号（全部 busy 时取负载最小者）；0 = 不限
+                  </span>
+                </span>
+                <span className="flex shrink-0 items-center gap-1.5">
+                  <input
+                    type="number"
+                    min={0}
+                    max={32}
+                    step={1}
+                    value={qoderAccountConcurrencyLimit}
+                    onChange={(e) =>
+                      setQoderAccountConcurrencyLimit(
+                        Math.max(0, Math.min(32, Number(e.target.value) || 0)),
+                      )
+                    }
+                    className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                  />
+                  <span className="text-[11px] text-slate-400">并发</span>
                 </span>
               </div>
-              <p className="px-1.5 text-[11px] text-slate-400 dark:text-zinc-500">
-                三池共用参数（Trae/Buddy/Qoder 同一值，改动影响所有渠道）；如需调整请到
-                Buddy「资源调度」页。
-              </p>
+              <div className="flex items-center justify-between gap-3 px-1.5">
+                <span className="min-w-0">
+                  <span className="block text-xs text-slate-700 dark:text-zinc-200">池粘性 TTL</span>
+                  <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                    TTL 内同会话落同一账号（上游 KV cache 复用）；0 = 关闭
+                  </span>
+                </span>
+                <span className="flex shrink-0 items-center gap-1.5">
+                  <input
+                    type="number"
+                    min={0}
+                    max={3600}
+                    step={30}
+                    value={qoderPoolStickyTtlSecs}
+                    onChange={(e) =>
+                      setQoderPoolStickyTtlSecs(
+                        Math.max(0, Math.min(3600, Number(e.target.value) || 0)),
+                      )
+                    }
+                    className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                  />
+                  <span className="text-[11px] text-slate-400">秒</span>
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-3 px-1.5">
+                <span className="min-w-0">
+                  <span className="block text-xs text-slate-700 dark:text-zinc-200">会话粘性 TTL</span>
+                  <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
+                    显式 conversationId 绑定账号的有效期（仅会话粘性开启时生效）
+                  </span>
+                </span>
+                <span className="flex shrink-0 items-center gap-1.5">
+                  <input
+                    type="number"
+                    min={0}
+                    max={86400}
+                    step={60}
+                    value={qoderStickyTtlSecs}
+                    onChange={(e) =>
+                      setQoderStickyTtlSecs(
+                        Math.max(0, Math.min(86400, Number(e.target.value) || 0)),
+                      )
+                    }
+                    className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-right text-xs tabular-nums text-slate-700 focus:border-brand-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                  />
+                  <span className="text-[11px] text-slate-400">秒</span>
+                </span>
+              </div>
               {/* F-80-余 v2：会话粘性开关（默认关；同账号+同种子派生同一上游 session） */}
               <label className="flex cursor-pointer items-start gap-2.5 rounded-md px-1.5 py-1.5 transition hover:bg-slate-100/60 dark:hover:bg-zinc-800/60">
                 <input
@@ -503,9 +572,9 @@ export default function QoderApiService() {
                 <span className="min-w-0">
                   <span className="block text-xs text-slate-700 dark:text-zinc-200">会话粘性</span>
                   <span className="block text-[11px] leading-4 text-slate-400 dark:text-zinc-500">
-                    显式 conversationId 绑定 30 分钟（滚动续期）、消息指纹 60 秒短窗；
-                    同账号 + 同种子派生同一上游 session_id，保住会话侧复用；账号 busy
-                    且有空闲候选时自动让位（并发优先）。默认关闭（轮换调度）
+                    显式 conversationId 按会话粘性 TTL（当前 {qoderStickyTtlSecs}s）绑定账号（滚动续期）、
+                    消息指纹 60 秒短窗；同账号 + 同种子派生同一上游 session_id，保住会话侧复用；
+                    账号 busy 且有空闲候选时自动让位（并发优先）。默认关闭（轮换调度）
                   </span>
                 </span>
               </label>
@@ -593,7 +662,6 @@ export default function QoderApiService() {
                       <th className="px-3 py-2 text-left">模型 ID</th>
                       <th className="px-3 py-2 text-left">展示名</th>
                       <th className="px-3 py-2 text-left">厂商</th>
-                      <th className="px-3 py-2 text-center">地区</th>
                       <th className="px-3 py-2 text-right">积分倍率</th>
                       <th className="px-3 py-2 text-left">思考档位</th>
                       <th className="px-3 py-2 text-right">上下文</th>
@@ -606,20 +674,6 @@ export default function QoderApiService() {
                         <td className="px-3 py-2 font-mono text-xs">{m.id}</td>
                         <td className="px-3 py-2">{m.display || '—'}</td>
                         <td className="px-3 py-2 text-xs text-slate-500">{m.vendor || '—'}</td>
-                        <td className="px-3 py-2 text-center text-xs text-slate-500">
-                          {m.region === 'cn' ? (
-                            'CN'
-                          ) : m.region === 'global' ? (
-                            <span
-                              className="text-amber-600 dark:text-amber-400"
-                              title="目录并集按 global 优先标注；当前仅接入 CN 网关，Global 专属模型不可路由"
-                            >
-                              Global
-                            </span>
-                          ) : (
-                            '—'
-                          )}
-                        </td>
                         <td className="px-3 py-2 text-right tabular-nums text-amber-600 dark:text-amber-400">
                           {m.rate != null ? m.rate.toFixed(2) : '—'}
                         </td>
@@ -651,9 +705,8 @@ export default function QoderApiService() {
             <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50/80 px-3 py-2 text-[11px] leading-4 text-slate-500 dark:border-zinc-800 dark:bg-zinc-800/40 dark:text-zinc-400">
               <span className="font-medium text-slate-600 dark:text-zinc-300">地区说明：</span>
               当前仅接入 <span className="font-medium">CN 区（国内版）</span> 网关
-              （gateway.qoder.com.cn）；「地区」列为目录并集标注（global 优先），同名模型两区
-              共享。Global 区（api3.qoder.sh，海外版）尚未接线：Global 专属模型仅目录可见、
-              不可路由，请求将显式返回 404。
+              （gateway.qoder.com.cn）。Global 区（api3.qoder.sh，海外版）尚未接线：
+              Global 专属模型仅目录可见、不可路由，请求将显式返回 404。
             </div>
           </div>
         </div>

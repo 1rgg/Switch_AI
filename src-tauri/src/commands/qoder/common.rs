@@ -202,17 +202,17 @@ pub(crate) fn live_account_id(_state: &AppState) -> Option<String> {
     None
 }
 
-/// Qoder Work 守卫数据源（2026-10-02 审查补齐，与 IDE 守卫同权）：Work 客户端
-/// Cookies（根级 Chromium 库）的 qoderuid cookie（uuid，与池账号 uid 同源）→
-/// 池反查账号 id。uid 在池外原样返回；Cookie 缺失/解密失败 → None（fail-open：
-/// 保存守卫放行、切换来源槽不回写）。未登录时该 Cookie 不存在，天然 fail-open。
+/// Qoder Work 守卫数据源（2026-10-04 修正）：Work 客户端登录真源 = 数据目录根级
+/// auth.v1.dat（"v10" os_crypt 密文 JSON，user.id 与池账号 uid 同源）→ 池反查账号 id。
+/// 原 Cookies qoderuid 探测已证伪（Work Cookies 库不存在该 cookie，恒 None → 守卫
+/// 恒 fail-open、来源槽永不回写）。uid 在池外原样返回；文件缺失/解密失败 → None
+/// （fail-open：保存守卫放行、切换来源槽不回写）。
 #[cfg(windows)]
 pub(crate) fn live_work_account_id(state: &AppState) -> Option<String> {
     let data_dir =
         crate::switcher::profile::profile_for(crate::switcher::TargetApp::QoderWork, &state.data_dir)
             .data_dir;
-    let uid = super::ide_store::read_cookie_value(&data_dir, "qoder.cn", "qoderuid")
-        .filter(|u| !u.is_empty())?;
+    let uid = super::ide_store::scan_work_login_uid(&data_dir)?;
     Some(
         load_pool(state)
             .into_iter()
@@ -222,14 +222,39 @@ pub(crate) fn live_work_account_id(state: &AppState) -> Option<String> {
     )
 }
 
-/// 非 Windows：Qoder Work 守卫无数据源（Cookie 解密依赖 Windows DPAPI）
+/// 非 Windows：Qoder Work 守卫无数据源（auth.v1.dat 解密依赖 Windows DPAPI）
 #[cfg(not(windows))]
 pub(crate) fn live_work_account_id(_state: &AppState) -> Option<String> {
     // macOS 适配预留：与 live_account_id 同链路——Work 数据目录
-    // ~/Library/Application Support/com.qodercn.app.stable 的 Network/Cookies +
+    // ~/Library/Application Support/com.qodercn.app.stable 的 auth.v1.dat +
     // 根级 Local State（macOS 密钥同样在 Keychain Safe Storage），v10 解密逻辑
     // （ide_store::decrypt_v10）本身跨平台可复用，仅需按平台分支密钥获取。
     None
+}
+
+/// 本机双端当前登录账号（账号管理「登录中」徽标数据源，对齐 Trae localEntitlement /
+/// Buddy is_current 徽标）：IDE = state.vscdb secret://userInfo 解密（live_account_id），
+/// Work = auth.v1.dat 解密（live_work_account_id）。解密失败/未登录 → null（fail-open，
+/// 前端不展示徽标）。
+#[derive(serde::Serialize, Clone, Default)]
+pub struct QoderLiveLogins {
+    /// Qoder IDE 当前登录的账号 id（池反查；uid 在池外时为原样 uid）
+    pub ide: Option<String>,
+    /// Qoder Work 当前登录的账号 id（池反查；uid 在池外时为原样 uid）
+    pub work: Option<String>,
+}
+
+#[tauri::command]
+pub async fn qoder_live_logins(state: State<'_, AppState>) -> Result<QoderLiveLogins, String> {
+    // DPAPI + vscdb SQLite/文件 IO 为阻塞操作：spawn_blocking 移出 async worker
+    //（审查 P3 修复，对齐 qoder_accounts_list 惯例；join 失败回退全 None = 不展示徽标）
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || QoderLiveLogins {
+        ide: live_account_id(&st).filter(|s| !s.is_empty()),
+        work: live_work_account_id(&st).filter(|s| !s.is_empty()),
+    })
+    .await
+    .map_err(|e| format!("登录状态读取任务失败: {e}"))
 }
 
 // ── 环境检测（M0 侦察结论固化为候选路径；M0 R-1/R-2 缺口闭合后扩展）─────────
