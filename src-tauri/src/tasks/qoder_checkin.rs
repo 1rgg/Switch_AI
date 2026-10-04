@@ -182,6 +182,12 @@ fn append_results(state: &AppState, events: &[Value]) {
 /// 统计，更换标记本身只需改本常量一处（勿在消费侧绕过常量硬编码前缀）。
 const EMPTY_CAMPAIGNS_TAG: &str = "empty_campaigns";
 
+/// 永久性认证失败标记（fail_kind 产源标记，与 EMPTY_CAMPAIGNS_TAG 同模式）：
+/// pat_rejected / expired_needs_relogin / auth_dead 前置拦截分支产出——
+/// 重试注定失败，调度器按 failed - failed_empty - failed_permanent 判定
+/// 是否冷却重试，避免全天约 28 轮无效重试（审查 minor）
+const PERMANENT_AUTH_TAG: &str = "permanent_auth";
+
 /// 拉取活动列表并过滤可领项。返回 Ok(可领 campaign 列表)；
 /// Err(kind, message)：auth（401，调用方刷新重试）| fail。
 fn list_claimable(
@@ -401,23 +407,31 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &Q
     let base_ev = json!({"user_id": aid, "name": name});
     let (creds, refreshed, note) = qoder_common::ensure_fresh(state, agent, &aid, opts.lazy_hours);
     if creds.access_token.is_empty() {
-        return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
+        let mut ev = json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
                        "message": format!("无可用凭证（{note}）") });
+        if note == "auth_dead" {
+            // 凭证为空且刷新令牌已被永久拒绝：同样属终态，单列免全天重试
+            ev["fail_kind"] = json!(PERMANENT_AUTH_TAG);
+        }
+        return ev;
     }
     if note == "pat_rejected" {
         return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
+                       "fail_kind": PERMANENT_AUTH_TAG,
                        "message": "PAT 校验失败（无效或已吊销）：请到 qoder.com.cn/account/integrations 重新创建并导入" });
     }
     // 前置拦截（审查 L）：凭证已过期且无刷新令牌（expired_needs_relogin）时，本轮
     // 请求与 401 自愈都注定失败——直接 fail 跳过，省一次必败网络请求
     if note == "expired_needs_relogin" {
         return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
+                       "fail_kind": PERMANENT_AUTH_TAG,
                        "message": "凭证已过期且无刷新令牌，需重新登录或重新导入 PAT" });
     }
     // P1 前置拦截：刷新令牌已被服务端 4xx 永久拒绝（auth_dead，池已标记 needs_relogin）
     // 时本轮请求与 401 自愈同样注定失败——直接 fail 跳过，省一次必败网络请求
     if note == "auth_dead" {
         return json!({ "user_id": aid, "name": base_ev["name"], "status": "fail",
+                       "fail_kind": PERMANENT_AUTH_TAG,
                        "message": "登录凭证已失效（刷新令牌被服务端拒绝），请重新导入账号凭证" });
     }
     if refreshed {
@@ -630,7 +644,7 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
         );
         let done = json!({
             "type": "done", "ok": 0, "already": 0, "failed": 0,
-            "failed_empty_campaigns": 0, "skipped_busy": true,
+            "failed_empty_campaigns": 0, "failed_permanent": 0, "skipped_busy": true,
         });
         emit(&done);
         return done;
@@ -675,9 +689,19 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
                 && e.get("fail_kind").and_then(Value::as_str) == Some(EMPTY_CAMPAIGNS_TAG)
         })
         .count();
+    // 永久性认证失败单列（审查 minor）：pat_rejected/expired_needs_relogin/auth_dead
+    // 重试注定失败，调度器从重试判定中剔除，避免全天约 28 轮无效重试 + 必败刷新请求
+    let failed_permanent = events
+        .iter()
+        .filter(|e| {
+            e["status"] == "fail"
+                && e.get("fail_kind").and_then(Value::as_str) == Some(PERMANENT_AUTH_TAG)
+        })
+        .count();
     let done = json!({
         "type": "done", "ok": ok, "already": already, "failed": failed,
         "failed_empty_campaigns": failed_empty_campaigns,
+        "failed_permanent": failed_permanent,
     });
     emit(&done);
     append_results(state, &events);

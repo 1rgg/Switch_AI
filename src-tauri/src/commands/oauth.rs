@@ -186,13 +186,13 @@ fn pem_cert_der(pem: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("本地 CA base64 解码失败: {e}"))
 }
 
-/// 生成随机 hex 字符串。
+/// 生成随机 hex 字符串（安全场景入口：OAuth state / PKCE verifier / 签名 nonce）。
 /// 熵源：OS CSPRNG（Windows BCryptGenRandom 系统首选 RNG）。旧 LCG 以时间戳作种子，
-/// 输出可预测，不适合 OAuth state / PKCE verifier / nonce 等安全场景（审查 P1-6）——
-/// 已移除：CSPRNG 失败直接 panic（系统熵池不可用时继续只会产生可预测输出，
-/// 等同把授权码暴露给可猜 state 的劫持者），不再静默降级。
+/// 输出可预测，不适合安全场景（审查 P1-6）——已移除。CSPRNG 失败返回 Err 上抛为
+/// 用户可见错误：不 panic（审查修复——panic 在异步命令任务内会中止任务，前端
+/// invoke 永不 resolve），也不静默降级为可预测随机。
 #[cfg(windows)]
-pub(crate) fn random_hex(len: usize) -> String {
+pub(crate) fn random_hex_result(len: usize) -> Result<String, String> {
     use windows_sys::Win32::Security::Cryptography::{
         BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
     };
@@ -204,10 +204,31 @@ pub(crate) fn random_hex(len: usize) -> String {
         BCryptGenRandom(halg, bytes.as_mut_ptr(), bytes.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG)
     };
     if status != 0 {
-        panic!(
-            "BCryptGenRandom 失败（status={status:#x}）：系统熵池不可用，拒绝降级为可预测随机"
-        );
+        return Err(format!(
+            "系统熵池不可用（BCryptGenRandom status={status:#x}），已拒绝生成随机数"
+        ));
     }
+    Ok(hex_encode(&bytes, len))
+}
+
+/// 非 Windows（仅本地开发编译）：无 BCrypt 通道，直接哈希熵链（官方构建仅产
+/// Windows，build-windows.yml）。
+#[cfg(not(windows))]
+pub(crate) fn random_hex_result(len: usize) -> Result<String, String> {
+    Ok(hash_hex_fallback(len))
+}
+
+/// 非安全场景便捷封装（request-id / trace-id / 设备号等仅需唯一性）：
+/// CSPRNG 不可用时退化为哈希熵链（唯一性有保障，时间可预测性可接受），
+/// 不 panic 不上抛。安全场景（state/PKCE/nonce）必须走 [random_hex_result]
+/// 并上抛错误（审查 P1-6：熵链不可预测性弱于 CSPRNG，勿用于安全令牌）。
+pub(crate) fn random_hex(len: usize) -> String {
+    random_hex_result(len).unwrap_or_else(|_| hash_hex_fallback(len))
+}
+
+/// 字节 → 定长 hex 字符串（截断到 len）
+#[cfg(windows)]
+fn hex_encode(bytes: &[u8], len: usize) -> String {
     let mut out = String::with_capacity(len);
     for b in bytes {
         if out.len() >= len {
@@ -222,10 +243,9 @@ pub(crate) fn random_hex(len: usize) -> String {
     out
 }
 
-/// 非 Windows（仅本地开发编译）：哈希熵链代替已移除的 LCG（审查 P1-6）。
-/// sha256（时间纳秒 + pid + 计数器）迭代扩展；官方构建仅产 Windows（build-windows.yml）。
-#[cfg(not(windows))]
-pub(crate) fn random_hex(len: usize) -> String {
+/// 哈希熵链回退（sha256：时间纳秒 + pid + 计数器迭代扩展）。仅保证唯一性，
+/// 供 [random_hex] 非安全场景兜底与 [random_hex_result] 非 Windows 实现。
+fn hash_hex_fallback(len: usize) -> String {
     use sha2::{Digest, Sha256};
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut h = Sha256::new();
@@ -312,14 +332,15 @@ fn load_or_create_oauth_device(state: &AppState) -> OAuthDevice {
 }
 
 /// 生成 PKCE code_verifier（RFC 7636：43-128 字符非 reserved 字符；hex 64字符合规）
-/// 与 S256 code_challenge（BASE64URL-NOPAD(SHA256(verifier))）
-fn pkce_pair() -> (String, String) {
+/// 与 S256 code_challenge（BASE64URL-NOPAD(SHA256(verifier))）。
+/// 安全令牌走 [random_hex_result]：CSPRNG 不可用上抛 Err，不静默降级
+fn pkce_pair() -> Result<(String, String), String> {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
-    let verifier = random_hex(64);
+    let verifier = random_hex_result(64)?;
     let digest = Sha256::digest(verifier.as_bytes());
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-    (verifier, challenge)
+    Ok((verifier, challenge))
 }
 
 /// 生成 OAuth 登录 URL（2026-09-16 抓包固化：对齐真实 Trae IDE 登录页参数形态）。
@@ -328,14 +349,14 @@ fn pkce_pair() -> (String, String) {
 /// login_channel=native_ide → 页面前端调 GetPCAuthCode（绑定 PKCE challenge）→
 /// 302 回 auth_callback_url，回调参数为 authCodeInfo（JSON）而非 refreshToken/code。
 #[tauri::command]
-pub fn oauth_get_login_url(state: State<AppState>) -> OAuthLoginUrl {
+pub fn oauth_get_login_url(state: State<AppState>) -> Result<OAuthLoginUrl, String> {
     let state = &*state;
     let dev = load_or_create_oauth_device(state);
     let machine_id = dev.machine_id;
     let device_id = dev.device_id;
     // login_trace_id 兼作 CSRF 绑定值（抓包实证：授权页原样回传为回调 loginTraceID）
     let trace_id = random_hex(32);
-    let (pkce_verifier, code_challenge) = pkce_pair();
+    let (pkce_verifier, code_challenge) = pkce_pair()?;
 
     let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows-PC".into());
     let url = format!(
@@ -380,11 +401,11 @@ pub fn oauth_get_login_url(state: State<AppState>) -> OAuthLoginUrl {
         *guard = Some(PendingLogin { state: trace_id.clone(), pkce_verifier });
     }
 
-    OAuthLoginUrl {
+    Ok(OAuthLoginUrl {
         url,
         state: trace_id,
         redirect_uri: OAUTH_REDIRECT_URI.to_string(),
-    }
+    })
 }
 
 /// 解析 OAuth 回调 URL

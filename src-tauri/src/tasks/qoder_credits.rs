@@ -571,6 +571,37 @@ pub fn fetch_credits(state: &AppState, user_id: Option<&str>, fresh: bool) -> Re
     if accounts.is_empty() {
         return Ok(json!({ "ok": false, "cached": false, "accounts": [], "message": "账号池为空" }));
     }
+    // 跨进程互斥（审查 major，对齐 checkin/refresh scope 模式）：schtasks 调度的
+    // qoder-credits-snapshot（CLI 进程）与应用内 UI 拉积分分属两进程，401 自愈
+    // 并发 ensure_fresh 同一账号会以同一 refresh_token 刷新——服务端一次性轮换下
+    // 败方 4xx 误标 needs_relogin 丢 refresh_token。抢锁失败幂等回退缓存（wait 0
+    // 不阻塞 UI 线程；锁创建失败=机制不可用，同样走回退并落日志区分根因）
+    let (_cross, lock_fail) =
+        qoder_common::CrossProcLock::try_acquire(&state.data_dir, "credits", 0);
+    if _cross.is_none() {
+        let reason = lock_fail.as_ref().map(|f| f.describe()).unwrap_or_default();
+        crate::fs_utils::app_log(
+            &state.data_dir,
+            &format!("[qoder-credits] 跨进程锁未获取（{reason}），本轮回退缓存"),
+        );
+        let fallback = match user_id {
+            Some(uid) => filter_cache_by_user(cache, uid),
+            None => cache,
+        };
+        if fallback.get("accounts").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
+            let mut out = fallback;
+            out["ok"] = json!(false);
+            out["cached"] = json!(true);
+            out["stale"] = json!(true);
+            out["stale_reason"] = json!("另一进程正在同步积分，展示历史缓存");
+            return Ok(out);
+        }
+        return Ok(json!({
+            "ok": false, "cached": false, "stale": false,
+            "accounts": [], "total_balance": 0.0,
+            "message": "另一进程正在同步积分，请稍后重试",
+        }));
+    }
     let rows: Vec<Value> = accounts
         .iter()
         .map(|a| {

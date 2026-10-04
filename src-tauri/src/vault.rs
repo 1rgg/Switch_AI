@@ -225,7 +225,10 @@ fn ns_vault_key(ns: &str, key: &str) -> Vec<u8> {
     format!("ns:{ns}:{key}").into_bytes()
 }
 
-/// 读取命名空间凭证（vault 不可用 / 记录缺失 / 解析失败均返回 None，fail-secure）
+/// 读取命名空间凭证（vault 不可用 / 记录缺失 / 解析失败均返回 None，fail-secure）。
+/// 系统性故障（DPAPI/快照/锁）与「无凭证」在返回值上不可区分——错误先落日志
+/// 留排查线索再回退 None（审查修复：读取侧原完全静默，vault 故障表现为
+/// 「全体掉线」且无线索）
 pub fn ns_get(data_dir: &Path, ns: &str, key: &str) -> Option<serde_json::Value> {
     if ns.is_empty() || key.is_empty() {
         return None;
@@ -240,6 +243,9 @@ pub fn ns_get(data_dir: &Path, ns: &str, key: &str) -> Option<serde_json::Value>
             }
             None => Ok(None),
         }
+    })
+    .inspect_err(|e| {
+        crate::fs_utils::app_log(data_dir, &format!("[vault] ns_get {ns}:{key} 失败: {e}"));
     })
     .ok()
     .flatten()

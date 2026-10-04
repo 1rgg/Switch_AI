@@ -350,8 +350,9 @@ fn edit_qoder_storage_ids(path: &Path, machine_id: &str) -> Result<bool, String>
         }
     }
     if changed {
-        std::fs::write(path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        // 原子写（temp+rename，对齐同文件 edit_storage_device_ids 口径）：
+        // storage.json 是登录态载体，直接覆盖写遇断电/崩溃会产生半截文件
+        crate::fs_utils::write_json(path, &v)?;
     }
     Ok(changed)
 }

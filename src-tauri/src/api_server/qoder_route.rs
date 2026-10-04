@@ -686,7 +686,10 @@ fn run_qoder_stream(
                                         }
                                         continue;
                                     }
-                                    break; // 超限：放回调度轮换
+                                    // 超限/sent_any：不再 break 硬换号——内容已流出
+                                    // （sent_any=true）时换号重发会向同一 SSE 流拼接
+                                    // 第二份完整响应；交下方公共收尾（!sent_any→换号，
+                                    // sent_any→就地收尾），与其他错误分支口径一致
                                 }
                                 Some(kind) => {
                                     let ek = kind.to_err_kind();
@@ -699,8 +702,13 @@ fn run_qoder_stream(
                                     ));
                                 }
                                 None => {
-                                    // translate 之外的错误帧（理论不可达）：按 Server 熔断
-                                    state.qoder_pool.note_error(&win_uid, ErrKind::Server);
+                                    // translate 之外的错误帧。EOF 零完成哨兵（-9901）不经
+                                    // translate 写 ErrMeta，必落本分支（非「理论不可达」）：
+                                    // 上游间歇性空回放属暂态，按 wb_route 口径免熔断，
+                                    // 仅由下方 !sent_any 分支换号重试
+                                    if !super::is_empty_completion(code, &msg) {
+                                        state.qoder_pool.note_error(&win_uid, ErrKind::Server);
+                                    }
                                 }
                             }
                             if !sent_any {

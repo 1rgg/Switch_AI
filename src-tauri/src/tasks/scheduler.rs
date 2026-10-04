@@ -360,7 +360,14 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                 .get("failed_empty_campaigns")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            if failed - failed_empty > 0 {
+            // 审查 minor：永久性认证失败（pat_rejected/expired_needs_relogin/auth_dead）
+            // 重试注定失败，与 empty_campaigns 一并从重试判定剔除——否则失效账号
+            // 会拖动整轮全天约 28 次冷却重试（含每轮必败的刷新请求）
+            let failed_permanent = done
+                .get("failed_permanent")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if failed - failed_empty - failed_permanent > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 return Err(format!(

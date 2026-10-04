@@ -264,8 +264,12 @@ pub fn sticky_bindings_save_ns(
         if ns.is_empty() && other_ns.is_empty() {
             c.execute_batch("DELETE FROM sticky_bindings;")?;
         } else if ns.is_empty() {
-            // 无前缀键（WB/遗留）：删除不属于任何已登记命名空间的行
-            let conds: Vec<String> = other_ns.iter().map(|_| "key LIKE ?".to_string()).collect();
+            // 无前缀键（WB/遗留）：删除不属于任何已登记命名空间的行。
+            // 逐前缀 NOT LIKE 后 AND 连接（≡ NOT(任一前缀命中)）。曾误写
+            // LIKE+AND 的恒假条件——单个 key 不可能同时命中两个前缀模式，
+            // DELETE 恒 0 行：过期绑定永不清理，且残留行占主键使后续 INSERT
+            // 整事务回滚，WB 池粘性绑定在首次落库成功后永久失效（审查 major）
+            let conds: Vec<String> = other_ns.iter().map(|_| "key NOT LIKE ?".to_string()).collect();
             let sql = format!("DELETE FROM sticky_bindings WHERE {}", conds.join(" AND "));
             let mut stmt = c.prepare(&sql)?;
             let patterns: Vec<String> = other_ns.iter().map(|p| format!("{}%", p)).collect();
@@ -471,6 +475,43 @@ mod tests {
         let b = sticky_bindings_load(&s);
         assert_eq!(b["bindings"][0]["uid"], "u1");
         assert_eq!(b["bindings"][0]["explicit"], true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sticky_bindings_save_ns_no_prefix_scope_replaces_only_unowned_rows() {
+        use serde_json::json;
+        let (dir, s) = tmp_store("sticky_ns");
+        // 三池共存：q:/t: 命名空间行 + WB 无前缀行（一条存活、一条待清理）
+        let seed = json!({"bindings": [
+            {"key": "q:a", "uid": "q1", "conv_id": "", "last_seen": 1, "explicit": false},
+            {"key": "t:b", "uid": "t1", "conv_id": "", "last_seen": 1, "explicit": false},
+            {"key": "cid:keep", "uid": "w1", "conv_id": "", "last_seen": 1, "explicit": false},
+            {"key": "cid:stale", "uid": "w0", "conv_id": "", "last_seen": 1, "explicit": false}
+        ]});
+        sticky_bindings_save_ns(&s, &seed, "q:", &["t:", ""]).unwrap();
+        // WB 池范围替换（ns=""，other_ns=q:/t:）：只允许动无前缀行——
+        // 回归锚点：曾误写 LIKE+AND 恒假条件，DELETE 恒 0 行后 cid:stale
+        // 残留占主键，本次 INSERT 整事务回滚（落库永久失效）
+        let wb = json!({"bindings": [
+            {"key": "cid:fresh", "uid": "w2", "conv_id": "", "last_seen": 2, "explicit": false}
+        ]});
+        sticky_bindings_save_ns(&s, &wb, "", &["q:", "t:"]).unwrap();
+        let root = sticky_bindings_load(&s);
+        let keys: Vec<&str> = root["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|b| b["key"].as_str())
+            .collect();
+        assert!(keys.contains(&"q:a"), "q: 命名空间行必须原样保留");
+        assert!(keys.contains(&"t:b"), "t: 命名空间行必须原样保留");
+        assert!(keys.contains(&"cid:fresh"), "WB 新绑定必须写入");
+        assert!(!keys.contains(&"cid:stale"), "无前缀旧行必须被范围替换删除");
+        assert!(!keys.contains(&"cid:keep"), "ns=\"\" 为整命名空间替换，旧无前缀行不保留");
+        // 二次保存仍成功（旧 bug 下主键冲突会回滚）
+        sticky_bindings_save_ns(&s, &wb, "", &["q:", "t:"]).unwrap();
+        assert_eq!(sticky_bindings_load(&s)["bindings"].as_array().unwrap().len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

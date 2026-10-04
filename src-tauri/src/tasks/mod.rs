@@ -105,7 +105,13 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
                 .get("failed_empty_campaigns")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            if failed - failed_empty > 0 {
+            // 永久性认证失败与调度器口径对齐（scheduler.rs 同款）：重试注定失败，
+            // 不计入 Err（否则失效账号让 schtasks 每日执行结果恒为失败）
+            let failed_permanent = done
+                .get("failed_permanent")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if failed - failed_empty - failed_permanent > 0 {
                 let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 let already = done.get("already").and_then(serde_json::Value::as_i64).unwrap_or(0);
                 Err(format!(
