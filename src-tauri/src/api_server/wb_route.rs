@@ -1266,7 +1266,16 @@ pub async fn wb_tool_exec_chat(
                             break Err("上游返回空响应".to_string());
                         };
                         if super::aggregated_response_is_empty(&completion) {
-                            // 空完成（影子风控/上游异常，issue #57）：换号重试
+                            // 空完成（影子风控/上游异常，issue #57）：换号重试。
+                            // 口径：同流式路径不冷却（哨兵注释见 mod.rs）；此处补即时
+                            // 观测日志，接通「空完成 → 模板命中」反查通道（与其余路径一致）
+                            let duration_ms = start_ts.elapsed().as_millis() as u64;
+                            state.logger.log_request_ttfb(
+                                "buddy", "POST", "/v1/responses", &model, stream, 502, &picked.uid,
+                                duration_ms, last_ttfb_ms, &key_name,
+                                &state.wb_pool.name_of(&picked.uid),
+                                Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
+                            );
                             break Err("空完成（影子风控/上游异常）".to_string());
                         }
                         if let Some(u) = completion.get("usage") {

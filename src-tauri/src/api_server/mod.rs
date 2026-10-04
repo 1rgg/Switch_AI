@@ -493,6 +493,16 @@ pub fn classify_solo_error(code: i64, msg: &str) -> ErrKind {
 /// 空完成哨兵码：上游 HTTP 200 正常收流但零内容（影子风控静默拦截 / 上游异常）。
 /// 取负数避免与上游业务码（正整数）冲突；SSE 转换层不发收尾帧、以该哨兵上抛，
 /// 调用方按可重试失败换号处理（is_empty_completion 识别）
+///
+/// # 处置口径（有意按路径分轨，均为换号重试且 tried 集合有界无循环风险）
+///
+/// - **流式**（wb_route/routes 的 stream 路径）：不冷却、不透传、不绑定粘性——
+///   流内判定可能受协议占位帧干扰（如 Responses 协议 created 帧），冷却从严
+///   以免误伤健康账号；
+/// - **聚合**（wb_aggregate/aggregate 路径）：note_error(Server) 短冷却——
+///   整响应零内容判定最确凿，与既有「empty response」处置同口径；
+/// - **toolexec**（wb_tool_exec_chat）：不冷却、补观测日志——多轮代执行按
+///   换号自愈，日志接通「模板命中」反查通道（issue #57 迭代依赖）。
 pub const EMPTY_COMPLETION_CODE: i64 = -9901;
 pub const EMPTY_COMPLETION_MSG: &str =
     "empty completion: upstream returned a completed response with no content";
@@ -503,13 +513,15 @@ pub fn is_empty_completion(code: i64, msg: &str) -> bool {
 }
 
 /// 聚合响应是否零内容（OpenAI chat / legacy text / Anthropic message 三形态）：
-/// 无正文 + 无思考链 + 无工具调用即视为空完成（换号重试）
+/// 无正文 + 无思考链 + 无工具调用即视为空完成（换号重试）。
+/// legacy `message.function_call` 一并判定（防御性：聚合器当前会把
+/// function_call 归一为 tool_calls，此处兜底防未来透传形态漏判）
 pub fn aggregated_response_is_empty(r: &serde_json::Value) -> bool {
     // Anthropic message：顶层 content 块数组
     if let Some(blocks) = r.get("content").and_then(|c| c.as_array()) {
         return blocks.is_empty();
     }
-    // OpenAI chat（message.content/reasoning_content/tool_calls）与
+    // OpenAI chat（message.content/reasoning_content/tool_calls/function_call）与
     // legacy text（choices[0].text）统一判定（缺字段视为空）
     let empty_at = |p: &str| -> bool {
         r.pointer(p)
@@ -521,6 +533,8 @@ pub fn aggregated_response_is_empty(r: &serde_json::Value) -> bool {
         && r.pointer("/choices/0/message/tool_calls")
             .and_then(|t| t.as_array())
             .map_or(true, |a| a.is_empty())
+        && r.pointer("/choices/0/message/function_call")
+            .map_or(true, serde_json::Value::is_null)
         && empty_at("/choices/0/text")
 }
 
