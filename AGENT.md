@@ -200,7 +200,7 @@ ai-work-assistant/
 | Qoder | `qoder_checkin_start(opts)` → NDJSON `qoder-checkin-progress` | Rust 直调 `tasks/qoder_checkin.rs::run_checkin_round`（sash 双活动 claim，幂等回放归类已签；claim 间隔 1~3s 随机抖动；401 刷新一次重试；campaign_id 路径段白名单；done 事件含 `failed_empty_campaigns` 单列计数） |
 | Qoder | `qoder_checkin_results(days?)` | 签到日志（qoder_checkin_results 表 90 天滚动，逐条 UPSERT 按 pk=date\|user_id\|time_ms 去重） |
 | Qoder | `qoder_checkin_task_register(times[]) / _status / _unregister` | schtasks 每日签到任务（主 exe `--task-run qoder-checkin`；应用内调度器同款默认 10:15 单次覆盖双活动） |
-| Qoder | `qoder_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/qoder_credits.rs`：usage 三通道取数（R-7 主结构 userQuota/addOnQuota + 宽容兜底全 None 显式失败）；缓存 10min（仅全部成功落缓存）；401 自愈刷新一次；成功回写池余额；全量且全部成功才落每日快照（含当日消耗差分） |
+| Qoder | `qoder_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/qoder_credits.rs`：usage 三通道取数（R-7 主结构 userQuota/addOnQuota + 宽容兜底全 None 显式失败）+ R-11 逐包明细端点 `GET /api/v2/me/usages/big_model_credits`（total_quota.quota_detail → packages[]，source: plan 订阅配额 / bonus 个人资源包；字段级覆盖、失败静默回退聚合口径）；缓存 10min（仅全部成功落缓存）；401 自愈刷新一次；成功回写池余额；全量且全部成功才落每日快照（含当日消耗差分） |
 | Qoder | `qoder_credits_history_list()` | 积分每日快照时序读取（qoder_credits_history 表 365 天，同日覆盖） |
 | Qoder | `qoder_groups_list / create / update / remove` | 分组管理（kv("qoder_groups")，结构与 Trae/Buddy 一致；create 重名校验；删除时组内账号回落未分组） |
 | Qoder | `qoder_accounts_export(includeCredentials?) / _import(payload)` | 账号库导入导出（kind 标记 `aiwork-qoder-pool`；凭证是否随行由用户勾选，含凭证导出前端强确认；分组定义随载荷导出，导入按 id 幂等合并 + 幽灵 group_id 回落未分组） |

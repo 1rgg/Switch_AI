@@ -181,25 +181,33 @@ export default function ExpiryTab({
     }
     if (scope === 'qoder') {
       for (const acc of qoderCredits?.accounts ?? []) {
-        // 积分包：Add-on 包（source=addon）随订阅周期重置，expire_at = plan_expires_at；已用完不展示
+        // 积分包明细（R-11 逐包口径，展示结构对齐 Buddy 包级样式）：
+        // plan = 订阅配额（随订阅周期重置）、bonus = 个人资源包、
+        // addon = 旧聚合口径（addOnQuota 总额，随订阅周期展示）
         (acc.packages ?? []).forEach((p, i) => {
           if (p.amount != null && p.amount <= 0) return;
+          const isPlan = p.source === 'plan';
+          const isAddon = p.source === 'addon';
+          const pkgName = isPlan ? 'Plan 订阅配额' : isAddon ? 'Add-on 包' : '个人资源包';
+          const resetNote = isPlan || isAddon ? '（随订阅周期重置）' : '';
           items.push({
-            key: `qoder-${acc.user_id}-${i}`,
-            label: `Qoder · ${acc.name}`,
-            kind: p.source === 'addon' ? '订阅重置' : '积分包',
+            key: `qoder-${acc.user_id}-pack-${i}`,
+            label: `Qoder · ${acc.name} · ${pkgName}`,
+            kind: isPlan || isAddon ? '订阅重置' : '积分包',
             expire_ts: dateStrToEndTs(p.expire_at),
             note:
               p.amount == null
                 ? '剩余未知'
-                : p.source === 'addon'
-                  ? `剩余 ${fmtCredits(p.amount)}（Add-on 包 · 随订阅周期重置）`
-                  : `剩余 ${fmtCredits(p.amount)}`,
+                : p.total == null
+                  ? `剩余 ${fmtCredits(p.amount)}${resetNote}`
+                  : `剩余 ${fmtCredits(p.amount)} / 总 ${fmtCredits(p.total)}${resetNote}`,
           });
         });
-        // Plan 订阅重置：订阅周期到期时 Plan 额度重置（仅剩余额度 > 0 展示）
+        // Plan 订阅重置独立条目：包明细已含 plan 包（R-11 逐包口径）时不重复展示，
+        // 仅老缓存/明细接口失败回退聚合口径时补
+        const hasPlanPkg = (acc.packages ?? []).some((p) => p.source === 'plan');
         const planEnd = dateStrToEndTs(acc.plan_expires_at);
-        if (planEnd != null && (acc.plan_credits ?? 0) > 0) {
+        if (!hasPlanPkg && planEnd != null && (acc.plan_credits ?? 0) > 0) {
           items.push({
             key: `qoder-${acc.user_id}-plan`,
             label: `Qoder · ${acc.name}`,

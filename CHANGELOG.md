@@ -18,6 +18,7 @@
 - **Qoder 网关通路 v2（F-80-余）**：① 慢请求竞速对冲 WB 同构——原始行源层首字竞速（胜者统一信封翻译），对冲账号独立解凭证 + 重建 agent 信封，`qoder_hedge_threshold_ms` 热参数（默认 8s，0=关），上游首字节缓慢（静默排队/prefill 等待）场景收益直接；10605 排队通知为即时信封、仍由同号退避处理；② 会话粘性——conversationId/消息指纹双模式绑定账号（busy 让位同 F-77④），同账号 + 同种子派生同一上游 session_id，键命名空间与 WB 粘性同表隔离，`qoder_sticky_enabled` 开关默认关；③ Global 区产品决策**仅 CN 区（国内版）**，Global 专属模型标注说明（资源调度页地区卡 + 目录地区列）。
 - **Qoder 导出文件迁移提示（F-80-余）**：导入历史明文凭证导出文件时识别明文形态（结果 `plaintext_credentials: true`），前端提示重新以加密格式导出归档（不自动改动用户文件）。
 - **Qoder 签到活动档期日历（F-80-余）**：签到结果补 `campaigns` 逐活动明细，签到页新增月历卡——逐日双活动状态点 + 奖励合计 + 选中日逐账号逐活动明细 + 静态档期标注（0:00 签到刷新 / 10:00 登录奖励开窗 / 10:15 调度），辅助校验「10:15 双活动均已开放」类排期决策。
+- **Qoder 积分包逐包明细（R-11 抓包 2026-10-04）**：积分查询在 sash 聚合口径基础上追加 `GET {open_api}/api/v2/me/usages/big_model_credits`（官网 account/usage 页端点），解析 `total_quota.quota_detail` 逐包明细——`PLAN`（订阅配额，`expires_at=0` 随订阅周期重置，到期日以订阅周期兜底）与 `RESOURCE_PACKAGE_SOURCE_BONUS`（个人资源包）分型下发（`source: plan/bonus` + `total` 包总量 + `amount` 剩余），已用完/非激活包过滤对齐 Trae/Buddy 口径；字段级覆盖、失败静默回退 sash 聚合口径（明细接口异常零影响）。前端到期日历改 Buddy 包级样式：`Qoder · 账号 · Plan 订阅配额/个人资源包` + `剩余 X / 总 Y`（先到期在前），包明细含 plan 包时不再重复展示独立 Plan 订阅重置条目（老缓存/回退口径仍补）；KPI「积分包总数」真实包计数（含订阅配额包）、「7 天内到期」逐包累计 + hasPlanPkg 防双计。
 
 ### 修复
 
@@ -39,7 +40,7 @@
 
 ### 测试
 
-- `cargo test` 727 passed / 0 failed / 8 ignored（疑点批新增 `is_pat_channel` 通道判定 / jobToken 探测端点序 / Argon2id 双 KDF roundtrip / 环境重置 9 项目录等回归用例）；`cargo check` 零警告；`tsc --noEmit` 全绿；`vitest` 59 passed（含 `daysFromWbRecords` 同日同账号去重 4 例新增）；`vite build` 通过。
+- `cargo test` 731 passed / 0 failed / 8 ignored（疑点批新增 `is_pat_channel` 通道判定 / jobToken 探测端点序 / Argon2id 双 KDF roundtrip / 环境重置 9 项目录，逐包明细批新增 `parse_big_model` 抓包样本·过滤·降级 3 例等回归用例）；`cargo check` 零警告；`tsc --noEmit` 全绿；`vitest` 59 passed（含 `daysFromWbRecords` 同日同账号去重 4 例新增）；`vite build` 通过。
 
 ---
 

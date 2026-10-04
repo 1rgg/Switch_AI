@@ -369,16 +369,21 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
     let expiring = 0;
     for (const a of accs) {
       totalCredits += a.total ?? 0;
+      // 包明细已含 plan 订阅配额包（R-11 逐包口径）→ 独立 Plan 条目不重复计入
+      let hasPlanPkg = false;
       for (const p of a.packages ?? []) {
         // 包计数与到期日历对齐：剩余未知或 > 0 计入，已用完不计
         if (p.amount != null && p.amount <= 0) continue;
         packages += 1;
+        if (p.source === 'plan') hasPlanPkg = true;
         const endTs = dateStrToEndTs(p.expire_at);
         if (endTs != null && endTs > nowSec && endTs <= horizon) expiring += p.amount ?? 0;
       }
       // 7 天内到期含 Plan 订阅重置额度：订阅周期在窗口内到期，plan 剩余全额计入
-      const planEnd = dateStrToEndTs(a.plan_expires_at);
-      if (planEnd != null && planEnd > nowSec && planEnd <= horizon) expiring += a.plan_credits ?? 0;
+      if (!hasPlanPkg) {
+        const planEnd = dateStrToEndTs(a.plan_expires_at);
+        if (planEnd != null && planEnd > nowSec && planEnd <= horizon) expiring += a.plan_credits ?? 0;
+      }
     }
     // 今日新增：快照 earned（签到合计）优先，回退签到日志 reward 聚合（fetch 未落快照时）
     const todaySnap = qoderSnapshots.find((s) => s.date === today);

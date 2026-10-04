@@ -1386,7 +1386,11 @@ export interface QoderCheckinDone {
 
 export interface QoderCreditPackage {
   amount: number | null;
+  /** 包总量（R-11 逐包明细 limit_value；旧聚合口径无此值） */
+  total?: number | null;
   expire_at: string;
+  /** 包来源：plan = 订阅配额（随订阅周期重置）；bonus = 个人资源包（R-11 逐包明细）；
+   *  addon = 旧聚合口径（addOnQuota 总额，随订阅周期展示） */
   source: string;
 }
 

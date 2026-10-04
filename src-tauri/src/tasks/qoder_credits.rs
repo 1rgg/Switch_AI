@@ -164,6 +164,97 @@ fn parse_usage(b: &Value) -> UsageParsed {
     UsageParsed { plan, plan_used, addon, addon_used, total, plan_expires_at, packages }
 }
 
+// ── 逐包明细端点（R-11 抓包 2026-10-04，官网 account/usage 页）─────────────
+// `GET {open_api}/api/v2/me/usages/big_model_credits`
+// 响应四族配额：plan_quota（订阅配额）/ resource_package_quota（个人资源包）/
+// dedicated_resource_package_quota（专属资源包）/ total_quota（全量合并视图），
+// 每族 { quota_summary, quota_detail[] }；detail 条目含
+// id / limit_value / used_value / remaining_value / expires_at（ms，PLAN 为 0=
+// 随订阅周期重置）/ source（"PLAN" | "RESOURCE_PACKAGE_SOURCE_BONUS" | ...）/ status。
+// 明细取 total_quota.quota_detail——合并视图天然覆盖专属族，无需逐族拼接。
+
+/// big_model_credits 解析产出（字段级覆盖 sash 聚合口径，缺失回退）
+#[derive(Default, Debug, PartialEq)]
+struct BigModelParsed {
+    /// total_quota.quota_summary.remaining_value（全量剩余；与 sash plan+addon 同语义）
+    total: Option<f64>,
+    /// plan_quota.quota_summary（订阅配额，随订阅周期重置）
+    plan: Option<f64>,
+    plan_used: Option<f64>,
+    /// resource_package_quota.quota_summary（个人资源包聚合；sash addOnQuota 同源）
+    addon: Option<f64>,
+    addon_used: Option<f64>,
+    /// nextResetAt（订阅周期重置时刻 ms；sash expiresAt 缺失时兜底）
+    next_reset_ms: Option<i64>,
+    /// 逐包明细（PLAN + 个人资源包；已用完/非激活过滤）
+    packages: Vec<Value>,
+}
+
+/// detail 条目 source → 稳定标识（前端分型展示用）：
+/// "PLAN" → "plan"（订阅配额）；"RESOURCE_PACKAGE*" → "bonus"（个人资源包）；
+/// 其余保留原值小写（未知来源前端按通用积分包展示）
+fn big_model_source(s: &str) -> String {
+    if s == "PLAN" {
+        "plan".into()
+    } else if s.starts_with("RESOURCE_PACKAGE") {
+        "bonus".into()
+    } else {
+        s.to_ascii_lowercase()
+    }
+}
+
+/// big_model_credits 响应 → BigModelParsed（纯函数便于单测）。
+/// 过滤口径对齐 Trae/Buddy 包级口径：已用完（remaining 0）、非激活（is_active=false
+/// 或 status 非 ACTIVE）的包不进明细。
+fn parse_big_model(b: &Value, plan_expires_at: &str) -> BigModelParsed {
+    let summary = |key: &str| b.get(key).and_then(|v| v.get("quota_summary"));
+    let pair = |q: Option<&Value>| {
+        let remaining = num_or_none(q.and_then(|v| v.get("remaining_value")));
+        let used = num_or_none(q.and_then(|v| v.get("used_value")));
+        (remaining, used)
+    };
+    let (plan, plan_used) = pair(summary("plan_quota"));
+    let (addon, addon_used) = pair(summary("resource_package_quota"));
+    let total = num_or_none(summary("total_quota").and_then(|v| v.get("remaining_value")));
+    let next_reset_ms = b.get("nextResetAt").and_then(Value::as_i64);
+    let mut packages: Vec<Value> = Vec::new();
+    if let Some(arr) = b
+        .get("total_quota")
+        .and_then(|v| v.get("quota_detail"))
+        .and_then(Value::as_array)
+    {
+        for d in arr {
+            let amount = num_or_none(d.get("remaining_value"));
+            // 已用完的包无到期提醒价值，不进明细（Trae/Buddy 同款口径）
+            if amount.map(|a| a <= 0.0).unwrap_or(true) {
+                continue;
+            }
+            // 激活态宽容过滤：status 非空且非 ACTIVE / is_active 显式 false 才跳过
+            let status = s_of(d.get("status"));
+            if !status.is_empty() && status != "ACTIVE" {
+                continue;
+            }
+            if d.get("is_active").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            let exp_ms = d.get("expires_at").and_then(Value::as_i64).unwrap_or(0);
+            // expires_at=0（PLAN）＝随订阅周期重置：到期时间取 sash 侧订阅周期到期日
+            let expire_at = if exp_ms > 0 {
+                ms_to_date(exp_ms)
+            } else {
+                plan_expires_at.to_string()
+            };
+            packages.push(json!({
+                "amount": amount,
+                "total": num_or_none(d.get("limit_value")),
+                "expire_at": expire_at,
+                "source": big_model_source(&s_of(d.get("source"))),
+            }));
+        }
+    }
+    BigModelParsed { total, plan, plan_used, addon, addon_used, next_reset_ms, packages }
+}
+
 /// 当前余额（签到奖励差值兜底数据源）：plan + addon remaining 之和；失败 None。
 pub fn fetch_usage_balance(agent: &ureq::Agent, headers: &[(String, String)]) -> Option<f64> {
     let url = format!("{}/sash/api/v2/me/usage", qoder_common::OPEN_API_BASE);
@@ -233,6 +324,42 @@ fn fetch_account(agent: &ureq::Agent, acct: &Value, creds: &qoder_common::QoderC
     row["total"] = json!(p.total);
     row["plan_expires_at"] = json!(p.plan_expires_at);
     row["packages"] = json!(p.packages);
+    // 逐包明细增强（R-11）：big_model_credits 提供 PLAN 订阅配额 + 个人资源包逐包
+    // 明细（到期日历包级展示数据源）。字段级覆盖——新接口有值才覆盖，缺失/失败
+    //（非 200、非 JSON、结构异常）静默回退 sash 聚合口径，不影响既有余额链路
+    let big_url = format!("{}/api/v2/me/usages/big_model_credits", qoder_common::OPEN_API_BASE);
+    let (bs, bb, _) = qoder_common::get_json(agent, &big_url, &headers);
+    if bs == 200 {
+        if let Some(bv) = bb {
+            let bm = parse_big_model(&bv, &p.plan_expires_at);
+            if let Some(v) = bm.total {
+                row["total"] = json!(v);
+            }
+            if let Some(v) = bm.plan {
+                row["plan_credits"] = json!(v);
+            }
+            if let Some(v) = bm.plan_used {
+                row["plan_used"] = json!(v);
+            }
+            if let Some(v) = bm.addon {
+                row["addon_credits"] = json!(v);
+            }
+            if let Some(v) = bm.addon_used {
+                row["addon_used"] = json!(v);
+            }
+            if !bm.packages.is_empty() {
+                row["packages"] = json!(bm.packages);
+            }
+            // sash 侧 expiresAt 缺失时以 nextResetAt 兜底订阅周期到期日
+            if p.plan_expires_at.is_empty() {
+                if let Some(nr) = bm.next_reset_ms {
+                    if nr > 0 {
+                        row["plan_expires_at"] = json!(ms_to_date(nr));
+                    }
+                }
+            }
+        }
+    }
     // source 徽标：PAT 通道（access_token 已换为作业令牌，kind 恒为 pat）/ 客户端 token（dt- 等）
     row["source"] = json!(if creds.kind == "pat" || creds.access_token.starts_with("pt-") { "pat" } else { "client_token" });
     row
@@ -619,5 +746,101 @@ mod tests {
         assert!(!cache_valid(&expired, now));
         let empty = json!({"fetched_at_ms": now, "accounts": []});
         assert!(!cache_valid(&empty, now));
+    }
+
+    // ── big_model_credits 逐包明细（R-11 抓包 2026-10-04）───────────────────
+
+    /// 抓包样本（官网 account/usage 页实测）：PLAN 300（expires_at=0 随订阅周期，
+    /// 已用 19）+ 5 个 RESOURCE_PACKAGE_SOURCE_BONUS 各 100；total_quota 为 6 条合并视图
+    const BIG_MODEL_SAMPLE: &str = r#"{
+        "user_id": "01a0dff8-cc47-7b64-bd6d-d9cb2aea6792",
+        "quota_key": "big_model_credits",
+        "status": "active",
+        "plan_quota": {
+            "quota_summary": {"used_value": 19, "limit_value": 300, "remaining_value": 281, "unit": "credits"},
+            "quota_detail": [{"id": "p1", "limit_value": 300, "used_value": 19, "remaining_value": 281, "unit": "credits", "is_active": true, "expires_at": 0, "source": "PLAN", "status": "ACTIVE"}]
+        },
+        "resource_package_quota": {
+            "quota_summary": {"used_value": 0, "limit_value": 500, "remaining_value": 500, "unit": "credits"},
+            "quota_detail": [{"id": "b1", "limit_value": 100, "used_value": 0, "remaining_value": 100, "expires_at": 1793060431732, "source": "RESOURCE_PACKAGE_SOURCE_BONUS", "status": "ACTIVE"}]
+        },
+        "dedicated_resource_package_quota": {
+            "quota_summary": {"used_value": 0, "limit_value": 0, "remaining_value": 0, "unit": "credits"},
+            "quota_detail": null
+        },
+        "total_quota": {
+            "quota_summary": {"used_value": 19, "limit_value": 800, "remaining_value": 781, "unit": "credits"},
+            "quota_detail": [
+                {"id": "p1", "limit_value": 300, "used_value": 19, "remaining_value": 281, "is_active": true, "expires_at": 0, "source": "PLAN", "status": "ACTIVE"},
+                {"id": "b5", "limit_value": 100, "used_value": 0, "remaining_value": 100, "is_active": true, "expires_at": 1793535788250, "source": "RESOURCE_PACKAGE_SOURCE_BONUS", "status": "ACTIVE"},
+                {"id": "b4", "limit_value": 100, "used_value": 0, "remaining_value": 100, "is_active": true, "expires_at": 1793350958633, "source": "RESOURCE_PACKAGE_SOURCE_BONUS", "status": "ACTIVE"},
+                {"id": "b3", "limit_value": 100, "used_value": 0, "remaining_value": 100, "is_active": true, "expires_at": 1793274555259, "source": "RESOURCE_PACKAGE_SOURCE_BONUS", "status": "ACTIVE"},
+                {"id": "b2", "limit_value": 100, "used_value": 0, "remaining_value": 100, "is_active": true, "expires_at": 1793190775403, "source": "RESOURCE_PACKAGE_SOURCE_BONUS", "status": "ACTIVE"},
+                {"id": "b1", "limit_value": 100, "used_value": 0, "remaining_value": 100, "is_active": true, "expires_at": 1793060431732, "source": "RESOURCE_PACKAGE_SOURCE_BONUS", "status": "ACTIVE"}
+            ]
+        },
+        "lastResetAt": 1790464019910,
+        "nextResetAt": 1791673619906
+    }"#;
+
+    #[test]
+    fn parse_big_model_captured_sample() {
+        let b: Value = serde_json::from_str(BIG_MODEL_SAMPLE).unwrap();
+        let plan_cycle = ms_to_date(1791673619906);
+        let p = parse_big_model(&b, &plan_cycle);
+        // 汇总：total 全量剩余 / plan 订阅配额 / addon 个人资源包聚合
+        assert_eq!(p.total, Some(781.0));
+        assert_eq!(p.plan, Some(281.0));
+        assert_eq!(p.plan_used, Some(19.0));
+        assert_eq!(p.addon, Some(500.0));
+        assert_eq!(p.addon_used, Some(0.0));
+        assert_eq!(p.next_reset_ms, Some(1791673619906));
+        // 逐包明细：total_quota 合并视图 6 条（1 PLAN + 5 bonus）
+        assert_eq!(p.packages.len(), 6);
+        // PLAN：expires_at=0 → 订阅周期到期日兜底
+        assert_eq!(p.packages[0]["source"], json!("plan"));
+        assert_eq!(p.packages[0]["amount"], json!(281.0));
+        assert_eq!(p.packages[0]["total"], json!(300.0));
+        assert_eq!(p.packages[0]["expire_at"], json!(plan_cycle));
+        // 个人资源包：ms → 日期 + source 映射 bonus（到期日断言用同函数推导，防时区翻转）
+        assert_eq!(p.packages[1]["source"], json!("bonus"));
+        assert_eq!(p.packages[1]["amount"], json!(100.0));
+        assert_eq!(p.packages[1]["total"], json!(100.0));
+        assert_eq!(p.packages[1]["expire_at"], json!(ms_to_date(1793535788250)));
+    }
+
+    #[test]
+    fn parse_big_model_filters_inactive_and_empty_detail() {
+        // 已用完（remaining 0）/ status 非 ACTIVE / is_active=false 的包不进明细；
+        // 未知 source 保留小写；quota_detail=null（dedicated 族）不 panic
+        let b = json!({
+            "total_quota": {
+                "quota_summary": {"remaining_value": 50.0, "used_value": 10.0, "limit_value": 60.0},
+                "quota_detail": [
+                    {"remaining_value": 0.0, "limit_value": 100.0, "expires_at": 1793535788250i64, "source": "PLAN", "status": "ACTIVE", "is_active": true},
+                    {"remaining_value": 50.0, "limit_value": 100.0, "expires_at": 1793535788250i64, "source": "RESOURCE_PACKAGE_SOURCE_BONUS", "status": "EXPIRED", "is_active": true},
+                    {"remaining_value": 50.0, "limit_value": 100.0, "expires_at": 1793535788250i64, "source": "RESOURCE_PACKAGE_SOURCE_BONUS", "status": "ACTIVE", "is_active": false},
+                    {"remaining_value": 50.0, "limit_value": 100.0, "expires_at": 1793535788250i64, "source": "DEDICATED_SOURCE_X", "status": "ACTIVE", "is_active": true}
+                ]
+            },
+            "dedicated_resource_package_quota": {"quota_summary": {"remaining_value": 0.0, "used_value": 0.0, "limit_value": 0.0}, "quota_detail": null}
+        });
+        let p = parse_big_model(&b, "");
+        assert_eq!(p.total, Some(50.0));
+        assert_eq!(p.packages.len(), 1);
+        assert_eq!(p.packages[0]["source"], json!("dedicated_source_x"));
+        // 非 0 expires_at 直接 ms → 日期（与抓包样本同函数推导，防时区翻转）
+        assert_eq!(p.packages[0]["expire_at"], json!(ms_to_date(1793535788250)));
+    }
+
+    #[test]
+    fn parse_big_model_empty_and_missing_detail_degrade() {
+        // 空响应 → 全 None 不 panic（fetch 侧静默回退 sash 聚合口径）
+        assert_eq!(parse_big_model(&json!({}), "2026-12-05"), BigModelParsed::default());
+        // total_quota 缺 quota_detail（null）→ 无明细
+        let b = json!({"total_quota": {"quota_summary": {"remaining_value": 30.0}, "quota_detail": null}});
+        let p = parse_big_model(&b, "");
+        assert_eq!(p.total, Some(30.0));
+        assert!(p.packages.is_empty());
     }
 }
