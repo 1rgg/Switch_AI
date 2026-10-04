@@ -108,6 +108,45 @@ describe('daysFromWbRecords（Buddy 逐账号记录 → 逐日聚合）', () => 
     expect(days[0]).toMatchObject({ ok: 0, fail: 1 });
     expect(daysFromWbRecords([])).toEqual([]);
   });
+
+  it('同日同账号多轮去重（新→旧序）：任一 success/already 即当日已领，不再计 fail', () => {
+    // 用户实测场景：同日三轮记录 = already（最新）→ success(+100) → fail(no_credential)
+    const days = daysFromWbRecords([
+      { date: '2026-10-04', user_id: 'u1', name: 'A', status: 'already', reward: 100 },
+      { date: '2026-10-04', user_id: 'u1', name: 'A', status: 'success', reward: 100, message: '签到成功' },
+      { date: '2026-10-04', user_id: 'u1', name: 'A', status: 'fail', message: '无可用凭证（no_credential）' },
+    ]);
+    expect(days[0]).toMatchObject({ ok: 1, fail: 0 }); // 全部已领 → 日格绿点
+    expect(days[0].entries.length).toBe(1); // 明细只出一行（此前 3 行）
+    expect(days[0].entries[0]).toMatchObject({ name: 'A', status: 'success' });
+    expect(days[0].entries[0].note).toBe('+100 积分');
+  });
+
+  it('同日同账号全失败去重：仅最新失败原因；多账号按账号计数不重复', () => {
+    const days = daysFromWbRecords([
+      { date: '2026-10-04', user_id: 'u1', name: 'A', status: 'fail', message: '最新失败原因' },
+      { date: '2026-10-04', user_id: 'u1', name: 'A', status: 'fail', message: '旧失败原因' },
+      { date: '2026-10-04', user_id: 'u2', name: 'B', status: 'success', reward: 100 },
+      { date: '2026-10-04', user_id: 'u2', name: 'B', status: 'fail', message: '无可用凭证（no_credential）' },
+    ]);
+    // u1 全失败（1 fail）、u2 曾成功（1 ok）——此前 fail=3 导致日格误显琥珀
+    expect(days[0]).toMatchObject({ ok: 1, fail: 1 });
+    expect(days[0].entries.length).toBe(2);
+    const a = days[0].entries.find((e) => e.name === 'A')!;
+    const b = days[0].entries.find((e) => e.name === 'B')!;
+    expect(a.status).toBe('fail');
+    expect(a.note).toBe('最新失败原因'); // recs 新→旧，取最新一条
+    expect(b.status).toBe('success');
+    expect(b.note).toBe('+100 积分');
+  });
+
+  it('同日同账号跨轮奖励取最大额（already 回填与 success 同额不叠加）', () => {
+    const days = daysFromWbRecords([
+      { date: '2026-10-04', user_id: 'u1', name: 'A', status: 'already', reward: 100 },
+      { date: '2026-10-04', user_id: 'u1', name: 'A', status: 'success', reward: 100 },
+    ]);
+    expect(days[0].entries[0].note).toBe('+100 积分');
+  });
 });
 
 describe('daysFromTrendPoints（Trae 趋势点 → 逐日汇总行）', () => {

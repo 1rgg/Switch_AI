@@ -25,11 +25,13 @@
 - **三源调度早退缺陷**：buddy+qoder 双源模型在 wb 关闭时误报 400 `wb_upstream_disabled`，补 Qoder 可用性守卫；思考档位 `max` 别名映射不再压过 efforts 白名单（静默降级修复）。
 - **Qoder CN 0.4.3 安装目录拆分适配**：IDE/Work 真实路径候选 + 独立进程检测 + 过期手动路径降级，「打开 IDE/Work」不再误拉 Launcher/Work 本体。
 - **签到与 OAuth 加固一批**：签到失败返 Err 交调度器冷却自愈、already 奖励计入「今日获得」、OAuth poll nonce 回验、claim URL 路径段白名单、积分缓存仅全量成功落库、jobToken 已证实通道优先、identity 回调 20s 超时等十余项。
+- **Trae 活动档期日历无打卡标记（P1）**：`checkin_results` 此前仅 UI 签到路径落库——应用内调度器（每日定时）与 CLI `--task-run checkin` 直调 `trae_checkin::run_round` 不落库，定时签到日历全空；现 `run_round` 末尾统一按日落库 per-uid 最终状态（全路径覆盖，UI 路径重试轮合并后双写幂等），日历/趋势图恢复标记。
+- **Buddy 活动档期日历误显「部分失败」（P1）**：`wb_checkin_results` 为纯追加存储，同日同账号多轮记录（失败→成功→已签）在 `daysFromWbRecords` 聚合时逐条计数——早前失败记录令日格误显琥珀点、明细一账号出多行；现按账号取当日最终态去重（任一 success/already 即当日已领，口径对齐账号列表状态推导；仅全失败账号计 fail 并取最新失败原因），明细一账号一行。
 - **抓包与代理链路**：MITM 转发直连白名单域（qoder 四域直连优先，打通系统代理开启时的 IDE chat 链路）；解密白名单默认值补 Qoder 三域 + 存量旧默认自动迁移；抓包日志响应体预览 8KB→256KB。
 
 ### 测试
 
-- `cargo test` 684 passed / 0 failed；`cargo check` 零警告；`tsc --noEmit` 全绿；`vitest` 35 passed。
+- `cargo test` 721 passed / 0 failed / 8 ignored；`cargo check` 零警告；`tsc --noEmit` 全绿；`vitest` 59 passed（含 `daysFromWbRecords` 同日同账号去重 4 例新增）。
 
 ---
 

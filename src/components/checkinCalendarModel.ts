@@ -91,8 +91,11 @@ export function shiftMonth(cur: { y: number; m: number }, delta: number): { y: n
 
 /**
  * Buddy 逐账号签到记录（wb_checkin_results 表 → workbuddy_checkin_results 命令）→ 逐日聚合。
+ * 结果表为纯追加（调度/手动/重试多轮并存，同日同账号可能多条），按账号取当日最终态：
+ * 任一 success/already 即视为当日已领（口径对齐 BuddyCheckin.checkinStatusOf 的列表推导），
+ * 仅当日全失败账号计 fail（取最新失败原因；recs 为新→旧序，首条即最新）。
  * status 归一：success/already 计入 ok，其余（fail/未知值防御）计入 fail；
- * note 取奖励（>0），失败行取失败原因；账号名缺失回落 user_id。
+ * note 取奖励（>0 时为当日最大奖励额），失败行取失败原因；账号名缺失回落 user_id。
  */
 export function daysFromWbRecords(
   recs: {
@@ -104,26 +107,43 @@ export function daysFromWbRecords(
     reward?: number;
   }[],
 ): CheckinCalendarDay[] {
-  const byDay = new Map<string, CheckinCalendarDay>();
+  // date → (账号键 → 该账号当日记录数组，保持新→旧序)：账号键 user_id 优先，
+  // 旧记录无 user_id 时回落 name（对齐后端去重键约定）
+  const byDay = new Map<string, Map<string, { date: string; user_id: string; name: string; status: string; message?: string; reward?: number }[]>>();
   for (const r of recs) {
-    const d = byDay.get(r.date) ?? { date: r.date, ok: 0, fail: 0, entries: [] };
-    const status =
-      r.status === 'success' ? 'success' : r.status === 'already' ? 'already' : 'fail';
-    if (status === 'fail') d.fail += 1;
-    else d.ok += 1;
-    d.entries.push({
-      name: r.name || r.user_id,
-      status,
-      note:
-        r.reward != null && r.reward > 0
-          ? `+${r.reward} 积分`
-          : r.message && status === 'fail'
-            ? r.message
-            : undefined,
-    });
-    byDay.set(r.date, d);
+    const accs = byDay.get(r.date) ?? new Map();
+    const key = r.user_id || r.name;
+    const arr = accs.get(key) ?? [];
+    arr.push(r);
+    accs.set(key, arr);
+    byDay.set(r.date, accs);
   }
-  return [...byDay.values()];
+  return [...byDay.entries()].map(([date, accs]) => {
+    let ok = 0;
+    let fail = 0;
+    const entries: CheckinCalendarEntry[] = [];
+    for (const arr of accs.values()) {
+      const status: CheckinCalendarEntry['status'] = arr.some((r) => r.status === 'success')
+        ? 'success'
+        : arr.some((r) => r.status === 'already')
+          ? 'already'
+          : 'fail';
+      if (status === 'fail') fail += 1;
+      else ok += 1;
+      const reward = Math.max(...arr.map((r) => r.reward ?? 0));
+      entries.push({
+        name: arr.map((r) => r.name || r.user_id).find(Boolean) ?? '',
+        status,
+        note:
+          reward > 0
+            ? `+${reward} 积分`
+            : status === 'fail'
+              ? arr.find((r) => r.message)?.message
+              : undefined,
+      });
+    }
+    return { date, ok, fail, entries };
+  });
 }
 
 /**

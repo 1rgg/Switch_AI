@@ -116,7 +116,7 @@ ai-work-assistant/
 | OAuth | `oauth_parse_callback(callback_url)` → `{ user_id, ... }` | 解析回调 URL 中的 token |
 | 分组 | `groups_list` / `group_create` / `group_update` / `group_delete` / `group_move` | 删除分组时账号回落「未分组」 |
 | 签到 | `checkin_start(opts)` → NDJSON 事件 | `opts: { scope, user_ids?, skip_checked_in, skip_expired }`；失败自动重试最多 2 轮（30s/90s，T5） |
-| 签到 | `checkin_trends(days?)` → `CheckinTrendPoint[]` | 近 N 天签到结果按日汇总（T8，data/checkin_results.json，保留 90 天） |
+| 签到 | `checkin_trends(days?)` → `CheckinTrendPoint[]` | 近 N 天签到结果按日汇总（T8，checkin_results 表，保留 90 天）；写入方 = `trae_checkin::run_round` 末尾统一落库（UI 手动/托盘/静默/应用内调度器/CLI `--task-run checkin` 全路径覆盖；UI 路径重试轮合并后由 `run_checkin_worker` 再落一次，同 uid 同日以最后一次为准，双写幂等） |
 | 环境 | `app_locate(targetApp)` → `AppLocate` | 四应用安装位置四级探测（手动指定→注册表→默认路径→进程反查，F-01）；`targetApp: trae_work\|trae\|doubao\|workbuddy` |
 | 环境 | `open_doubao_app()` | 启动豆包桌面版（复用 app_locate 豆包档案探测） |
 | 切换 | `switch_account(userId)` | 调 `switcher::run_action(Switch)`（进程内直调，三级关闭策略）；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
@@ -172,7 +172,7 @@ ai-work-assistant/
 | WorkBuddy | `workbuddy_refresh_token(userId)` | plugin refresh 端点（X-Refresh-Token 仅限此端点）+ 回写 token store 与账号池过期时间；失败提示需重登 |
 | WorkBuddy | `workbuddy_checkin_start(opts)` → NDJSON `wb-checkin-progress` | Rust 直调 `tasks/wb_checkin.rs::run_checkin_round`（状态查询回退旧路径 / code:10001 已签容错 / 401 刷新一次重试 / 零 token 输出）；opts: `{ user_ids?, skip_checked_in, skip_expired, lazy_hours? }` |
 | WorkBuddy | `workbuddy_growth_run()` | 成长中心执行入口（旅行/盲盒/任务开关从 workbuddy_settings.json 读取；`wb_checkin::run_growth_round` 链式执行：travel status→claim→config→depart / lottery chances→draw 循环（上限 20）/ tasks→accept，各步独立容错、401 刷新一次重试、奖励数额以接口返回为准） |
-| WorkBuddy | `workbuddy_checkin_results(days?)` | 签到日志（data/workbuddy_checkin_results.json 90 天滚动，默认展示 30 天） |
+| WorkBuddy | `workbuddy_checkin_results(days?)` | 签到日志（wb_checkin_results 表 90 天滚动，默认展示 30 天；**纯追加**：同日同账号多轮并存，返回新→旧序；活动档期日历聚合 `daysFromWbRecords` 按账号取当日最终态——任一 success/already 即当日已领、仅全失败计 fail） |
 | WorkBuddy | `workbuddy_checkin_task_register(times[]) / _status / _unregister` | schtasks 每日双时段签到任务 AIWorkAssistant_WorkBuddyCheckin_<HHMM>（09:00/21:00） |
 | WorkBuddy | `workbuddy_renew_task_register(day) / _status / _unregister` | schtasks 每周凭证续期兜底任务 AIWorkAssistant_WorkBuddyRenew（周日 10:30，主 exe `--task-run wb-renew` → `run_renew_only` 惰性刷新） |
 | WorkBuddy | `workbuddy_credits_fetch(userId?, fresh?)` | Rust 直调 `tasks/wb_credits.rs`：积分三件套 + 旧接口回退 + 容量字段链解析 + ≥10min 缓存；成功回写账号池余额缓存；非缓存命中时追加每日快照（含 earned = 当日余额差分与签到 reward 归并，credits-dashboard-plan.md §2.2 方案 B） |
