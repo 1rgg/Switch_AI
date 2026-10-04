@@ -1399,6 +1399,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut tried = HashSet::new();
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
+        // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
+        // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
+        let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        let templates = super::wb_route::load_templates(&state);
 
         for _ in 0..MAX_ROTATE {
             // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽
@@ -1417,10 +1421,6 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
             guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
             *safe_lock(&state.active_uid) = Some(picked.uid.clone());
 
-            // 指纹清洗（issue #57）：Trae 池沿用全局 wb_sanitize 开关 + 热更新规则表，
-            // 客户端 harness 身份句不再原样透传上游（进入风控名单即全量 11128）
-            let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
-            let templates = super::wb_route::load_templates(&state);
             let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
@@ -1776,6 +1776,10 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let mut tried = HashSet::new();
         // 401 自愈去重（issue #27 方案 B）：每账号每请求最多强制刷新一次（对齐 wb_route T2.6）
         let mut refreshed_401 = HashSet::new();
+        // 指纹清洗（issue #57）：请求级快照（对齐 wb_route）——11128 强制开启后
+        // 跨账号保持，换号不再以未清洗状态重烧一次拦截；热更新开关下请求生效
+        let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
+        let templates = super::wb_route::load_templates(&state);
 
         for _ in 0..MAX_ROTATE {
             let mut picked = match state
@@ -1790,9 +1794,6 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
             // F-77 账号级在途计数：取号即绑定（换号时自动解绑旧账号）
             guard = guard.bind_account(state.pool.inflight_handle(&picked.uid));
 
-            // 指纹清洗（issue #57）：Trae 池沿用全局 wb_sanitize 开关 + 热更新规则表
-            let mut sanitize = state.wb_sanitize.load(std::sync::atomic::Ordering::Relaxed);
-            let templates = super::wb_route::load_templates(&state);
             let mut converted = super::payload::prepare_llm_chat_body(
                 &body_vec, &state.default_model, &picked.uid, &picked.device_id, &picked.machine_id,
                 // 模型目录（config_cache 缓存，热路径）：function 查表优先
