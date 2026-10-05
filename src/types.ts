@@ -355,6 +355,11 @@ export interface Settings {
   notify_webhook_url: string | null;
   /** Server酱 SendKey（空 = 关闭） */
   notify_serverchan_sendkey: string | null;
+  // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──
+  /** 固定应用 key：始终显示在侧边栏且不可隐藏（单选，默认 'trae'） */
+  pinned_app: AppKey;
+  /** 侧边栏隐藏的应用 key 列表（空 = 全部显示；固定应用即使列入也强制显示） */
+  hidden_apps: AppKey[];
 }
 
 /** F-74：会话域（WorkBuddy = ~/.workbuddy，CodeBuddy = ~/.codebuddy） */
