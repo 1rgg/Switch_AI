@@ -4,7 +4,8 @@ import { useAppStore } from '../store';
 import { withMinDelay } from '../lib/delay';
 import { api } from '../lib/tauri';
 import { THEMES } from '../lib/themes';
-import type { Settings as SettingsType } from '../types';
+import { APP_TABS } from './Sidebar';
+import type { AppKey, Settings as SettingsType } from '../types';
 
 /**
  * 通用设置面板：外观 / 语言 / 通用与通知 / 代理相关配置。
@@ -74,6 +75,27 @@ export default function GeneralSettingsPanel() {
     setForm((prev) => (prev ? { ...prev, [key]: val } : prev));
   };
 
+  // 切换固定应用：新固定项强制从隐藏列表移除（始终可见、不可取消）
+  const setPinned = (key: AppKey) => {
+    setForm((prev) =>
+      prev ? { ...prev, pinned_app: key, hidden_apps: prev.hidden_apps.filter((a) => a !== key) } : prev,
+    );
+  };
+
+  // 勾选 = 显示（移出隐藏列表）；取消勾选 = 隐藏（加入隐藏列表）
+  const toggleAppVisible = (key: AppKey) => {
+    setForm((prev) =>
+      prev
+        ? {
+            ...prev,
+            hidden_apps: prev.hidden_apps.includes(key)
+              ? prev.hidden_apps.filter((a) => a !== key)
+              : [...prev.hidden_apps, key],
+          }
+        : prev,
+    );
+  };
+
   const save = async () => {
     if (!form) return;
     setSaving(true);
@@ -118,6 +140,52 @@ export default function GeneralSettingsPanel() {
               <option value="zh-CN">简体中文</option>
               <option value="en-US">English</option>
             </select>
+          </div>
+        </div>
+      </section>
+
+      {/* 应用显示（侧边栏应用 Tab：固定应用单选 + 显示勾选） */}
+      <section className="card p-4">
+        <h3 className="mb-1 font-medium">应用显示</h3>
+        <p className="mb-3 text-xs text-slate-400">
+          控制左下角侧边栏显示哪些应用。「固定应用」始终显示且不可隐藏（默认 Trae）；其余应用可自由勾选。
+          隐藏仅收起入口，<b>不删除账号数据、不影响签到 / 保活等定时任务</b>，重新勾选即可恢复；
+          若当前正在浏览的应用被隐藏，会自动跳回固定应用。
+        </p>
+        <div className="grid gap-x-8 gap-y-2 sm:grid-cols-2">
+          <div className="space-y-2">
+            <label className="label">固定应用（始终显示）</label>
+            {APP_TABS.map((tab) => (
+              <label key={tab.key} className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="pinned-app"
+                  checked={form.pinned_app === tab.key}
+                  onChange={() => setPinned(tab.key)}
+                />
+                {tab.label}
+                {tab.title ? <span className="text-xs text-slate-400">（{tab.title}）</span> : null}
+              </label>
+            ))}
+          </div>
+          <div className="space-y-2">
+            <label className="label">侧边栏显示</label>
+            {APP_TABS.map((tab) => {
+              const pinned = form.pinned_app === tab.key;
+              const visible = pinned || !form.hidden_apps.includes(tab.key);
+              return (
+                <label key={tab.key} className={`flex items-center gap-2 ${pinned ? 'opacity-60' : ''}`}>
+                  <input
+                    type="checkbox"
+                    checked={visible}
+                    disabled={pinned}
+                    onChange={() => toggleAppVisible(tab.key)}
+                  />
+                  {tab.label}
+                  {pinned ? <span className="text-xs text-slate-400">（固定应用，不可隐藏）</span> : null}
+                </label>
+              );
+            })}
           </div>
         </div>
       </section>

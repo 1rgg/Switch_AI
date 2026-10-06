@@ -292,6 +292,13 @@ pub struct Settings {
     /// 间隔，任一 tick 必落窗内）；关闭后凭证仅在使用时惰性刷新
     #[serde(default = "default_true")]
     pub qoder_token_renew_enabled: bool,
+    // ── 侧边栏应用显示（仅 UI 偏好：隐藏不停功能、不删数据、不影响计划任务） ──
+    /// 固定应用：始终显示在侧边栏且不可隐藏（radio 单选，默认 trae）
+    #[serde(default = "default_pinned_app")]
+    pub pinned_app: String,
+    /// 侧边栏隐藏的应用 key 列表（空 = 全部显示；固定应用即使列入也强制显示）
+    #[serde(default)]
+    pub hidden_apps: Vec<String>,
 }
 
 fn default_api_port() -> u16 {
@@ -299,6 +306,10 @@ fn default_api_port() -> u16 {
 }
 fn default_api_model() -> String {
     "deepseek-v4-flash".into()
+}
+/// 侧边栏固定应用默认 trae（主应用与回退项）
+fn default_pinned_app() -> String {
+    "trae".into()
 }
 
 fn default_port() -> u16 {

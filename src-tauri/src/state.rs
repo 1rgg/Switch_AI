@@ -293,6 +293,19 @@ impl AppState {
         if s.trae_credits_sync_mode.trim().is_empty() {
             s.trae_credits_sync_mode = "daily".into();
         }
+        // 侧边栏应用显示：固定应用零值回填（kv 全缺失走 Settings::default() 时 String=""）
+        if s.pinned_app.trim().is_empty() {
+            s.pinned_app = "trae".into();
+        }
+        // 隐藏列表归一：丢弃非法 key、去重排序；固定应用强制可见（双保险，前端同样约束）
+        {
+            let pinned = s.pinned_app.clone();
+            s.hidden_apps.retain(|k| {
+                matches!(k.as_str(), "trae" | "buddy" | "qoder" | "doubao") && k != &pinned
+            });
+            s.hidden_apps.sort_unstable();
+            s.hidden_apps.dedup();
+        }
         // 通知渠道迁移（F-19 → 系统设置页通知渠道面板，Trae/Buddy 共用）：
         // app_settings 渠道字段双 None 时从旧 workbuddy_settings 一次性搬运。
         // 命中即 kv_set 回写持久化——push_notify 裸读 kv 不经过本函数，仅内存视图会让
