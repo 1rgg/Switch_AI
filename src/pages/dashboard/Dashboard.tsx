@@ -201,7 +201,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   }, []);
 
   // 懒加载（§3.4）：本地 token 仅 Buddy 页拉取（Trae 页本地源禁用，tokenStats 为
-  // WB/CodeBuddy 会话扫描的重操作，Trae 页零消费不触发）；网关数据在 Token Tab
+  // WorkBuddy 会话扫描的重操作，Trae 页零消费不触发）；网关数据在 Token Tab
   // 或 积分统计 Tab 网关源首次激活时拉取（SQLite 直查，轻）
   useEffect(() => {
     if (platform === 'buddy' && tab === 'tokens' && !tokensLoadedRef.current) {
@@ -467,7 +467,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
             official: 'Qoder 官网未提供 token 用量接口',
           }
         : platform === 'trae'
-          ? { local: '本地 Token 统计 = WB/CodeBuddy 客户端会话，Trae 无本地源' }
+          ? { local: '本地 Token 统计 = WorkBuddy 桌面端 + CodeBuddy IDE 会话，Trae 无本地源' }
           : { official: 'Buddy 官网未提供按日 token 明细接口' }
       : isQoder
         ? {

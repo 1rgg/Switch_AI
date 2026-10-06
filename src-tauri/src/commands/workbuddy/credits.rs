@@ -157,9 +157,39 @@ pub fn workbuddy_editions_backfill(state: State<AppState>) -> Result<usize, Stri
     Ok(backfill_edition_from_payment_type(&state))
 }
 
+/// 账号集合指纹（排序去重后的 user_id 列表）；无账号明细（空数组/缺字段）返回 None。
+/// 用途：判定相邻快照是否「同账号集合可比」——见 append_credits_snapshot 与
+/// workbuddy_usage_fallback 的可比性守卫。
+fn accounts_fingerprint(items: &[Value]) -> Option<Vec<String>> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut ids: Vec<String> = items
+        .iter()
+        .map(|a| {
+            a.get("user_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Some(ids)
+}
+
+/// 从快照对象取账号集合指纹（`{date,ts,total_balance,accounts:[{user_id,balance}],earned}`）
+fn snapshot_fingerprint(snapshot: &Value) -> Option<Vec<String>> {
+    accounts_fingerprint(snapshot.get("accounts").and_then(Value::as_array)?)
+}
+
 /// 追加每日积分余额快照（F-27）：SQLite 化 P6 → wb_credits_history 表，同日覆盖最新 + 365 天裁剪。
 /// credits-dashboard-plan.md §2.2 方案 B：快照行新增 earned（当日新增积分）——
 /// 口径 = max(当日余额差分(≥0), 当日签到 reward 合计)；首日无历史差分时退化为仅签到 reward。
+/// **账号集合可比性守卫（2026-10-06 修复）**：与上一快照账号集合不一致（增/删账号）时
+/// 余额差分不可比——新账号余额直接抬高 total，会被当成「当日获得」（实测 2026-10-05/10-06
+/// 加号后 earned 虚增 2217.83/3059.06），且 fallback 侧消耗被 .max(0.0) 钳成 0；
+/// 此时 earned 只取签到 reward。对齐 Qoder 侧账号数不一致即不采信差分的既有口径。
 fn append_credits_snapshot(state: &AppState, parsed: &Value) {
     let store = crate::store::db(&state.data_dir);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -182,19 +212,33 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
     let checkin_reward = checkin_reward_today(&store, &today);
     // 当日余额差分（最近一条「早于今天」的快照 → 当日总余额）；无历史快照 = 首日，无差分
     let hist: Value = crate::store::docs::wb_credits_history_load(&store);
-    let prev_total = hist
+    let prev_snapshot = hist
         .get("snapshots")
         .and_then(Value::as_array)
         .and_then(|snaps| {
             snaps
                 .iter()
                 .filter(|s| s.get("date").and_then(Value::as_str).map(|d| d < today.as_str()).unwrap_or(false))
-                .filter_map(|s| s.get("total_balance").and_then(Value::as_f64))
+                .filter(|s| s.get("total_balance").and_then(Value::as_f64).is_some())
                 .last()
         });
-    let earned = match prev_total {
-        Some(prev) => (total - prev).max(0.0).max(checkin_reward),
-        None => checkin_reward,
+    let prev_total = prev_snapshot.and_then(|s| s.get("total_balance").and_then(Value::as_f64));
+    // 可比性守卫：账号集合与上一快照不一致 → 差分含新账号余额，不可信，earned 只取签到 reward
+    // （任一侧无账号明细的旧快照视为可比，维持既有差分行为）
+    let set_changed = match (
+        prev_snapshot.and_then(snapshot_fingerprint),
+        accounts_fingerprint(&accounts),
+    ) {
+        (Some(prev), Some(cur)) => prev != cur,
+        _ => false,
+    };
+    let earned = if set_changed {
+        checkin_reward
+    } else {
+        match prev_total {
+            Some(prev) => (total - prev).max(0.0).max(checkin_reward),
+            None => checkin_reward,
+        }
     };
     let snap = serde_json::json!({
         "date": today,
@@ -266,8 +310,13 @@ pub fn workbuddy_usage_fallback(state: State<AppState>) -> Result<serde_json::Va
     }
 
     // 快照差分（快照按 date 升序，credits 追加时保序）
+    // 账号集合可比性守卫（2026-10-06 修复）：相邻两快照账号集合不一致（增/删账号）当日
+    // 差分不可比——新账号余额抬高 cur_bal 会把消耗 .max(0.0) 钳成 0（实测 2026-10-05/10-06
+    // 加号日恒 0），删账号则反向虚增消耗。该日**不计入 daily**（趋势留空，对齐 Qoder
+    // consumed=null 过滤「不可比日不计入」口径；旧快照无账号明细时维持既有差分行为）。
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let mut daily: Vec<Value> = vec![];
+    let mut skipped_uncomparable = 0usize;
     for i in 1..snapshots.len() {
         let (Some(prev_bal), Some(cur_bal)) = (
             snapshots[i - 1].get("total_balance").and_then(Value::as_f64),
@@ -276,6 +325,17 @@ pub fn workbuddy_usage_fallback(state: State<AppState>) -> Result<serde_json::Va
             continue;
         };
         let Some(date) = snapshots[i].get("date").and_then(Value::as_str) else { continue };
+        let comparable = match (
+            snapshot_fingerprint(&snapshots[i - 1]),
+            snapshot_fingerprint(&snapshots[i]),
+        ) {
+            (Some(prev), Some(cur)) => prev == cur,
+            _ => true,
+        };
+        if !comparable {
+            skipped_uncomparable += 1;
+            continue;
+        }
         let reward = recharge.get(date).copied().unwrap_or(0.0);
         let usage = (prev_bal - cur_bal + reward).max(0.0);
         daily.push(serde_json::json!({ "date": date, "usage": usage }));
@@ -304,6 +364,13 @@ pub fn workbuddy_usage_fallback(state: State<AppState>) -> Result<serde_json::Va
         }
     }
 
+    let note = if skipped_uncomparable > 0 {
+        format!(
+            "快照回退数据源（本地余额时序差分 + 签到日志推导），非官方逐请求口径；账号增删日不可比已跳过 {skipped_uncomparable} 天"
+        )
+    } else {
+        "快照回退数据源（本地余额时序差分 + 签到日志推导），非官方逐请求口径".to_string()
+    };
     Ok(serde_json::json!({
         "status": "snapshot",
         "snapshot_days": snapshots.len(),
@@ -313,7 +380,7 @@ pub fn workbuddy_usage_fallback(state: State<AppState>) -> Result<serde_json::Va
             "usage_this_month": usage_month,
         },
         "daily": daily,
-        "note": "快照回退数据源（本地余额时序差分 + 签到日志推导），非官方逐请求口径",
+        "note": note,
         "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
         "_today": today,
     }))
@@ -994,5 +1061,43 @@ mod credits_tests {
             None
         );
         assert_eq!(earliest_pack_expire(&serde_json::json!({}), 500), None);
+    }
+
+    // ── accounts_fingerprint（2026-10-06：账号增删日差分可比性守卫）────────────
+
+    #[test]
+    fn accounts_fingerprint_sorts_dedups_and_ignores_order() {
+        let a = serde_json::json!([{"user_id": "wb-b"}, {"user_id": "wb-a"}]);
+        let b = serde_json::json!([{"user_id": "wb-a"}, {"user_id": "wb-b"}]);
+        assert_eq!(
+            accounts_fingerprint(a.as_array().unwrap()),
+            accounts_fingerprint(b.as_array().unwrap())
+        );
+        assert_eq!(
+            accounts_fingerprint(a.as_array().unwrap()),
+            Some(vec!["wb-a".to_string(), "wb-b".to_string()])
+        );
+    }
+
+    #[test]
+    fn accounts_fingerprint_none_without_details_and_detects_set_change() {
+        // 无账号明细（空数组 / 缺字段）= 不可比信息缺失，返回 None 由调用方维持既有行为
+        assert_eq!(accounts_fingerprint(&[]), None);
+        assert_eq!(
+            snapshot_fingerprint(&serde_json::json!({"date": "2026-10-06"})),
+            None
+        );
+        // 加号 / 换号（同数量不同集合）都必须判为集合变化
+        let prev = serde_json::json!({"accounts": [{"user_id": "wb-a"}, {"user_id": "wb-b"}]});
+        let added = serde_json::json!({"accounts": [{"user_id": "wb-a"}, {"user_id": "wb-b"}, {"user_id": "wb-c"}]});
+        let swapped = serde_json::json!({"accounts": [{"user_id": "wb-a"}, {"user_id": "wb-c"}]});
+        assert_ne!(snapshot_fingerprint(&prev), snapshot_fingerprint(&added));
+        assert_ne!(snapshot_fingerprint(&prev), snapshot_fingerprint(&swapped));
+        assert_eq!(
+            snapshot_fingerprint(&prev),
+            snapshot_fingerprint(&serde_json::json!({
+                "accounts": [{"user_id": "wb-b", "balance": 1.0}, {"user_id": "wb-a", "balance": 2.0}]
+            }))
+        );
     }
 }
