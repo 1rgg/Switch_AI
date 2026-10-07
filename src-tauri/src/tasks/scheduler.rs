@@ -170,6 +170,9 @@ fn tick(app: &AppHandle, st: &AppState) {
     let now = chrono::Local::now();
     let today = now.format("%Y-%m-%d").to_string();
     let now_hm = now.format("%H:%M").to_string();
+    // 网关运行态句柄（main.rs manage；积分类任务运行中回写池快照用，issue #67）
+    let api_runtime = app
+        .state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：「每日 HH:MM」/「每小时」/「每N小时」）
         let trigger = match sched_plan(st, t) {
@@ -207,7 +210,9 @@ fn tick(app: &AppHandle, st: &AppState) {
                 continue;
             }
         }
-        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_task(t.key, st))) {
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_task(t.key, st, Some(api_runtime.inner()))
+        })) {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("任务线程 panic（已捕获，不影响后续调度）".to_string()),
@@ -340,8 +345,14 @@ fn enabled(st: &AppState, key: &str) -> bool {
     }
 }
 
-/// 执行单个任务（复用 CLI 任务同款实现，进度静默、结果汇总落日志）
-fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
+/// 执行单个任务（复用 CLI 任务同款实现，进度静默、结果汇总落日志）。
+/// `runtime`：GUI 进程内的网关运行态句柄（tick 经 AppHandle 取得），
+/// 供积分类任务运行中回写池快照（issue #67）；CLI 侧传 None
+fn run_task(
+    key: &str,
+    st: &AppState,
+    runtime: Option<&std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+) -> Result<Value, String> {
     match key {
         // Trae 每日签到：与 `--task-run checkin` 同款（vault 全账号单轮，状态核验幂等）。
         // 审查 P2：存在可重试失败时返 Err，交调度器 30 分钟冷却重试（对齐 qoder-checkin）；
@@ -510,8 +521,9 @@ fn run_task(key: &str, st: &AppState) -> Result<Value, String> {
                 "usage": usage,
             }))
         }
-        // Trae 积分数据同步：与 `--task-run refresh-credits` 同款（无账号返回 refreshed=0）
-        "trae-credits-snapshot" => crate::commands::accounts::refresh_remaining_credits_impl(st)
+        // Trae 积分数据同步：与 `--task-run refresh-credits` 同款（无账号返回 refreshed=0）；
+        // GUI 进程内把 runtime 句柄传入，网关运行中同步回写池内积分快照（issue #67）
+        "trae-credits-snapshot" => crate::commands::accounts::refresh_remaining_credits_impl(st, runtime)
             .map(|n| json!({ "ok": true, "refreshed": n })),
         // Trae 消耗明细同步（issue #61）：与 `--task-run trae-usage-sync` 同款（fresh=true 增量拉取）；
         // 无账号静默跳过（对齐 trae-models-sync 惯例）；全部账号拉取失败返 Err 交 30 分钟冷却重试
