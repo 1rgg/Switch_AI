@@ -122,7 +122,7 @@ ai-work-assistant/
 | 切换 | `switch_account(userId)` | 调 `switcher::run_action(Switch)`（进程内直调，三级关闭策略）；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
 | 切换 | `reset_device_ids(userId)` | switch 模块：重置设备指纹（区别于 misc 的 `device_reset` 只删映射）；仅 icube 布局 |
 | 保存 | `save_current_login(userId)` | 调 `switcher::run_action(SaveCurrentLogin)`；`target_app` 支持 TraeWork/Trae/Doubao/WorkBuddy/CodeBuddy |
-| 快照 | `profile_list` → `ProfileInfo[]` | 列出快照槽；`target_app` 决定根目录 profiles / profiles_trae / profiles_doubao / profiles_codebuddy |
+| 快照 | `profile_list(targetApp?, fresh?)` → `ProfileInfo[]` | 列出快照槽；`target_app` 决定根目录 profiles / profiles_trae / profiles_doubao / profiles_codebuddy。**性能（2026-10-07）**：体积统计（`dir_stats` 递归整棵快照目录）改「缓存 + 多槽并行 + `spawn_blocking`」——CodeBuddy 档实测 18,372 目录 / 13,659 文件 / 300MB，单线程 4.89s、4 线程 1.64s（耗时几乎全在逐目录 `read_dir`：只遍历不取 metadata 同样 4.87s），原实现是同步命令逐槽串行 → 打开快照管理卡 UI 数秒。缓存键 = 槽位目录绝对路径，`mtime` 仅作尽力而为失效信号（NTFS 只在**直接子项**增删时更新槽位目录时间戳，且更新有延迟），正确性由 TTL 300s + 显式失效（备份/删除后 `invalidate_profile_stats`）保证；`fresh=true` 绕过缓存（前端「刷新列表」按钮）。埋点 `[profiles] 快照体积统计 …` 仅在实际计算时落一行 |
 | 快照 | `profile_backup(userId)` / `profile_restore(userId)` / `profile_delete(slot)` | 手动备份/恢复/删除；`target_app` 同上 |
 | 快照 | `profile_format_size(...)` | 快照体积格式化 |
 | 豆包 | `doubao_accounts_list` → `DoubaoAccountView[]` | 账号池 ∪ profiles_doubao 快照槽合并视图 + 当前账号标记 + 会话状态（last 槽与 `*.bak` 单代回滚槽不展示） |
