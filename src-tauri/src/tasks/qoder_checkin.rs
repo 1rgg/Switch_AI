@@ -476,6 +476,23 @@ fn classify_blind_step(status: u16, claimed: Option<&str>, replayed: bool) -> Bl
     BlindStep::Failed(status)
 }
 
+/// 盲发失败的人类可读原因（known_daily_fallback Failed 分支消息构造）。
+/// 已探针锁定的形态给可操作提示，其余保留 HTTP 码 + 原始响应前缀（截 120
+/// 字符，与旧格式一致）供排障：
+/// - 200/BLOCKED：服务端风控明确拒绝本次领取（非依赖故障、非瞬时错误），
+///   提示到真实客户端建立设备信任
+/// - 503/RISK_DEPENDENCY_UNAVAILABLE：风控前置依赖暂不可用，调度器会自动重试
+fn describe_blind_failure(code: u16, claimed: Option<&str>, raw: &str) -> String {
+    if claimed == Some("BLOCKED") {
+        return "服务端风控拦截（status=BLOCKED，本次领取被拒绝）——请在 Qoder 客户端正常登录/使用一次建立设备信任后重试".into();
+    }
+    if code == 503 && raw.contains("RISK_DEPENDENCY_UNAVAILABLE") {
+        return "服务端风控依赖暂不可用（503 RISK_DEPENDENCY_UNAVAILABLE），稍后将自动重试".into();
+    }
+    let head: String = raw.chars().take(120).collect();
+    format!("（HTTP {code}）{head}")
+}
+
 /// 盲发兜底聚合结果（替代原 Option<(kind, message, reward)>——None 曾被调用方
 /// 解释为「无可领活动（均已领取）」，掩盖真实失败）。
 enum FallbackOutcome {
@@ -546,8 +563,10 @@ fn known_daily_fallback(agent: &ureq::Agent, headers: &[(String, String)]) -> Fa
                 any_replay = true;
             }
             BlindStep::Failed(code) => {
-                let head: String = raw.chars().take(120).collect();
-                fail_parts.push(format!("{cname} 盲发失败（HTTP {code}）{head}"));
+                fail_parts.push(format!(
+                    "{cname} 盲发失败：{}",
+                    describe_blind_failure(code, claimed.as_deref(), &raw)
+                ));
                 // 继续尝试下一条：单条失败不中断（聚合时整体归 Failed）
             }
         }
@@ -1088,6 +1107,32 @@ mod tests {
         assert!(matches!(classify_blind_step(0, None, false), Failed(0)));
         // 401 → Auth
         assert!(matches!(classify_blind_step(401, None, false), Auth));
+    }
+
+    /// 盲发失败消息构造：BLOCKED/风控依赖不可用给可操作提示（不倾倒原始
+    /// JSON），未知形态保留旧格式（HTTP 码 + 原始响应前缀）
+    #[test]
+    fn describe_blind_failure_friendly_for_known_shapes() {
+        // 实测 BLOCKED 形态（2026-10-07 nick 账号）：HTTP 200 + status=BLOCKED
+        let raw = r#"{"grantId":"01a114bf-5a68-712d-bc12-5fd8391baa59","status":"BLOCKED","replayed":false}"#;
+        let msg = describe_blind_failure(200, Some("BLOCKED"), raw);
+        assert!(msg.contains("风控拦截"), "{msg}");
+        assert!(msg.contains("BLOCKED"), "{msg}");
+        assert!(msg.contains("客户端"), "{msg}");
+        assert!(!msg.contains("grantId"), "BLOCKED 形态不得倾倒原始 JSON：{msg}");
+        // 503 风控依赖不可用
+        let msg = describe_blind_failure(
+            503,
+            None,
+            r#"{"code":{"message":"risk dependency unavailable","code":"RISK_DEPENDENCY_UNAVAILABLE"}}"#,
+        );
+        assert!(msg.contains("RISK_DEPENDENCY_UNAVAILABLE"), "{msg}");
+        assert!(msg.contains("自动重试"), "{msg}");
+        // 未知形态：保持旧格式（HTTP 码 + 原始响应前缀）
+        assert_eq!(
+            describe_blind_failure(404, None, r#"{"message":"not found"}"#),
+            r#"（HTTP 404）{"message":"not found"}"#
+        );
     }
 
     /// filter_claimable：CLAIMABLE 大小写宽容 + 非 CLAIMABLE 全排除
