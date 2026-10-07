@@ -534,27 +534,37 @@ fn codebuddy_ide_root() -> Option<PathBuf> {
 /// `<product>` 不写死：实测至少存在 `CodeBuddyIDE` 与 `VSCode` 两套布局，
 /// 后者同样落 `history\<ws-hash>\<session>\index.json` 且含真实用量
 /// （本机 45 个会话索引中 4 个有用量），只看 `CodeBuddyIDE` 会静默漏计。
-/// 结构异常（新版布局变化）时回退限深递归兜底（剪掉已知重子树）。
+/// 结构异常（新版布局变化）时按**产品子树**回退限深递归兜底（剪掉已知重子树）。
 fn collect_codebuddy_indexes(data_root: &Path, output: &mut Vec<PathBuf>) {
-    let before = output.len();
     for uid_dir in subdirs(data_root) {
         for product_dir in subdirs(&uid_dir) {
-            for workspace_root in subdirs(&product_dir) {
-                let history = workspace_root.join("history");
-                for ws_hash in subdirs(&history) {
-                    for session in subdirs(&ws_hash) {
-                        let idx = session.join("index.json");
-                        if idx.is_file() {
-                            output.push(idx);
-                        }
-                    }
-                }
+            let before = output.len();
+            collect_session_indexes(&product_dir, output);
+            if output.len() == before {
+                // 兜底按**产品子树**判零：某产品布局漂移（如新增层级）而其余产品仍
+                // 命中时，全局判零不会触发兜底、该子树的会话索引会被静默漏收。
+                // 子树级判零只对异常子树限深递归，正常子树零慢路径不变；
+                // 起点比全局兜底深一层、深度预算更足，覆盖原全局兜底的全部搜索
+                // 范围（Data 根直接子树即全部 product_dir，根上文件本就不含
+                // history 祖先），故不再保留全局兜底。
+                collect_codebuddy_indexes_deep(&product_dir, 0, output);
             }
         }
     }
-    if output.len() == before {
-        // 兜底：结构与预期不符时保留旧行为（仅当严格扫描零命中才走，避免常态慢路径）
-        collect_codebuddy_indexes_deep(data_root, 0, output);
+}
+
+/// 单个产品子树的结构化定向下探：`<workspace>\history\<ws-hash>\<session>\index.json`。
+fn collect_session_indexes(product_dir: &Path, output: &mut Vec<PathBuf>) {
+    for workspace_root in subdirs(product_dir) {
+        let history = workspace_root.join("history");
+        for ws_hash in subdirs(&history) {
+            for session in subdirs(&ws_hash) {
+                let idx = session.join("index.json");
+                if idx.is_file() {
+                    output.push(idx);
+                }
+            }
+        }
     }
 }
 
@@ -1366,6 +1376,76 @@ mod tests {
         let mut again = Vec::new();
         collect_codebuddy_indexes(&root, &mut again);
         assert_eq!(again.len(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 兜底按**产品子树**判零：某产品布局漂移（此处 history\<ws> 下多出一层）
+    /// 而其余产品仍正常命中时，漂移子树由限深兜底补收、不再静默漏收，
+    /// 正常子树仍走结构化快路径（评审 #1 修复的回归锁定）。
+    #[test]
+    fn collect_codebuddy_indexes_falls_back_per_product_on_layout_drift() {
+        let root = std::env::temp_dir().join(format!("wb_stats_p4_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let uid = "u1";
+        let ws = "d41d8cd98f00b204e9800998ecf8427e";
+
+        // VSCode 子树：正常布局（结构化下探命中）
+        let vscode_ok = root
+            .join(uid)
+            .join("VSCode")
+            .join(uid)
+            .join("history")
+            .join(ws)
+            .join("vscode-conv");
+        std::fs::create_dir_all(&vscode_ok).unwrap();
+        std::fs::write(
+            vscode_ok.join("index.json"),
+            json!({ "messages": [], "requests": [] }).to_string(),
+        )
+        .unwrap();
+
+        // CodeBuddyIDE 子树：布局漂移——history\<ws> 与会话目录之间多了一层 v2，
+        // 结构化下探（只认 history\<ws>\<session>\index.json）在该子树零命中
+        let drifted = root
+            .join(uid)
+            .join("CodeBuddyIDE")
+            .join(uid)
+            .join("history")
+            .join(ws)
+            .join("v2")
+            .join("drifted-conv");
+        std::fs::create_dir_all(&drifted).unwrap();
+        std::fs::write(
+            drifted.join("index.json"),
+            json!({ "messages": [], "requests": [] }).to_string(),
+        )
+        .unwrap();
+
+        let dir_name = |p: &PathBuf| -> Option<String> {
+            p.parent()
+                .and_then(|d| d.file_name())
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        };
+        let mut paths = Vec::new();
+        collect_codebuddy_indexes(&root, &mut paths);
+        assert_eq!(
+            paths.len(),
+            2,
+            "正常子树快路径 + 漂移子树兜底都应收集：{paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| dir_name(p).as_deref() == Some("vscode-conv")),
+            "VSCode 正常布局应结构化命中：{paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| dir_name(p).as_deref() == Some("drifted-conv")),
+            "CodeBuddyIDE 漂移布局应由子树级兜底补收，不静默漏收：{paths:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
