@@ -75,22 +75,46 @@ pub(crate) fn dir_stats(path: &std::path::Path) -> (u64, u64) {
 /// 性能（2026-10-07 实测）：CodeBuddy 档 14 个槽位 / 18,372 目录 / 13,659 文件，
 /// 单线程 `dir_stats` 约 4.9s，且「只遍历不取 metadata」同样 4.87s——耗时几乎全在逐目录
 /// `read_dir`（Windows 上文件 metadata 随目录项免费返回，不是瓶颈）。4 线程同机实测 1.7s。
+/// 分配用 round-robin 交错而非连续切块：连续切块下体积悬殊的槽位扎堆同一线程时，
+/// 总时长由最慢线程决定，并行收益退化。
 fn dir_stats_many(paths: &[PathBuf]) -> Vec<(u64, u64)> {
     if paths.is_empty() {
         return Vec::new();
     }
     let threads = paths.len().min(4).max(1);
-    let chunk = paths.len().div_ceil(threads).max(1);
+    let mut out = vec![(0u64, 0u64); paths.len()];
     std::thread::scope(|scope| {
-        let handles: Vec<_> = paths
-            .chunks(chunk)
-            .map(|c| scope.spawn(move || c.iter().map(|p| dir_stats(p)).collect::<Vec<_>>()))
+        let handles: Vec<_> = (0..threads)
+            .map(|i| {
+                scope.spawn(move || {
+                    paths
+                        .iter()
+                        .enumerate()
+                        .skip(i)
+                        .step_by(threads)
+                        .map(|(gi, p)| (gi, dir_stats(p)))
+                        .collect::<Vec<_>>()
+                })
+            })
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
-    })
+        // 按全局下标回填而非 flat_map 拼接：某线程 panic（join Err）时只在收集线程
+        // 串行重算该线程负责的槽位、对位补齐——不会因缺块让后续槽位体积整体错位。
+        for (i, h) in handles.into_iter().enumerate() {
+            match h.join() {
+                Ok(rs) => {
+                    for (gi, r) in rs {
+                        out[gi] = r;
+                    }
+                }
+                Err(_) => {
+                    for (gi, p) in paths.iter().enumerate().skip(i).step_by(threads) {
+                        out[gi] = dir_stats(p);
+                    }
+                }
+            }
+        }
+    });
+    out
 }
 
 /// 槽位体积缓存项。
