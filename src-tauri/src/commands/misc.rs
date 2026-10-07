@@ -431,14 +431,23 @@ fn collect_proxy_candidates(
     for name in files {
         let path = log_dir.join(name);
         if keyword.is_empty() {
-            let idx = proxy_file_index(&path)?;
+            // 健壮性（对齐基线 `Err(_) => continue`）：单文件读失败（被独占锁定、权限变化等）
+            // 跳过该文件继续其余文件，不让整个列表失败
+            let idx = match proxy_file_index(&path) {
+                Ok(idx) => idx,
+                Err(_) => continue,
+            };
             for (ei, e) in idx.entries.iter().enumerate() {
                 if ts_in_range(e.ts_str(), start, end) {
                     out.push((name.clone(), ei, *e));
                 }
             }
         } else {
-            let bytes = std::fs::read(&path).map_err(|e| format!("读取日志文件失败: {e}"))?;
+            // 同上：单文件读失败跳过（基线关键字路径同样是整读，读失败 continue）
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
             for (ei, e) in scan_index_entries(&bytes, 0).iter().enumerate() {
                 if !ts_in_range(e.ts_str(), start, end) {
                     continue;
@@ -505,6 +514,7 @@ fn proxy_logs_list_impl(
         .skip(offset)
         .take(limit)
         .filter_map(|(name, ei, e)| {
+            // 单条读取失败（候选收集后文件恰被删除/轮转）降级跳过该条，不让整页失败
             let text = read_entry_text(&log_dir.join(&name), &e).ok()?;
             parse_proxy_entry(&text, &name, ei)
         })
@@ -1432,6 +1442,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(filtered.total, 1, "时间戳为空串的块在带起始时间时应被排除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 健壮性：单文件读失败跳过该文件，列表/关键字路径均不整体报错（对齐基线
+    /// `Err(_) => continue`；此处用同名子目录模拟读失败——Windows 打开目录报
+    /// Access denied，Unix read 目录报 EISDIR，两平台都走不到正文）
+    #[test]
+    fn proxy_logs_list_skips_unreadable_file() {
+        let dir = tmp_dir("proxy_logs_skip");
+        write_proxy_log(
+            &dir,
+            "proxy_req_2026-10-01.log",
+            &[proxy_entry_text("2026-10-01 10:00:00", "GET", "a.example.com/x", "200 OK", "body-one")],
+        );
+        // 目录名匹配 proxy_req_*.log → 会进文件列表，但读内容必然失败
+        std::fs::create_dir(dir.join("proxy_req_2026-10-02.log")).unwrap();
+
+        let all = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, None, None, None)).unwrap();
+        assert_eq!(all.total, 1, "坏文件应被跳过而非整个列表失败");
+        assert_eq!(all.entries[0].id, "proxy_req_2026-10-01.log:0");
+
+        // 关键字路径同样跳过
+        let kw = proxy_logs_list_impl(&dir, &proxy_opts(0, 50, Some("body"), None, None)).unwrap();
+        assert_eq!(kw.total, 1);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
