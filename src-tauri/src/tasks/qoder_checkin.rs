@@ -751,7 +751,12 @@ pub fn run_checkin_round(state: &AppState, opts: &QoderCheckinOpts, emit: &mut d
     emit(&json!({"type": "start", "total": accounts.len()}));
 
     let mut events: Vec<Value> = Vec::new();
+    // 多账号签到间隔（任务配置页可改，默认 3s，0=关闭）：防上游频控，账号间串行等待
+    let gap_secs = crate::models::effective_checkin_gap(state.settings().qoder_checkin_gap_secs);
     for (i, acct) in accounts.iter().enumerate() {
+        if i > 0 && gap_secs > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(gap_secs));
+        }
         // 单账号失败不中断整轮（对齐 wb try/except 语义）
         let mut ev = process_account(state, &agent, acct, opts);
         ev["index"] = json!(i + 1);

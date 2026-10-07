@@ -720,8 +720,11 @@ fn try_capture_doubao_credentials(ctx: &ProxyCtx, host: &str, req_headers: &[(St
         return;
     }
     *cache = Some(captured.clone());
-    // SQLite 化（P3）：凭证快照 → kv `doubao_captured_credentials`
-    let _ = crate::store::db(&ctx.data_dir).kv_set("doubao_captured_credentials", &captured);
+    // 凭证收敛（审查 P1-7）：抓包凭证 → vault（ns "doubao"/"captured"），明文禁入
+    // SQLite；vault 失败仅记日志（内存缓存保当次会话可用，下次抓包重试写入）
+    if let Err(e) = crate::vault::ns_set(&ctx.data_dir, "doubao", "captured", &captured) {
+        ctx.log.log(&format!("  [doubao] 抓包凭证入 vault 失败（仅本次内存缓存可用）: {e}"));
+    }
     ctx.log.log(&format!(
         "  [doubao] 抓到会话凭证: sessionid={} 字符{}{}{}",
         session_id.len(),

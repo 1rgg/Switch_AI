@@ -646,9 +646,18 @@ fn detect_uid_from_local_storage(state: &State<AppState>) -> Option<String> {
 /// 从代理抓包凭证读 uid（代理 MITM 层解析 multi_sids 得到；None = 未抓到/旧格式无此字段）。
 /// SQLite 化（P3）：kv `doubao_captured_credentials`。
 fn read_captured_uid(state: &State<AppState>) -> Option<String> {
-    let v: serde_json::Value = crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+    let v = read_captured_credentials(&state.data_dir);
     let uid = v.get("uid")?.as_str()?.trim().to_string();
     (!uid.is_empty()).then_some(uid)
+}
+
+/// 读代理抓包凭证（凭证收敛 P1-7）：vault ns "doubao"/"captured" 优先，回退旧
+/// 明文 kv（迁移前存量，启动迁移后即抹除）；均无返回 Null。新写入只进 vault
+pub(crate) fn read_captured_credentials(data_dir: &std::path::Path) -> serde_json::Value {
+    if let Some(v) = crate::vault::ns_get(data_dir, "doubao", "captured") {
+        return v;
+    }
+    crate::store::db(data_dir).kv_get("doubao_captured_credentials")
 }
 
 /// 来源①：从 User Data/Local State 的 profile.info_cache 取最近活跃 Profile 的 saman.user_id。
@@ -1029,8 +1038,8 @@ pub struct DoubaoCapturedCredential {
 
 #[tauri::command]
 pub fn doubao_captured_credential(state: State<AppState>) -> Result<Option<DoubaoCapturedCredential>, String> {
-    // SQLite 化（P3）：kv `doubao_captured_credentials`
-    let v: serde_json::Value = crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+    // 凭证收敛（P1-7）：vault 优先，回退旧明文 kv
+    let v = read_captured_credentials(&state.data_dir);
     if v.is_null() {
         return Ok(None);
     }
@@ -1172,8 +1181,8 @@ pub fn doubao_account_get_credential(
 /// 返回 Some(说明) = 本次发生了写入（前端据此提示并刷新）；None = 无凭证/无 uid/未入池/内容未变。
 #[tauri::command]
 pub fn doubao_credential_auto_apply(state: State<AppState>) -> Result<Option<String>, String> {
-    // 读最新抓包凭证（SQLite 化 P3：kv `doubao_captured_credentials`）
-    let v: serde_json::Value = crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+    // 读最新抓包凭证（凭证收敛 P1-7：vault 优先，回退旧明文 kv）
+    let v = read_captured_credentials(&state.data_dir);
     if v.is_null() {
         return Ok(None);
     }

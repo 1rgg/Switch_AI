@@ -704,22 +704,35 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
 }
 
 /// 全账号官方用量聚合（Buddy 积分看板「近 7 日积分消耗」主数据源）：
+/// force=false 走 10min 缓存；调度器 wb-credits-snapshot 以 force=true 定时预热本缓存
+/// （issue #61 同款缺口：此前调度器只刷单账号 workbuddy_usage_official_cache，
+/// 而看板消费的是本全账号聚合缓存，页面常驻时近 7 日趋势停留在最后打开时刻）。
+#[tauri::command(async)]
+pub fn workbuddy_usage_official_all(state: State<AppState>) -> Result<serde_json::Value, String> {
+    workbuddy_usage_official_all_impl(&state, false)
+}
+
+/// 实现（本命令与调度器 wb-credits-snapshot 用量刷新共用）：
 /// 遍历账号池全部有凭证账号，逐个拉取官方用量明细后按日/按模型求和（31 天零填充）。
 /// 此前看板用快照差分（usageFallback）作唯一数据源——快照只在打开积分页且非缓存
 /// 命中时写入，未打开应用的日子无快照，7 日趋势只剩「昨天」一格。
 /// 单账号失败跳过（accounts_ok 计数），全部失败才报错并回退过期缓存（stale）。
 /// 聚合结果缓存 10 分钟（跨账号全量拉取代价高，避免看板每次刷新都打满分页请求）。
-#[tauri::command(async)]
-pub fn workbuddy_usage_official_all(state: State<AppState>) -> Result<serde_json::Value, String> {
+pub(crate) fn workbuddy_usage_official_all_impl(
+    state: &AppState,
+    force: bool,
+) -> Result<serde_json::Value, String> {
     let cache_path = "workbuddy_usage_official_all_cache"; // kv 键（SQLite 化 P2）
     let cached_val: Option<Value> = {
         let c: Value = crate::store::db(&state.data_dir).kv_get(cache_path);
         (c.get("status").is_some()).then_some(c)
     };
-    if let Some(cached) = &cached_val {
-        let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
-        if chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000 {
-            return Ok(cached.clone());
+    if !force {
+        if let Some(cached) = &cached_val {
+            let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
+            if chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000 {
+                return Ok(cached.clone());
+            }
         }
     }
     let fail = |msg: &str| -> Result<Value, String> {
@@ -733,7 +746,7 @@ pub fn workbuddy_usage_official_all(state: State<AppState>) -> Result<serde_json
     };
 
     // 枚举有凭证账号：账号池优先，token store 补充（按 id 去重）
-    let store: Value = crate::tasks::wb_common::load_token_store(&state);
+    let store: Value = crate::tasks::wb_common::load_token_store(state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
     let pick = |id: &str| -> Option<(String, String, String)> {
         let rec = tokens.get(id)?;
@@ -744,7 +757,7 @@ pub fn workbuddy_usage_official_all(state: State<AppState>) -> Result<serde_json
         let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
         Some((id.to_string(), token, domain))
     };
-    let pool = load_pool(&state);
+    let pool = load_pool(state);
     let mut list: Vec<(String, String, String)> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for a in &pool.accounts {

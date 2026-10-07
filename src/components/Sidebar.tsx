@@ -18,6 +18,7 @@ import {
 import { useAppStore } from '../store';
 import { cn } from '../lib/cn';
 import { nextTheme } from '../lib/themes';
+import { resolveAppIcon } from '../lib/appIcons';
 import type { ViewKey, AppKey } from '../types';
 import AboutDialog from './AboutDialog';
 import SystemDialog from './SystemDialog';
@@ -158,7 +159,8 @@ export default function Sidebar({
           )}
         >
           {visibleTabs.map((tab) => {
-            const TabIcon = tab.icon;
+            // 自定义图标优先（系统设置「应用图标」），非法/缺失回退 APP_TABS 内置图标
+            const TabIcon = resolveAppIcon(settings?.app_icons?.[tab.key]) ?? tab.icon;
             const active = activeApp === tab.key;
             return (
               <button

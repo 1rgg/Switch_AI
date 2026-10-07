@@ -1087,6 +1087,17 @@ impl CrossProcLock {
         scope: &str,
         wait_ms: u32,
     ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        Self::try_acquire_ns(data_dir, "qoder", scope, wait_ms)
+    }
+
+    /// 带命名空间版本：WB 域复用同一互斥体机制（ns="wb"），锁名互不串扰。
+    /// ns/scope 均须为单段名（不得含 `\`，见上方多段名教训）。
+    pub fn try_acquire_ns(
+        data_dir: &std::path::Path,
+        ns: &str,
+        scope: &str,
+        wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
         use windows_sys::Win32::Foundation::{
             CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
         };
@@ -1098,7 +1109,7 @@ impl CrossProcLock {
         let mut h = Sha256::new();
         h.update(data_dir.to_string_lossy().as_bytes());
         let hex: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        let name: Vec<u16> = format!("Global\\AIWorkAssistant.qoder.{scope}.{}", &hex[..16])
+        let name: Vec<u16> = format!("Global\\AIWorkAssistant.{ns}.{scope}.{}", &hex[..16])
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -1150,7 +1161,16 @@ pub struct CrossProcLock;
 #[cfg(not(windows))]
 impl CrossProcLock {
     pub fn try_acquire(
+        data_dir: &std::path::Path,
+        scope: &str,
+        wait_ms: u32,
+    ) -> (Option<Self>, Option<CrossProcLockFail>) {
+        Self::try_acquire_ns(data_dir, "qoder", scope, wait_ms)
+    }
+
+    pub fn try_acquire_ns(
         _data_dir: &std::path::Path,
+        _ns: &str,
         _scope: &str,
         _wait_ms: u32,
     ) -> (Option<Self>, Option<CrossProcLockFail>) {

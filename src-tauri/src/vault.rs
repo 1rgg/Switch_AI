@@ -550,6 +550,29 @@ pub fn migrate_ns_on_startup(state: &AppState) {
             }
         }
     }
+    // ④ 豆包抓包凭证（审查 P1-7：kv doubao_captured_credentials → vault，
+    // ns "doubao"/"captured"；vault 成功后删除明文 kv 行，读取侧 vault 优先）
+    {
+        let plain: serde_json::Value =
+            crate::store::db(&state.data_dir).kv_get("doubao_captured_credentials");
+        let has_session = plain
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .map_or(false, |s| !s.is_empty());
+        if has_session {
+            match crate::vault::ns_set(&state.data_dir, "doubao", "captured", &plain) {
+                Ok(()) => {
+                    let _ =
+                        crate::store::db(&state.data_dir).kv_delete("doubao_captured_credentials");
+                    fs_utils::app_log(&state.data_dir, "启动迁移: 豆包抓包凭证已加密写入 vault");
+                }
+                Err(e) => fs_utils::app_log(
+                    &state.data_dir,
+                    &format!("启动迁移: 豆包抓包凭证入 vault 失败（下次启动重试）: {e}"),
+                ),
+            }
+        }
+    }
 }
 
 /// 清理目录下残留的临时凭据文件（按前缀匹配，覆盖 write_json 的 .tmp 半成品），返回数量

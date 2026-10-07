@@ -212,6 +212,10 @@ function defaultSettings(): Settings {
     buddy_switch_migrate_chats: false,
     // Trae 每日签到调度时刻（环境配置页可改，默认 09:00；schtasks 注册时间复用该值）
     trae_checkin_hhmm: '09:00',
+    // 签到多账号间隔秒（默认 3s，防上游频控；0=关闭；Trae/Buddy/Qoder 各自环境配置页可改，Buddy 签到与成长共用）
+    trae_checkin_gap_secs: 3,
+    wb_checkin_gap_secs: 3,
+    qoder_checkin_gap_secs: 3,
     // Trae JWT 定时续期（issue #27）：默认开，每日 09:00 惰性续期临期账号
     jwt_renew_enabled: true,
     jwt_renew_hhmm: '09:00',
@@ -220,10 +224,10 @@ function defaultSettings(): Settings {
     wb_growth_hhmm: '09:00',
     // WorkBuddy 每日签到调度时刻（任务配置页可改，默认 09:10）
     wb_checkin_hhmm: '09:10',
-    // 积分/Token 同步与官网模型定时同步：默认每日定时（Buddy 23:30 / Trae 23:40）与默认开（05:45 / 05:40）
+    // 积分/Token 同步与官网模型定时同步：Buddy 默认每日 23:30；Trae 默认每小时（issue #61）+每日时刻 23:40（daily 模式生效）；模型同步默认开（05:45 / 05:40）
     wb_credits_sync_mode: 'daily',
     wb_credits_sync_hhmm: '23:30',
-    trae_credits_sync_mode: 'daily',
+    trae_credits_sync_mode: 'hourly',
     trae_credits_sync_hhmm: '23:40',
     wb_catalog_sync_enabled: true,
     wb_catalog_sync_hhmm: '05:45',
@@ -241,6 +245,7 @@ function defaultSettings(): Settings {
     // 侧边栏应用显示：默认固定 Trae，其余应用全部显示
     pinned_app: 'trae',
     hidden_apps: [],
+    app_icons: {},
     // Qoder（F-80）：客户端路径与调度时刻/开关（默认 10:15 签到 / 23:40 快照）
     qoder_ide_path: null,
     qoderwork_path: null,
@@ -677,6 +682,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       settings.hidden_apps = (settings.hidden_apps ?? []).filter(
         (a): a is AppKey => validApps.includes(a) && a !== settings.pinned_app,
       );
+      // 自定义图标兜底：非法应用 key / 空图标名丢弃（非法图标名由渲染层 resolveAppIcon 回退默认）
+      const cleanIcons: Partial<Record<AppKey, string>> = {};
+      for (const [k, v] of Object.entries(settings.app_icons ?? {})) {
+        if (validApps.includes(k as AppKey) && typeof v === 'string' && v.trim()) {
+          cleanIcons[k as AppKey] = v.trim();
+        }
+      }
+      settings.app_icons = cleanIcons;
       set({ settings });
     } catch {
       set({ settings: defaultSettings() });
