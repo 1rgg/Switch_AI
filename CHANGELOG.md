@@ -4,6 +4,18 @@
 
 ---
 
+## [Unreleased]
+
+### 修复
+
+- **[P1] Qoder 每日签到误报「已领（此前已领）」——设备风控真值集成 + 盲发失败如实上报**：每日 100 Credits 活动 campaignId 每日轮换，服务端按设备风控身份真值（machineToken/MachineType/MachineCode 三元组）做指纹分桶——工具派生值会被分入独立桶，表现为 campaigns 列表恒无 CLAIMABLE + claim 盲发 503 `RISK_DEPENDENCY_UNAVAILABLE`，旧代码把非成功盲发静默归 already 造成「假已领」。现：① openapi 域 `Cosy-MachineToken/Code/Type` 三键优先取 Qoder 主客户端随包 `runtime-info.exe` 产出的真值（OnceLock 缓存进程内至多 spawn 一次、CREATE_NO_WINDOW、客户端未装/解析失败回退 machine_id 派生并保持幂等），并按客户端 0.4.3 抓包形态补齐 `Cosy-Version`/`Cosy-MachineOS`/`Cosy-MachineHostname`（openapi 域与网关域 COSY 协议版本互不通用）；② 真实已领判定从严（claimStatus==CLAIMED + actionType==CLAIM_BENEFIT + benefit 类型 + 活动时间窗口四条件齐备），已知活动兜底盲发逐条聚合归类（Success/AlreadyReplay/Auth/Failed），任一 Failed 如实归 fail 交调度器 30 分钟自动重试（宁 fail 不假 already），仅全部重放才归 already；campaigns 列表改全量返回不过滤，CLAIMABLE 过滤下沉为独立纯函数。实机验证：账号池签到真实到账（CLAIMED 非重放），风控 BLOCKED 账号如实报 fail。
+
+### 测试
+
+- `cargo test` 774 passed / 0 failed / 9 ignored。
+
+---
+
 ## [3.7.1] · 2026-10-07 · 看板数据联动 + 三池耗尽归因 + 指纹清洗 UI 化 + 加固批
 
 > 范围：自 [3.7.0] 以来的全部变更。
