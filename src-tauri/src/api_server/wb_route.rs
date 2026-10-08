@@ -298,6 +298,7 @@ fn race_first_byte(
     tried: &HashSet<String>,
     allowed: Option<&HashSet<String>>,
     dedicated: Option<&str>,
+    wb_global: bool,
 ) -> Result<RaceWin, ()> {
     let hedge_ms = state.wb_hedge_threshold_ms.load(std::sync::atomic::Ordering::Relaxed);
     if hedge_ms == 0 {
@@ -314,9 +315,10 @@ fn race_first_byte(
     let dedicated2 = dedicated.map(str::to_string);
     let body = converted.to_vec();
     let spawn_backup = move || -> Option<(Box<dyn Read + Send>, HedgeLease)> {
+        // Switch AI 区域拆分：对冲账号与主账号同区域（请求区域由 dispatch 决策）
         let (picked2, ev) = state2
             .wb_pool
-            .pick_excluding_constrained_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref())?;
+            .pick_excluding_constrained_region_ev(&tried2, allowed2.as_ref(), dedicated2.as_deref(), Some(wb_global))?;
         // F-77⑤ 可观测：对冲取号同样记录 busy 让位/降级事件
         if let Some(ev) = ev {
             state2.logger.log_sched_event(&ev);
@@ -418,6 +420,7 @@ pub fn wb_stream_chat(
     proto: Protocol,
     key_id: String,
     guard: InflightGuard,
+    wb_global: bool,
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel(64);
 
@@ -462,7 +465,7 @@ pub fn wb_stream_chat(
             });
         }
 
-        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard);
+        run_wb_stream(&state, &body_vec, &model, proto, &key_id, &chat_id, &tx, start_ts, guard, wb_global);
     });
 
     let stream = ReceiverStream::new(rx);
@@ -490,6 +493,7 @@ fn run_wb_stream(
     tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     start_ts: Instant,
     mut guard: InflightGuard,
+    wb_global: bool,
 ) {
     // 请求日志附带的 API Key 展示名（匿名/未知 → 空串，日志显示 "-"）
     let key_name = super::api_keys::key_name_for(&state.data_dir, key_id);
@@ -509,7 +513,9 @@ fn run_wb_stream(
         .map_or((None, None), |c| (c.allowed, c.dedicated));
 
     // 粘性首轮：命中绑定且账号 healthy → 锁定账号与上游会话（双段分配）；
-    // 子 Key 限定上游不含粘性账号时忽略粘性
+    // 子 Key 限定上游不含粘性账号时忽略粘性；
+    // Switch AI 区域拆分：粘性账号区域与请求区域错配时忽略粘性（模型→区域
+    // 决策在 dispatch，粘性只应在本区域账号间复用上游会话缓存）
     let sticky0: Option<(String, String)> = state
         .wb_sticky
         .resolve(&sticky_key, now_ts())
@@ -520,6 +526,7 @@ fn run_wb_stream(
             state
                 .wb_pool
                 .pick_by_uid(&b.uid)
+                .filter(|p| p.global_region == wb_global)
                 .map(|_| (b.uid, b.conv_id))
         });
     let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
@@ -533,7 +540,7 @@ fn run_wb_stream(
         .and_then(|(u, _)| {
             state
                 .wb_pool
-                .pick_sticky_yield(u, allowed_set.as_ref())
+                .pick_sticky_yield(u, allowed_set.as_ref(), Some(wb_global))
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
@@ -553,9 +560,10 @@ fn run_wb_stream(
             return;
         }
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
+        // Switch AI 区域拆分：取号约束请求区域（Some(wb_global)），跨区域账号不参与
         let picked = match first_pick.take() {
             Some(p) => p,
-            None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
+            None => match state.wb_pool.pick_excluding_constrained_region_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), Some(wb_global)) {
                 Some((p, ev)) => {
                     // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
                     if let Some(ev) = ev {
@@ -627,7 +635,13 @@ fn run_wb_stream(
             gen_conv_id()
         };
 
-        let catalog = super::wb_catalog::load(&state.data_dir);
+        // Switch AI 区域拆分：effort 档位按请求所属区域目录解析
+        //（国际请求不查国内目录——国际模型 id 不在国内目录，反之亦然）
+        let catalog = if wb_global {
+            super::wb_catalog::load_global(&state.data_dir)
+        } else {
+            super::wb_catalog::load(&state.data_dir)
+        };
         let effort = super::wb_catalog::find(&catalog, model)
             .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
         let mut converted = wb_payload::prepare_wb_chat_body(
@@ -663,6 +677,7 @@ fn run_wb_stream(
                         &tried,
                         allowed_set.as_ref(),
                         dedicated.as_deref(),
+                        wb_global,
                     ) {
                         Ok(w) => w,
                         Err(()) => {
@@ -870,6 +885,7 @@ pub async fn wb_aggregate_chat(
     proto: Protocol,
     key_id: String,
     guard: InflightGuard,
+    wb_global: bool,
 ) -> Response {
     let model_out = model.clone();
     // P2 修复：聚合含分级重试（RetrySame 退避 std::thread::sleep 最长 60s×N），
@@ -898,9 +914,11 @@ pub async fn wb_aggregate_chat(
                 if allowed_set.as_ref().map_or(false, |a| !a.contains(&b.uid)) {
                     return None;
                 }
+                // Switch AI 区域拆分：粘性账号区域与请求区域错配时忽略粘性
                 state
                     .wb_pool
                     .pick_by_uid(&b.uid)
+                    .filter(|p| p.global_region == wb_global)
                     .map(|_| (b.uid, b.conv_id))
             });
         let sticky_uid: Option<String> = sticky0.as_ref().map(|(u, _)| u.clone());
@@ -913,7 +931,7 @@ pub async fn wb_aggregate_chat(
             .and_then(|(u, _)| {
                 state
                     .wb_pool
-                    .pick_sticky_yield(u, allowed_set.as_ref())
+                    .pick_sticky_yield(u, allowed_set.as_ref(), Some(wb_global))
                     .map(|(p, ev)| {
                         if let Some(ev) = ev {
                             state.logger.log_sched_event(&ev);
@@ -930,7 +948,7 @@ pub async fn wb_aggregate_chat(
         loop {
             let picked = match first_pick.take() {
                 Some(p) => p,
-                None => match state.wb_pool.pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref()) {
+                None => match state.wb_pool.pick_excluding_constrained_region_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), Some(wb_global)) {
                     Some((p, ev)) => {
                         if let Some(ev) = ev {
                             state.logger.log_sched_event(&ev);
@@ -976,7 +994,12 @@ pub async fn wb_aggregate_chat(
                 gen_conv_id()
             };
 
-            let catalog = super::wb_catalog::load(&state.data_dir);
+            // Switch AI 区域拆分：effort 档位按请求所属区域目录解析
+            let catalog = if wb_global {
+                super::wb_catalog::load_global(&state.data_dir)
+            } else {
+                super::wb_catalog::load(&state.data_dir)
+            };
             let effort = super::wb_catalog::find(&catalog, &model)
                 .and_then(|m| m.resolve_effort(peek.get("reasoning_effort").and_then(|v| v.as_str())));
             let mut converted = wb_payload::prepare_wb_chat_body(
@@ -1007,6 +1030,7 @@ pub async fn wb_aggregate_chat(
                             &tried,
                             allowed_set.as_ref(),
                             dedicated.as_deref(),
+                            wb_global,
                         ) {
                             Ok(w) => w,
                             Err(()) => {
@@ -1237,6 +1261,7 @@ pub async fn wb_tool_exec_chat(
     start_ts: Instant,
     key_id: String,
     guard: InflightGuard,
+    wb_global: bool,
 ) -> Response {
     let model_inner = model.clone();
     // P2 修复：工具代执行多轮上游请求 + 重试退避（最长 60s×N），长阻塞占主池
@@ -1260,7 +1285,12 @@ pub async fn wb_tool_exec_chat(
             .and_then(|k| k.pool_constraints("buddy"))
             .map_or((None, None), |c| (c.allowed, c.dedicated));
 
-        let catalog = super::wb_catalog::load(&state.data_dir);
+        // Switch AI 区域拆分：effort 档位按请求所属区域目录解析
+        let catalog = if wb_global {
+            super::wb_catalog::load_global(&state.data_dir)
+        } else {
+            super::wb_catalog::load(&state.data_dir)
+        };
         let effort = super::wb_catalog::find(&catalog, &model)
             .and_then(|m| m.resolve_effort(chat_body.get("reasoning_effort").and_then(|v| v.as_str())));
 
@@ -1278,7 +1308,7 @@ pub async fn wb_tool_exec_chat(
         'accounts: loop {
             let picked = match state
                 .wb_pool
-                .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+                .pick_excluding_constrained_region_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), Some(wb_global))
             {
                 Some((p, ev)) => {
                     if let Some(ev) = ev {

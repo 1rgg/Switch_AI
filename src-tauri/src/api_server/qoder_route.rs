@@ -479,7 +479,7 @@ fn run_qoder_stream(
     let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
         state
             .qoder_pool
-            .pick_sticky_yield(u, allowed_set.as_ref())
+            .pick_sticky_yield(u, allowed_set.as_ref(), None)
             .map(|(p, ev)| {
                 if let Some(ev) = ev {
                     state.logger.log_sched_event(&ev);
@@ -953,7 +953,7 @@ pub async fn qoder_aggregate_chat(
         let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
             state
                 .qoder_pool
-                .pick_sticky_yield(u, allowed_set.as_ref())
+                .pick_sticky_yield(u, allowed_set.as_ref(), None)
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);

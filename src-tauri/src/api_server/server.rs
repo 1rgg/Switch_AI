@@ -256,13 +256,20 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
         // T5.1/F-37：启动即做一次上游目录动态替换（best effort，失败不影响启动——
-        // 本地静态兜底目录保持不动）；取任一健康 WB 账号的凭证拉取
-        {
-            let picked = state.wb_pool.pick_excluding_constrained(
-                &std::collections::HashSet::new(),
-                None,
-                None,
-            );
+        // 本地静态兜底目录保持不动）。
+        // Switch AI 区域拆分：国内/国际**各取一个本区域账号**拉取，
+        // 目录落各自区域键（wb_model_catalog / wb_model_catalog_global）——
+        // 原实现"任选一个账号"在混合池下目录区域随机，是国际模型不可用的根因之一
+        for global in [false, true] {
+            let picked = state
+                .wb_pool
+                .pick_excluding_constrained_region_ev(
+                    &std::collections::HashSet::new(),
+                    None,
+                    None,
+                    Some(global),
+                )
+                .map(|(p, _)| p);
             if let Some(p) = picked {
                 match wb_catalog::fetch_and_replace(
                     &state.data_dir,
@@ -275,13 +282,21 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
                     Ok(n) => {
                         crate::fs_utils::app_log(
                             &state.data_dir,
-                            &format!("WB 模型目录动态替换成功: {} 个模型", n),
+                            &format!(
+                                "WB 模型目录动态替换成功（{}）: {} 个模型",
+                                if global { "国际版" } else { "国内版" },
+                                n
+                            ),
                         );
                     }
                     Err(e) => {
                         crate::fs_utils::app_log(
                             &state.data_dir,
-                            &format!("WB 模型目录动态替换失败（保持静态兜底）: {}", e),
+                            &format!(
+                                "WB 模型目录动态替换失败（{}，保持现状）: {}",
+                                if global { "国际版" } else { "国内版" },
+                                e
+                            ),
                         );
                     }
                 }

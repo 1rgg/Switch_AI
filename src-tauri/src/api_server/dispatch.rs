@@ -200,6 +200,10 @@ pub struct Resolved {
     /// 内部落 app_log；本字段供调度测试断言与 Phase 2 资源页展示预留）
     #[allow(dead_code)]
     pub fallback_from: Option<TargetPool>,
+    /// Switch AI 区域拆分：Buddy 池请求的目标区域（true = 国际版 workbuddy.ai）。
+    /// 区域在 dispatch 按模型目录/家族名决策，wb_route 据此约束取号；
+    /// 非 Buddy 池恒 false
+    pub wb_global: bool,
 }
 
 /// 回退原因（供 warn 日志）
@@ -222,6 +226,9 @@ impl FallbackReason {
 struct ModelSources {
     /// Buddy 源：四段管线归一化命中（Some(最终模型, effort 提示)）
     buddy: Option<(String, Option<String>)>,
+    /// Switch AI 区域拆分：Buddy 源的目标区域（true = 国际版 workbuddy.ai）。
+    /// 与 buddy 同生命周期：buddy 为 None 时恒 false
+    buddy_global: bool,
     /// Trae 源：api_models 命中；或模型不属于任何目录（透传语义，单源 Trae）
     trae: bool,
     /// Trae 侧最终模型 + effort 提示 + Max Mode 入口标志（issue #31 T3.1/T4.2：
@@ -321,38 +328,63 @@ pub fn resolve_target(
             effort_hint: None,
             max_mode_hint: false,
             fallback_from: None,
+            wb_global: false,
         });
     }
 
-    // ② 模型名归一化（四段管线）+ Buddy 源判定：管线命中目录 → Buddy 源存在
+    // ② 模型名归一化（四段管线）+ Buddy 源判定：管线命中目录 → Buddy 源存在。
+    // Switch AI 区域拆分：国内/国际各一份目录（wb_catalog::load / load_global），
+    // 国际池有在用账号时——国际目录命中、或国际家族模型名（claude-/gpt-/gemini-/o1/o3/o4）
+    // 未收录 → 目标区域 = 国际（透传 workbuddy.ai）；国内目录命中 → 国内；
+    // 均未命中保持透传 Trae 语义（buddy = None）。无国际账号时行为与改造前一致
+    //（claude-* 等仍按内置系列通配改写为国内模型——兼容垫片只在无国际账号时生效）
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = super::wb_catalog::load(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
-    let buddy_hit = super::wb_catalog::find(&catalog, &r.model)
-            .map(|_| {
-                // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型
-                // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
-                let whitelist = super::unified_catalog::load_whitelist(&state.data_dir);
-                let in_wl = |m: &str| super::unified_catalog::whitelist_allows(&whitelist, m);
-                let final_model = if state
-                    .wb_bg_downgrade
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    && wb_model_route::is_background_task(body)
-                {
-                    wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl)
-                        .unwrap_or_else(|| r.model.clone())
-                } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
-                    // F-76④ 长上下文降档：输入粗估超阈值（默认 100k token）→ flash 档模型
-                    && wb_model_route::estimate_input_tokens(body)
-                        >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
-                {
-                    wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl)
-                        .unwrap_or_else(|| r.model.clone())
-                } else {
-                    r.model.clone()
-                };
-                (final_model, r.effort_hint.clone())
-            });
+    let cn_hit = super::wb_catalog::find(&catalog, &r.model).is_some();
+    let gl_catalog = super::wb_catalog::load_global(&state.data_dir);
+    let gl_r = wb_model_route::resolve(&cfg, &gl_catalog, model);
+    let gl_hit = super::wb_catalog::find(&gl_catalog, &gl_r.model).is_some();
+    let gl_pool = state.wb_pool.has_region(true);
+    let whitelist = super::unified_catalog::load_whitelist(&state.data_dir);
+    let in_wl = |m: &str| super::unified_catalog::whitelist_allows(&whitelist, m);
+    let bg_on = state
+        .wb_bg_downgrade
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let lc_on = state
+        .wb_longctx_downgrade
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let bg_task = wb_model_route::is_background_task(body);
+    let longctx = wb_model_route::estimate_input_tokens(body)
+        >= wb_model_route::LONGCTX_TOKEN_THRESHOLD;
+    // 目录内降级（T5.6③ 后台任务 → 最低倍率；F-76④ 长上下文 → flash 档）：
+    // issue #26 白名单感知——降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）。
+    // 区域拆分后按请求所属区域目录降级（国际请求不引用国内倍率表）
+    let downgraded = |rr: &wb_model_route::RouteResult,
+                      cat: &[super::wb_catalog::WbModel]|
+     -> (String, Option<String>) {
+        let final_model = if bg_on && bg_task {
+            wb_model_route::cheapest_catalog_model_filtered(cat, &in_wl)
+                .unwrap_or_else(|| rr.model.clone())
+        } else if lc_on && longctx {
+            wb_model_route::flash_catalog_model_filtered(cat, &in_wl)
+                .unwrap_or_else(|| rr.model.clone())
+        } else {
+            rr.model.clone()
+        };
+        (final_model, rr.effort_hint.clone())
+    };
+    let (buddy_hit, buddy_global) = if gl_pool && gl_hit {
+        (Some(downgraded(&gl_r, &gl_catalog)), true)
+    } else if gl_pool && wb_model_route::is_intl_family(model) {
+        // 国际家族名不被国内垫片截胡：国际池在用时一律透传国际上游
+        //（精确 id 已在 gl_hit 分支命中；此处兜住目录外变体名，如 claude-4.5-sonnet）
+        (Some((model.to_string(), None)), true)
+    } else if cn_hit {
+        (Some(downgraded(&r, &catalog)), false)
+    } else {
+        (None, false)
+    };
 
     // ③ Trae 源判定：canonical_id 命中 Trae 模型列表；未命中任何目录时保持
     // 透传语义（单源 Trae，与现状一致）。
@@ -414,6 +446,7 @@ pub fn resolve_target(
         || trae_list.iter().any(|m| canonical_id(&m.id) == canonical);
     let sources = ModelSources {
         buddy: buddy_hit,
+        buddy_global,
         trae: trae_hit,
         trae_final,
         qoder: qoder_hit,
@@ -482,6 +515,7 @@ pub fn resolve_target(
                     effort_hint: effort_for(pool, &sources),
                     max_mode_hint: max_mode_for(pool, &sources),
                     fallback_from: None,
+                    wb_global: wb_global_for(pool, &sources),
                 });
             }
         }
@@ -554,6 +588,7 @@ pub fn resolve_target(
                     effort_hint: effort_for(pool, &sources),
                     max_mode_hint: max_mode_for(pool, &sources),
                     fallback_from: fallback_from.map(|(p, _)| p),
+                    wb_global: wb_global_for(pool, &sources),
                 });
             }
             Err(reason) => {
@@ -777,6 +812,11 @@ fn max_mode_for(pool: TargetPool, sources: &ModelSources) -> bool {
         TargetPool::Trae => sources.trae_final.2,
         TargetPool::Buddy | TargetPool::Custom | TargetPool::Qoder => false,
     }
+}
+
+/// Switch AI 区域拆分：Buddy 池请求的目标区域随池取值；非 Buddy 池恒 false
+fn wb_global_for(pool: TargetPool, sources: &ModelSources) -> bool {
+    matches!(pool, TargetPool::Buddy) && sources.buddy_global
 }
 
 // ==================== 会话池粘性（§4.4，内存态） ====================

@@ -1177,29 +1177,48 @@ pub async fn api_wb_catalog_sync(state: State<'_, AppState>) -> Result<usize, St
 }
 
 /// WB 上游模型目录同步实现（手动命令与调度器 wb-catalog-sync 共用）：
-/// accounts 由调用方取好（wb_upstream_accounts，避免双读 pool/token store），
-/// 取首个含凭证账号拉取并替换目录；空列表时 Err（调度侧据此转静默跳过不计失败）
+/// accounts 由调用方取好（wb_upstream_accounts，避免双读 pool/token store）。
+/// Switch AI 区域拆分：国内/国际**各取该区域首个含凭证账号**分别拉取并写入
+/// 各自区域目录（wb_model_catalog / wb_model_catalog_global）；
+/// 两区域均无账号时 Err（调度侧据此转静默跳过不计失败）；单侧无账号时跳过该侧
+///（另一侧照常同步，返回值为两侧成功拉取的模型数之和）
 pub(crate) fn wb_catalog_sync_impl(
     data_dir: &std::path::Path,
     accounts: &[crate::api_server::pool::WbSyncAccount],
 ) -> Result<usize, String> {
-    let acct = accounts
-        .first()
-        .ok_or("无可用 WB 账号凭证，无法拉取上游目录")?;
-    crate::api_server::wb_catalog::fetch_and_replace(
-        data_dir,
-        &acct.uid,
-        &acct.token,
-        &acct.domain,
-        &acct.enterprise_id,
-        acct.global_region,
-    )
+    if accounts.is_empty() {
+        return Err("无可用 WB 账号凭证，无法拉取上游目录".to_string());
+    }
+    let mut total = 0usize;
+    let mut errs: Vec<String> = Vec::new();
+    for global in [false, true] {
+        let Some(acct) = accounts.iter().find(|a| a.global_region == global) else {
+            continue; // 该区域无账号：跳过（另一侧照常）
+        };
+        match crate::api_server::wb_catalog::fetch_and_replace(
+            data_dir,
+            &acct.uid,
+            &acct.token,
+            &acct.domain,
+            &acct.enterprise_id,
+            acct.global_region,
+        ) {
+            Ok(n) => total += n,
+            Err(e) => errs.push(format!("{}: {e}", if global { "国际版" } else { "国内版" })),
+        }
+    }
+    if total == 0 && !errs.is_empty() {
+        return Err(errs.join("；"));
+    }
+    Ok(total)
 }
 
-/// 列出 wb_model_catalog.json 中的 WB 模型（Buddy API 服务页展示模型 id/倍率/档位）
+/// 列出 WB 模型（Buddy API 服务页展示模型 id/倍率/档位）。
+/// Switch AI 区域拆分：返回国内+国际合并视图（wb_catalog::load_merged，
+/// 同 id 时国内优先；前端无需感知区域拆分）
 #[tauri::command]
 pub fn api_wb_catalog_list(state: State<'_, AppState>) -> Vec<crate::api_server::wb_catalog::WbModel> {
-    crate::api_server::wb_catalog::load(&state.data_dir)
+    crate::api_server::wb_catalog::load_merged(&state.data_dir)
 }
 
 /// 查询最近 N 天的 API 用量统计（Trae 模型请求桶，按日聚合，直接读盘，服务未运行也可查）

@@ -176,6 +176,48 @@ pub fn find<'a>(catalog: &'a [WbModel], model: &str) -> Option<&'a WbModel> {
     catalog.iter().find(|m| m.id == lower)
 }
 
+// ==================== Switch AI：目录按区域拆分（国内/国际） ====================
+//
+// 背景：原实现只有单一目录 kv `wb_model_catalog`，启动时"任选一个池内账号"
+// 拉取——池内同时存在国内+国际账号时，目录落谁家全看运气，且模型路由管线
+// 的内置改写目标（glm/deepseek 系）只对国内目录成立。现按区域拆成两份：
+//   国内 → kv `wb_model_catalog`（沿用原键，内置 15 模型兜底，语义不变）
+//   国际 → kv `wb_model_catalog_global`（只存上游拉取结果，缺失 = 空目录）
+// 读取方按请求的区域决策取对应目录；聚合展示（/v1/models、前端目录页）
+// 用 load_merged 合并视图。
+
+/// 国际版目录 kv 键（国内沿用 `wb_model_catalog` 原键，存量数据零迁移）。
+pub const KV_KEY_GLOBAL: &str = "wb_model_catalog_global";
+
+/// 加载国际版目录：kv `wb_model_catalog_global` 只读，缺失/为空返回空目录。
+/// 与 [load]（国内）的差异：**无内置表兜底、无落盘副作用**——内置 15 模型是
+/// 国内目录快照，掺进国际目录会让国内模型名被路由到 workbuddy.ai 而失败。
+pub fn load_global(data_dir: &Path) -> Vec<WbModel> {
+    super::config_cache::get_or_load(data_dir, KV_KEY_GLOBAL, || {
+        crate::store::db(data_dir)
+            .kv_get_raw(KV_KEY_GLOBAL)
+            .and_then(|t| serde_json::from_str::<WbCatalogFile>(&t).ok())
+            .map(|f| f.models)
+            .unwrap_or_default()
+    })
+}
+
+/// 合并视图（聚合展示用）：国内目录在前、国际目录追加，按 id 去重
+/// （同名时国内优先——国际目录不该出现国内模型 id，防御性保留）。
+pub fn load_merged(data_dir: &Path) -> Vec<WbModel> {
+    let cn = load(data_dir);
+    let gl = load_global(data_dir);
+    let mut out = cn;
+    let mut seen: std::collections::HashSet<String> =
+        out.iter().map(|m| m.id.clone()).collect();
+    for m in gl {
+        if seen.insert(m.id.clone()) {
+            out.push(m);
+        }
+    }
+    out
+}
+
 // ==================== T5.1/F-37 动态目录替换 ====================
 
 /// 条目是否具备「模型能力特征」——至少含一个能力/定价字段。
@@ -483,6 +525,8 @@ pub fn parse_upstream_catalog(body: &Value) -> Vec<WbModel> {
 
 /// 从上游模型目录接口拉取并全量替换本地目录（T5.1/F-37 启动动态替换）。
 /// 失败返回 Err（本地目录保持不动——静态兜底永远不因网络抖动被清掉）。
+/// Switch AI 区域拆分：`global_region` 决定写入哪份目录
+///（国内 → `wb_model_catalog`；国际 → `wb_model_catalog_global`）。
 pub fn fetch_and_replace(
     data_dir: &Path,
     uid: &str,
@@ -541,9 +585,10 @@ pub fn fetch_and_replace(
         ));
     }
     let count = models.len();
+    let kv_key = if global_region { KV_KEY_GLOBAL } else { "wb_model_catalog" };
     crate::store::db(data_dir)
         .kv_set(
-            "wb_model_catalog",
+            kv_key,
             &WbCatalogFile {
                 models,
                 fetched_at: Some(
@@ -557,7 +602,7 @@ pub fn fetch_and_replace(
         )
         .map_err(|e| format!("写目录失败: {e}"))?;
     // 写路径显式失效（批次 A）：目录替换即时生效
-    super::config_cache::invalidate(data_dir, "wb_model_catalog");
+    super::config_cache::invalidate(data_dir, kv_key);
     Ok(count)
 }
 

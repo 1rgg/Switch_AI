@@ -97,6 +97,19 @@ pub fn builtin_series() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// 国际版家族模型名判定（Switch AI 区域拆分）。
+///
+/// 前缀集合与内置系列通配（③）一致——这些家族名在国内目录里被改写为国产
+/// 模型，是「没有国际账号时的兼容垫片」；一旦国际版池有在用账号，这些名字
+/// 应当透传 `www.workbuddy.ai`（国际版原生提供 Claude / GPT / Gemini）。
+/// 大小写不敏感、容忍首尾空白。
+pub fn is_intl_family(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    ["claude-", "gpt-", "gemini-", "o1", "o3", "o4"]
+        .iter()
+        .any(|p| m.starts_with(p))
+}
+
 /// 目录命中（大小写不敏感），命中返回目录规范 id
 fn catalog_hit(catalog: &[super::wb_catalog::WbModel], model: &str) -> Option<String> {
     super::wb_catalog::find(catalog, model).map(|m| m.id.clone())

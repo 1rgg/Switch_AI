@@ -400,7 +400,8 @@ pub fn unified_models_ex(
     // 过滤会导致 /v1/models 随账号冷却抖动；池不可用的信号由 sources[].enabled
     // 传递（与 buddy-only 过滤依赖稳定的 wb_enabled 设置开关不同构）
     let trae_list = models_sync::load_models(data_dir);
-    let wb_list = wb_catalog::load(data_dir);
+    // Switch AI 区域拆分：Buddy 聚合源用国内+国际合并目录（国际模型也对外可见）
+    let wb_list = wb_catalog::load_merged(data_dir);
 
     let enabled_of = |pool: TargetPool| match pool {
         TargetPool::Trae => trae_ok,

@@ -87,7 +87,7 @@ enum AggregateFail {
 /// WB 上游模型目录命中（T2.1 原始判定，保留供 /v1/models 与诊断复用）
 #[allow(dead_code)]
 fn wb_model_requested(state: &ApiSharedState, model: &str) -> bool {
-    wb_catalog::find(&wb_catalog::load(&state.data_dir), model).is_some()
+    wb_catalog::find(&wb_catalog::load_merged(&state.data_dir), model).is_some()
 }
 
 fn internal_error_response() -> Response {
@@ -98,18 +98,36 @@ fn internal_error_response() -> Response {
 }
 
 /// T5.2/F-61 四段模型路由解析（别名→规则→系列通配→后缀）+ T5.6③ 后台任务降级。
-/// 返回 (最终模型, 路由级 effort 注入提示)；全未命中目录 → None（走 SOLO 上游）。
+/// 返回 Some((最终模型, 路由级 effort 注入提示, wb_global))；
+/// 全未命中目录且非国际家族名 → None（走 SOLO 上游）。
+/// Switch AI 区域拆分：国际池有在用账号时，国际目录命中或国际家族模型名
+/// （claude-/gpt-/gemini-/o1/o3/o4）→ wb_global=true（透传 workbuddy.ai）；
+/// 国内目录命中 → wb_global=false；无国际账号时行为与改造前一致
 fn resolve_wb_target(
     state: &ApiSharedState,
     model: &str,
     body: &Value,
-) -> Option<(String, Option<String>)> {
+) -> Option<(String, Option<String>, bool)> {
     let cfg = wb_model_route::load_config(&state.data_dir);
     let catalog = wb_catalog::load(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
-    if wb_catalog::find(&catalog, &r.model).is_none() {
-        return None;
-    }
+    let cn_hit = wb_catalog::find(&catalog, &r.model).is_some();
+    let gl_catalog = wb_catalog::load_global(&state.data_dir);
+    let gl_r = wb_model_route::resolve(&cfg, &gl_catalog, model);
+    let gl_hit = wb_catalog::find(&gl_catalog, &gl_r.model).is_some();
+    let gl_pool = state.wb_pool.has_region(true);
+    let (use_global, cat, rr): (bool, &[wb_catalog::WbModel], &wb_model_route::RouteResult) =
+        if gl_pool && gl_hit {
+            (true, &gl_catalog, &gl_r)
+        } else if gl_pool && wb_model_route::is_intl_family(model) {
+            // 国际家族名不被国内垫片截胡：国际池在用时一律透传国际上游
+            //（与 dispatch 区域决策同规则）
+            return Some((model.to_string(), None, true));
+        } else if cn_hit {
+            (false, &catalog, &r)
+        } else {
+            return None;
+        };
     // T5.6③ 后台任务降级（显式开启才生效）：标题/摘要类短请求 → 目录最低倍率模型；
     // F-76④ 长上下文降档：输入粗估超阈值 → flash 档模型。
     // issue #26 白名单感知：降级候选 ∩ 白名单为空则跳过降级（原模型已过端点准入）
@@ -118,16 +136,16 @@ fn resolve_wb_target(
     let final_model = if state.wb_bg_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::is_background_task(body)
     {
-        wb_model_route::cheapest_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
+        wb_model_route::cheapest_catalog_model_filtered(cat, &in_wl).unwrap_or(rr.model.clone())
     } else if state.wb_longctx_downgrade.load(std::sync::atomic::Ordering::Relaxed)
         && wb_model_route::estimate_input_tokens(body)
             >= wb_model_route::LONGCTX_TOKEN_THRESHOLD
     {
-        wb_model_route::flash_catalog_model_filtered(&catalog, &in_wl).unwrap_or(r.model)
+        wb_model_route::flash_catalog_model_filtered(cat, &in_wl).unwrap_or(rr.model.clone())
     } else {
-        r.model
+        rr.model.clone()
     };
-    Some((final_model, r.effort_hint))
+    Some((final_model, rr.effort_hint.clone(), use_global))
 }
 
 /// T5.3/F-62 默认深度思考：客户端未显式请求 effort 且无路由级提示时默认 high。
@@ -721,9 +739,9 @@ pub async fn chat_completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard);
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAi, key_str, guard, r.wb_global);
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAi, key_str, guard, r.wb_global).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：请求体由执行路径按目录条目构造（agent 信封），
@@ -827,7 +845,7 @@ pub async fn responses_api(
     let guard = state.inflight_guard();
 
     // T5.2/F-61 四段路由解析（Responses 仅支持 WB 上游模型）
-    let (resolved_model, route_hint) = match resolve_wb_target(&state, &model, &chat_body) {
+    let (resolved_model, route_hint, wb_global) = match resolve_wb_target(&state, &model, &chat_body) {
         Some(t) => t,
         None => {
             return openai_error(
@@ -864,6 +882,7 @@ pub async fn responses_api(
             start_ts,
             key_str,
             guard,
+            wb_global,
         )
         .await;
     }
@@ -874,9 +893,9 @@ pub async fn responses_api(
     let body_vec = apply_effort_hint(serde_json::to_vec(&chat_body).unwrap_or_default(), hint);
 
     if stream {
-        wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard)
+        wb_route::wb_stream_chat(state_clone, body_vec, resolved_model, start_ts, Protocol::Responses, key_str, guard, wb_global)
     } else {
-        wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard).await
+        wb_route::wb_aggregate_chat(state_clone, body_vec, resolved_model, stream, start_ts, Protocol::Responses, key_str, guard, wb_global).await
     }
 }
 
@@ -901,16 +920,18 @@ fn strip_bracket_1m(name: &str) -> Option<&str> {
 }
 
 /// 三池可路由判定（Anthropic 入口兜底专用）：Custom 直达命中 /
-/// WB 路由解析命中目录且上游启用 / Trae 模型列表 canonical 命中
+/// WB 路由解析命中目录（合并目录：国内+国际，Switch AI 区域拆分）且上游启用 /
+/// Trae 模型列表 canonical 命中
 fn anthropic_model_servable(state: &ApiSharedState, model: &str) -> bool {
     if super::custom_models::find_enabled(&state.data_dir, model).is_some() {
         return true;
     }
     let cfg = wb_model_route::load_config(&state.data_dir);
-    let catalog = wb_catalog::load(&state.data_dir);
+    let catalog = wb_catalog::load_merged(&state.data_dir);
     let r = wb_model_route::resolve(&cfg, &catalog, model);
     if state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed)
-        && wb_catalog::find(&catalog, &r.model).is_some()
+        && (wb_catalog::find(&catalog, &r.model).is_some()
+            || (state.wb_pool.has_region(true) && wb_model_route::is_intl_family(model)))
     {
         return true;
     }
@@ -1055,9 +1076,9 @@ pub async fn messages(
                 let hint = effective_effort_hint(&state, r.effort_hint, explicit);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard);
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::Anthropic, key_str, guard, r.wb_global);
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::Anthropic, key_str, guard, r.wb_global).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：Anthropic 入参已在端点层投影为 OpenAI 内部格式
@@ -1208,9 +1229,9 @@ pub async fn completions(
                 let hint = effective_effort_hint(&state, r.effort_hint, false);
                 let body_vec = apply_effort_hint(body_vec, hint);
                 if stream {
-                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard);
+                    return wb_route::wb_stream_chat(state_clone, body_vec, r.model, start_ts, Protocol::OpenAiText, key_str, guard, r.wb_global);
                 }
-                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard).await;
+                return wb_route::wb_aggregate_chat(state_clone, body_vec, r.model, stream, start_ts, Protocol::OpenAiText, key_str, guard, r.wb_global).await;
             }
             TargetPool::Qoder => {
                 // Qoder 上游（p3-3）：text completions 入参已在端点层投影为内部格式
@@ -1337,9 +1358,11 @@ async fn images_entry(
         .map_or((None, None), |c| (c.allowed, c.dedicated));
     let picked = {
         let tried = HashSet::new();
+        // Switch AI 区域拆分：生图校验用国内目录（wb_images::validate），取号
+        // 约束国内区域——国际账号不支持国内生图端点，混池时会误选
         state
             .wb_pool
-            .pick_excluding_constrained_ev(&tried, allowed_set.as_ref(), dedicated.as_deref())
+            .pick_excluding_constrained_region_ev(&tried, allowed_set.as_ref(), dedicated.as_deref(), Some(false))
             .map(|(p, ev)| {
                 // F-77⑤ 可观测：busy_yield / busy_fallback 调度事件
                 if let Some(ev) = ev {
@@ -1494,7 +1517,7 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
             state
                 .pool
-                .pick_sticky_yield(u, trae_allowed.as_ref())
+                .pick_sticky_yield(u, trae_allowed.as_ref(), None)
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);
@@ -1977,7 +2000,7 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
         let mut first_pick: Option<super::pool::PickedAccount> = sticky0.as_ref().and_then(|u| {
             state
                 .pool
-                .pick_sticky_yield(u, trae_allowed.as_ref())
+                .pick_sticky_yield(u, trae_allowed.as_ref(), None)
                 .map(|(p, ev)| {
                     if let Some(ev) = ev {
                         state.logger.log_sched_event(&ev);

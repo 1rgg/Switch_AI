@@ -469,6 +469,21 @@ impl ApiPool {
         allowed: Option<&HashSet<String>>,
         dedicated: Option<&str>,
     ) -> Option<(PickedAccount, Option<String>)> {
+        self.pick_excluding_constrained_region_ev(tried, allowed, dedicated, None)
+    }
+
+    /// Switch AI 区域拆分版取号：`global_only` 按账号区域过滤候选
+    ///（Some(true) = 仅国际版账号，Some(false) = 仅国内账号，None = 不过滤）。
+    /// 区域决策由 dispatch 按模型目录/家族名做出，此处仅做过滤与锁定；
+    /// 专一绑定（dedicated）保持原语义不让位——绑定是 Key 级显式动作，
+    /// 区域错配视为使用方配置问题。
+    pub fn pick_excluding_constrained_region_ev(
+        &self,
+        tried: &HashSet<String>,
+        allowed: Option<&HashSet<String>>,
+        dedicated: Option<&str>,
+        global_only: Option<bool>,
+    ) -> Option<(PickedAccount, Option<String>)> {
         // 专一模式：绑定账号 healthy 且未试错过 → 直接锁定（专一绑定不让位）
         if let Some(uid) = dedicated {
             if !tried.contains(uid) {
@@ -488,6 +503,7 @@ impl ApiPool {
             .values()
             .filter(|e| selectable(e, tried, now))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+            .filter(|e| global_only.map_or(true, |g| e.global_region == g))
             .collect();
         // F-77 busy 过滤 + 全 busy 降级
         let inflight = self.inflight_snapshot();
@@ -573,10 +589,13 @@ impl ApiPool {
     /// 全候选 busy / 未启用并发上限（limit=0）/ 无其他候选时保持粘性锁定。
     /// 返回 (账号, 调度事件)：事件非 None 时由调用方记 [SCHED] 日志
     /// （sticky_yield=让位改选 / sticky_fallback=全 busy 保持粘性）。
+    /// Switch AI 区域拆分：`global_only` 约束让位候选的区域（None = 不过滤）；
+    /// 粘性账号本身的区域由调用方先经 pick_by_uid 校验（区域错配不进本函数）。
     pub fn pick_sticky_yield(
         &self,
         sticky_uid: &str,
         allowed: Option<&HashSet<String>>,
+        global_only: Option<bool>,
     ) -> Option<(PickedAccount, Option<String>)> {
         let sticky = self.pick_by_uid(sticky_uid)?;
         let limit = self.concurrency_limit();
@@ -598,6 +617,7 @@ impl ApiPool {
                 .values()
                 .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now))
                 .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+                .filter(|e| global_only.map_or(true, |g| e.global_region == g))
                 .fold((false, false), |(any, idle), e| {
                     (any || true, idle || inflight_of(e, &inflight) < limit)
                 })
@@ -623,6 +643,7 @@ impl ApiPool {
             .values()
             .filter(|e| e.uid != sticky_uid && selectable(e, &tried, now))
             .filter(|e| allowed.map_or(true, |a| a.contains(&e.uid)))
+            .filter(|e| global_only.map_or(true, |g| e.global_region == g))
             .filter(|e| inflight_of(e, &inflight) < limit)
             .collect();
         let strategy = *safe_lock(&self.strategy);
@@ -781,6 +802,14 @@ impl ApiPool {
     ///
     /// 供上游健康探测按「实际在用区域」探测——只探国内域名会让
     /// 纯国际版部署拿到错误的健康结论（国际版 chat 走 www.workbuddy.ai）。
+    /// Switch AI 区域拆分：池内指定区域是否存在可用（未禁用）账号。
+    /// dispatch 区域决策用——国际池有在用账号时，国际家族模型名才走国际上游。
+    pub fn has_region(&self, global: bool) -> bool {
+        safe_lock(&self.entries)
+            .values()
+            .any(|e| e.global_region == global && !e.disabled)
+    }
+
     /// 非 WB 形态条目（`domain` 空且非 Global）不计入；池空时返回空 vec，
     /// 由调用方回退默认区域。
     pub fn wb_regions_in_use(&self) -> Vec<crate::tasks::wb_common::WbRegion> {
@@ -1655,6 +1684,56 @@ mod tests {
         assert!(pool2.pick_excluding_constrained(&HashSet::new(), None, None).is_none());
     }
 
+    /// Switch AI 区域拆分：区域约束取号与 has_region 判定——
+    /// 混合池（国内+国际）按 global_only 过滤，各自只命中本区域账号
+    #[test]
+    fn region_constrained_pick_and_has_region() {
+        let mk = |uid: &str, global: bool| crate::api_server::pool::WbSyncAccount {
+            uid: uid.into(),
+            name: uid.into(),
+            token: "tk".into(),
+            domain: if global { "workbuddy.ai".into() } else { "codebuddy.cn".into() },
+            enterprise_id: String::new(),
+            global_region: global,
+            credits: None,
+            credits_expire_at: None,
+            needs_relogin: false,
+            group_id: String::new(),
+        };
+        let pool = ApiPool::new();
+        pool.sync_from_wb(
+            &[mk("wb-cn", false), mk("wb-gl", true)],
+            &["wb-cn".to_string(), "wb-gl".to_string()],
+        );
+        assert!(pool.has_region(false), "国内区域在用");
+        assert!(pool.has_region(true), "国际区域在用");
+        let cn = pool
+            .pick_excluding_constrained_region_ev(&HashSet::new(), None, None, Some(false))
+            .unwrap()
+            .0;
+        assert_eq!(cn.uid, "wb-cn");
+        assert!(!cn.global_region);
+        let gl = pool
+            .pick_excluding_constrained_region_ev(&HashSet::new(), None, None, Some(true))
+            .unwrap()
+            .0;
+        assert_eq!(gl.uid, "wb-gl");
+        assert!(gl.global_region);
+        // tried 排除国际账号后，国际区域无候选 → None（国内候选不受影响）
+        let mut tried = HashSet::new();
+        tried.insert("wb-gl".to_string());
+        assert!(pool
+            .pick_excluding_constrained_region_ev(&tried, None, None, Some(true))
+            .is_none());
+        assert!(pool
+            .pick_excluding_constrained_region_ev(&HashSet::new(), None, None, Some(false))
+            .is_some());
+        // 禁用账号不计入 has_region
+        pool.note_refresh_invalid("wb-gl");
+        assert!(!pool.has_region(true));
+        assert!(pool.has_region(false));
+    }
+
     #[test]
     fn qoder_sync_and_pick_carries_machine_id() {
         let pool = ApiPool::new();
@@ -1843,7 +1922,7 @@ mod tests {
         // 粘性账号 busy（inflight≥limit=1）且存在空闲候选 → 让位改选空闲账号
         let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_idle", 10.0, 0)]);
         pool.inflight_handle("uid_sticky").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None, None).unwrap();
         assert_eq!(p.uid, "uid_idle", "busy 粘性账号应让位给空闲账号");
         let ev = ev.unwrap();
         assert!(
@@ -1858,7 +1937,7 @@ mod tests {
         let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_b", 10.0, 0)]);
         pool.inflight_handle("uid_sticky").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         pool.inflight_handle("uid_b").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None, None).unwrap();
         assert_eq!(p.uid, "uid_sticky", "全 busy 时应保持粘性");
         assert!(ev.unwrap().starts_with("sticky_fallback"));
     }
@@ -1867,7 +1946,7 @@ mod tests {
     fn sticky_kept_when_idle() {
         // 粘性账号空闲 → 正常锁定，无调度事件
         let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_b", 10.0, 0)]);
-        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None, None).unwrap();
         assert_eq!(p.uid, "uid_sticky");
         assert!(ev.is_none());
     }
@@ -1879,7 +1958,7 @@ mod tests {
         pool.inflight_handle("uid_sticky").fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut allowed = HashSet::new();
         allowed.insert("uid_sticky".to_string());
-        let (p, ev) = pool.pick_sticky_yield("uid_sticky", Some(&allowed)).unwrap();
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", Some(&allowed), None).unwrap();
         assert_eq!(p.uid, "uid_sticky", "无白名单内其他候选时保持粘性");
         assert!(ev.is_none());
     }
@@ -1890,7 +1969,7 @@ mod tests {
         let pool = build_pool(&[("uid_sticky", 10.0, 0), ("uid_b", 10.0, 0)]);
         pool.set_concurrency_limit(0);
         pool.inflight_handle("uid_sticky").fetch_add(5, std::sync::atomic::Ordering::Relaxed);
-        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None).unwrap();
+        let (p, ev) = pool.pick_sticky_yield("uid_sticky", None, None).unwrap();
         assert_eq!(p.uid, "uid_sticky");
         assert!(ev.is_none());
     }
