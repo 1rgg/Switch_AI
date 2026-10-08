@@ -382,8 +382,9 @@ pub struct CodeBuddyEnvCheck {
 pub fn codebuddy_env_check(state: State<AppState>) -> CodeBuddyEnvCheck {
     let loc = app_locate_inner(&state, "codebuddy");
     let running = is_running_codebuddy();
-    let (uid, nickname) = match crate::commands::workbuddy::workbuddy_scan_auth_file(state.clone())
-    {
+    // 区域传 None：CodeBuddy 环境检测只需 uid/昵称，区域按 auth 文件 domain 自行推断即可
+    let (uid, nickname) =
+        match crate::commands::workbuddy::workbuddy_scan_auth_file(state.clone(), None) {
         Ok(Some(scan)) => (
             (!scan.uid.is_empty()).then_some(scan.uid),
             (!scan.nickname.is_empty()).then_some(scan.nickname),

@@ -777,6 +777,32 @@ impl ApiPool {
         safe_lock(&self.entries).len()
     }
 
+    /// 池内在用的 WorkBuddy 区域集合（Switch AI：WorkBuddy 国际版支持）。
+    ///
+    /// 供上游健康探测按「实际在用区域」探测——只探国内域名会让
+    /// 纯国际版部署拿到错误的健康结论（国际版 chat 走 www.workbuddy.ai）。
+    /// 非 WB 形态条目（`domain` 空且非 Global）不计入；池空时返回空 vec，
+    /// 由调用方回退默认区域。
+    pub fn wb_regions_in_use(&self) -> Vec<crate::tasks::wb_common::WbRegion> {
+        use crate::tasks::wb_common::WbRegion;
+        let entries = safe_lock(&self.entries);
+        let mut out: Vec<WbRegion> = Vec::new();
+        for e in entries.values() {
+            if e.domain.is_empty() && !e.global_region {
+                continue; // 非 WB 形态（Trae / Qoder / 自定义）条目
+            }
+            let r = if e.global_region {
+                WbRegion::Global
+            } else {
+                WbRegion::Cn
+            };
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+        out
+    }
+
     /// 池内是否存在可选账号（healthy + 非零积分 + 未过期）。
     /// 统一调度选池健康预检用（§4.1 ④）；不含 Key 级白名单/专一约束——
     /// 那由各执行路径取号时自理，预检仅覆盖"池整体耗尽"场景

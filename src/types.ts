@@ -955,6 +955,22 @@ export interface UpdateDownloaded {
   version: string;
 }
 
+// ---- WorkBuddy 账号区域（Switch AI 二次开发：WorkBuddy 国际版支持）----
+/** `cn` = 国内版（codebuddy.cn / workbuddy.cn / copilot.tencent.com）；
+ *  `global` = 国际版（www.workbuddy.ai，Google/GitHub 登录，Claude/GPT/Gemini） */
+export type WbRegionKey = 'cn' | 'global';
+
+/** 区域选择项（UI 下拉/徽标共用文案） */
+export const WB_REGIONS: ReadonlyArray<{ key: WbRegionKey; label: string; hint: string }> = [
+  { key: 'cn', label: '国内版', hint: 'codebuddy.cn / workbuddy.cn' },
+  { key: 'global', label: '国际版', hint: 'workbuddy.ai（Google / GitHub 登录）' },
+];
+
+/** 区域徽标文案（未知/缺省按国内版展示） */
+export function wbRegionLabel(region?: string | null): string {
+  return region === 'global' ? '国际版' : '国内版';
+}
+
 // ---- WorkBuddy 账号池（批次1；对应 Rust workbuddy.rs WorkBuddyAccountView）----
 export interface WorkBuddyAccountView {
   id: string;
@@ -962,6 +978,8 @@ export interface WorkBuddyAccountView {
   nickname: string;
   phone_masked: string;
   edition_type: string;
+  /** 账号区域（`cn` / `global`）——已按显式字段 + 凭证 domain 解析后的有效值 */
+  region: string;
   access_token_expires_at: number | null;
   refresh_token_expires_at: number | null;
   auth_saved_at: number | null;
@@ -1019,6 +1037,8 @@ export interface WorkBuddyScanResult {
   exists: boolean;
   /** 已在账号池中（再次导入 = 更新凭证而非新增；accounts.rs 导入按此 upsert） */
   already_in_pool?: boolean;
+  /** 扫描时按 auth 文件 domain 推断的区域（Switch AI：国际版识别） */
+  region?: string;
 }
 
 export interface WorkBuddySettings {

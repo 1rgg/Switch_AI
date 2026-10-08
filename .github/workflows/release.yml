@@ -1,0 +1,115 @@
+name: Build & Release (Windows)
+
+# Switch AI —— Windows 安装包构建与 GitHub Release 发布。
+#
+# 触发方式：
+#   ① 推送版本 tag（v*）→ 自动构建并发布同名 Release；
+#   ② 手动 workflow_dispatch → 指定 tag 构建并发布（tag 不存在时自动创建）。
+#
+# 设计要点：
+#   - 与 build-windows.yml（仅构建、仅上传 artifact）互补：本工作流负责**发版**。
+#   - 复用 scripts/rename_release.mjs 的输出约定与 scripts/package_portable.mjs 的
+#     便携版打包（该脚本已内置 CI 下 tar/中文文件名 的规避处理）。
+#   - 产物三类：NSIS 安装包(*.exe) / MSI 安装包(*.msi) / 便携版 zip。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag（例：v3.7.3）'
+        required: true
+        type: string
+
+# 创建 Release / 上传资产需要写权限
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # 前端类型检查 + 构建（tauri build 的 beforeBuildCommand 也会跑，
+      # 这里先行一步让类型错误更早暴露）
+      - name: Type-check & build frontend
+        run: npm run build
+
+      - name: Build Tauri app (NSIS + MSI)
+        run: npm run tauri build -- --bundles nsis,msi
+
+      # 便携版 zip：零依赖（Windows 自带 tar.exe），从 release 产物打包
+      - name: Package portable zip
+        run: node scripts/package_portable.mjs
+
+      - name: Stage artifacts (release/windows)
+        shell: bash
+        run: |
+          mkdir -p release/windows
+          cp src-tauri/target/release/bundle/nsis/*.exe release/windows/
+          cp src-tauri/target/release/bundle/msi/*.msi release/windows/
+          cp release/*_x64_portable.zip release/windows/
+          ls -la release/windows/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: switch-ai-windows
+          path: release/windows/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: release/windows/*
+          draft: false
+          generate_release_notes: true
+          body: |
+            ## Switch AI · Windows 安装包
+
+            基于 [TraeWorkAssistant](https://github.com/smart-open/TraeWorkAssistant)（AI Work 助手）二次开发，
+            新增 **WorkBuddy 国际版（workbuddy.ai）** 支持。
+
+            ### 下载说明
+            | 文件 | 说明 |
+            | --- | --- |
+            | `*_x64-setup.exe` | NSIS 安装包（推荐，支持原地升级） |
+            | `*.msi` | MSI 安装包（企业分发；跨产品标识升级需先卸载旧版） |
+            | `*_x64_portable.zip` | 便携版（解压即用，无需安装） |
+
+            ### 运行要求
+            - Windows 10/11 x64
+            - WebView2 Runtime（Win11 及较新 Win10 通常已内置）
+
+            > 首次使用请阅读仓库 README 的「WorkBuddy 国际版」一节了解区域选择与账号录入方式。
+            > 本工具与 WorkBuddy / Trae / CodeBuddy 等官方产品均无关联，仅供学习研究。

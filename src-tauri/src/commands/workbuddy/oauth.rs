@@ -1,11 +1,13 @@
 //! WorkBuddy M7 生态接入 · OAuth 扫码登录（F-50，§3.10）（原 workbuddy.rs 机械拆分）。
 //!
 //! 流程（无 PKCE，state 服务端签发；对齐已验证的 workbuddy2api/官方插件实现）：
-//!   ① POST https://copilot.tencent.com/v2/plugin/auth/state?platform=CLI → state + authUrl
-//!      （API 上游在 copilot.tencent.com，不在 www.codebuddy.cn；UA 模拟官方 CLI
-//!       `CLI/2.x CodeBuddy/2.x`，Origin/Referer 指向 www.codebuddy.cn）
+//!   ① POST {plugin_base}/v2/plugin/auth/state?platform=CLI → state + authUrl
+//!      （国内 plugin_base = copilot.tencent.com；国际版 = www.workbuddy.ai，
+//!       **两端流程同构，仅基址不同**——Switch AI 二次开发实测 2026：
+//!       workbuddy.ai 返回 authUrl=https://www.workbuddy.ai/login?platform=CLI&state=…，
+//!       轮询同样回 code:11217 login ing…；UA 模拟官方 CLI `CLI/2.x CodeBuddy/2.x`）
 //!   ② 系统浏览器打开 authUrl（服务端 URL 原样优先；缺失或缺 state 凭证参数时按
-//!      已验证形态 `copilot.tencent.com/login?platform=CLI&state=<state>` 构造，绝不打开裸链接）
+//!      已验证形态 `{plugin_base}/login?platform=CLI&state=<state>` 构造，绝不打开裸链接）
 //!   ③ GET /v2/plugin/auth/token?state= 轮询（≤300s，间隔 3s）
 //!   ④ GET /v2/plugin/login/account?state= 带 Bearer 取 uid/nickname → 自动入池 + 凭证回写 token store
 //! 每流程独立 cookie jar（手工捕获 Set-Cookie 回传，不引新依赖）；凭证零明文输出（不进日志/事件/UI）。
@@ -16,6 +18,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::fs_utils;
 use crate::state::AppState;
+use crate::tasks::wb_common::WbRegion;
 
 use super::common::{account_id_of, as_str, load_pool, save_pool, upsert_token_store, WorkBuddyAccount};
 
@@ -100,11 +103,16 @@ fn find_state_credential(body: &serde_json::Value) -> Option<(&'static str, Stri
 /// ① 候选字段链取第一个 http(s):// 开头且 query 已含 `state` 凭证参数的 authUrl **原样打开**
 ///    （参考实现 `fmt.Println(st.AuthURL)` 同款：服务端 URL 从不追加参数）；
 /// ② URL 缺失 / 非 http(s) / query 缺 state（上一轮故障形态：错误上游只回裸登录页链接）
-///    → 按已验证形态构造 `copilot.tencent.com/login?platform=CLI&state=<state>`
+///    → 按已验证形态构造 `{plugin_base}/login?platform=CLI&state=<state>`
 ///    （antigravity-tools 卡密登录链接同款拼法；workbuddy-switch 缺 authUrl 时亦按此回退），
 ///    绝不原样打开缺 state 的登录页链接，也绝不回退裸基础域 URL。
-fn resolve_auth_url(body: &serde_json::Value, state_id: &str) -> Result<String, String> {
-    const LOGIN_BASE: &str = "https://copilot.tencent.com";
+///
+/// `region` 决定回退基址（Switch AI：国际版走 www.workbuddy.ai，不再固定 copilot）。
+fn resolve_auth_url(
+    body: &serde_json::Value,
+    state_id: &str,
+    region: WbRegion,
+) -> Result<String, String> {
     let state_id = state_id.trim();
     if state_id.is_empty() {
         return Err("auth/state 响应中 state 为空，无法构造登录链接".into());
@@ -118,7 +126,12 @@ fn resolve_auth_url(body: &serde_json::Value, state_id: &str) -> Result<String, 
                 .filter(|v| v.starts_with("https://") || v.starts_with("http://"))
                 .filter(|v| auth_url_query_has_key(v, "state"))
         })
-        .unwrap_or_else(|| format!("{LOGIN_BASE}/login?platform=CLI&state={state_id}"));
+        .unwrap_or_else(|| {
+            format!(
+                "{}/login?platform=CLI&state={state_id}",
+                region.plugin_base()
+            )
+        });
     Ok(complete)
 }
 
@@ -136,32 +149,36 @@ fn mask_phone(p: &str) -> String {
 }
 
 /// OAuth 主流程（后台线程执行）：进度经 wb-oauth-progress 事件推送，结果经 wb-oauth-done。
-fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), String> {
-    // API 上游在 copilot.tencent.com（workbuddy2api main.go:28 同款）——打到
-    // www.codebuddy.cn 会拿到与 CLI 登录流程不匹配的裸登录链接（上一轮故障根因）
-    const BASE: &str = "https://copilot.tencent.com";
-    const WEB_ORIGIN: &str = "https://www.codebuddy.cn";
+///
+/// `region`（Switch AI：WorkBuddy 国际版）决定 API 上游与 Web Origin/Referer：
+///   国内 → https://copilot.tencent.com + Origin https://www.codebuddy.cn
+///   国际 → https://www.workbuddy.ai  + Origin https://www.workbuddy.ai
+/// 打到错误区域会拿到与 CLI 登录流程不匹配的裸登录链接（历史故障根因），
+/// 国际版 token 也会被错误网关拒绝。
+fn oauth_flow(app: &AppHandle, state: &AppState, region: WbRegion) -> Result<(String, String), String> {
+    let base = region.plugin_base();
+    let web_origin = region.web_origin();
     // UA/头模拟官方 CLI 客户端（workbuddy2api main.go:29,38-45 同款）；
-    // 自造 UA 可能被服务端降级处理
+    // 自造 UA 可能被服务端降级处理。实测国际版同样接受该 CLI UA。
     const CLIENT_UA: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).build();
     let mut jar = std::collections::HashMap::new();
     let emit = |stage: &str, message: &str, auth_url: Option<&str>| {
         let _ = app.emit(
             "wb-oauth-progress",
-            serde_json::json!({ "stage": stage, "message": message, "auth_url": auth_url }),
+            serde_json::json!({ "stage": stage, "message": message, "auth_url": auth_url, "region": region.as_str() }),
         );
     };
 
     // ① 发起：auth/state?platform=CLI
     emit("init", "正在请求登录 state…", None);
     let mut req = agent
-        .post(&format!("{BASE}/v2/plugin/auth/state?platform=CLI"))
+        .post(&format!("{base}/v2/plugin/auth/state?platform=CLI"))
         .set("User-Agent", CLIENT_UA)
         .set("Accept", "application/json, text/plain, */*")
         .set("X-Requested-With", "XMLHttpRequest")
-        .set("Origin", WEB_ORIGIN)
-        .set("Referer", &format!("{WEB_ORIGIN}/"))
+        .set("Origin", web_origin)
+        .set("Referer", &format!("{web_origin}/"))
         .set("Content-Type", "application/json");
     if let Some(c) = oauth_cookie_header(&jar) {
         req = req.set("Cookie", &c);
@@ -169,11 +186,11 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
     let resp = req.send_string("{}").map_err(|e| format!("请求 auth/state 失败: {e}"))?;
     oauth_capture_cookies(&mut jar, &resp);
     let body: serde_json::Value = resp.into_json().unwrap_or_default();
-    // state 用于轮询；URL 缺 state 凭证参数时用它构造 copilot 登录链接（resolve_auth_url）
+    // state 用于轮询；URL 缺 state 凭证参数时用它构造本区域登录链接（resolve_auth_url）
     let state_id = find_state_credential(&body)
         .map(|(_, v)| v)
         .ok_or("auth/state 响应中未找到 state")?;
-    let auth_url = resolve_auth_url(&body, &state_id)?;
+    let auth_url = resolve_auth_url(&body, &state_id, region)?;
 
     // ② 浏览器打开登录页
     open_in_browser(&auth_url)?;
@@ -211,12 +228,12 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
             emit("polling", "等待登录完成…（最长 300 秒）", None);
         }
         let mut req = agent
-            .get(&format!("{BASE}/v2/plugin/auth/token?state={state_id}"))
+            .get(&format!("{base}/v2/plugin/auth/token?state={state_id}"))
             .set("User-Agent", CLIENT_UA)
             .set("Accept", "application/json, text/plain, */*")
             .set("X-Requested-With", "XMLHttpRequest")
-            .set("Origin", WEB_ORIGIN)
-            .set("Referer", &format!("{WEB_ORIGIN}/"));
+            .set("Origin", web_origin)
+            .set("Referer", &format!("{web_origin}/"));
         if let Some(c) = oauth_cookie_header(&jar) {
             req = req.set("Cookie", &c);
         }
@@ -245,12 +262,12 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
     let mut phone_masked = String::new();
     let mut edition = String::new();
     let mut req = agent
-        .get(&format!("{BASE}/v2/plugin/login/account?state={state_id}"))
+        .get(&format!("{base}/v2/plugin/login/account?state={state_id}"))
         .set("User-Agent", CLIENT_UA)
         .set("Accept", "application/json, text/plain, */*")
         .set("X-Requested-With", "XMLHttpRequest")
-        .set("Origin", WEB_ORIGIN)
-        .set("Referer", &format!("{WEB_ORIGIN}/"))
+        .set("Origin", web_origin)
+        .set("Referer", &format!("{web_origin}/"))
         .set("Authorization", &format!("Bearer {token}"));
     if let Some(c) = oauth_cookie_header(&jar) {
         req = req.set("Cookie", &c);
@@ -296,6 +313,9 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
         a.auth_saved_at = Some(now_s);
         a.needs_relogin = false;
         a.relogin_reason.clear();
+        // Switch AI：本次 OAuth 走的是用户选定区域，回写为其区域权威值
+        //（含「原本无区域标注的旧账号被国际版扫码重新登录」的纠正场景）
+        a.region = region.as_str().to_string();
         a.id.clone()
     } else {
         pool.accounts.push(WorkBuddyAccount {
@@ -306,6 +326,7 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
             edition_type: edition,
             access_token_expires_at: exp_s,
             auth_saved_at: Some(now_s),
+            region: region.as_str().to_string(),
             ..Default::default()
         });
         id.clone()
@@ -315,6 +336,9 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
         "access_token": token,
         "refresh_token": if refresh_token.is_empty() { None } else { Some(refresh_token) },
         "expires_at_ms": exp_s.map(|s| s * 1000),
+        // 凭证记录一并带区域：上游取号（wb_upstream_accounts）与刷新按此路由，
+        // 不再依赖可能缺失的 domain 字段
+        "region": region.as_str(),
     });
     upsert_token_store(state, &target_id, &creds)?;
     fs_utils::app_log(&state.data_dir, &format!("workbuddy: OAuth 扫码入池 {target_id}（{nickname}）"));
@@ -325,21 +349,27 @@ fn oauth_flow(app: &AppHandle, state: &AppState) -> Result<(String, String), Str
 }
 
 /// OAuth 扫码登录（F-50）：后台线程执行全流程，事件驱动 UI；同时仅允许一个流程。
+///
+/// `region`（Switch AI：WorkBuddy 国际版）：`None`/`"cn"` = 国内版；
+/// `"global"`/`"intl"`/`"international"`/`"oversea"` = 国际版（workbuddy.ai）。
+/// 前端 OAuth 弹框提供区域选择，登录链接与入池区域随之确定。
 #[tauri::command(async)]
-pub fn workbuddy_oauth_login(app: AppHandle) -> Result<(), String> {
+pub fn workbuddy_oauth_login(app: AppHandle, region: Option<String>) -> Result<(), String> {
     use std::sync::atomic::Ordering;
     if OAUTH_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("已有 OAuth 扫码流程进行中".into());
     }
+    let region = WbRegion::parse(region.as_deref().unwrap_or(""));
     std::thread::spawn(move || {
-        let payload = match AppState::new().and_then(|st| oauth_flow(&app, &st)) {
+        let payload = match AppState::new().and_then(|st| oauth_flow(&app, &st, region)) {
             Ok((id, nickname)) => serde_json::json!({
                 "ok": true,
                 "id": id,
                 "nickname": nickname,
+                "region": region.as_str(),
                 "message": format!("账号「{nickname}」已扫码登录并自动入池"),
             }),
-            Err(e) => serde_json::json!({ "ok": false, "message": e }),
+            Err(e) => serde_json::json!({ "ok": false, "message": e, "region": region.as_str() }),
         };
         // 终态事件：emit 失败落日志（issue #44 遗留项——前端 OAuth 弹框依赖此事件收尾）
         crate::events::emit_logged(&app, "wb-oauth-done", payload, None);
@@ -379,31 +409,31 @@ mod oauth_tests {
     fn resolve_auth_url_complete_field_untouched() {
         let body = oauth_body(r#"{"state":"s1","auth_url":"https://login.example/auth?state=tok9"}"#);
         assert_eq!(
-            resolve_auth_url(&body, "s1").unwrap(),
+            resolve_auth_url(&body, "s1", WbRegion::Cn).unwrap(),
             "https://login.example/auth?state=tok9"
         );
         let wrapped = oauth_body(
             r#"{"code":0,"msg":"","data":{"state":"st-1","authUrl":"https://copilot.tencent.com/login?platform=CLI&state=st-1"}}"#,
         );
         assert_eq!(
-            resolve_auth_url(&wrapped, "st-1").unwrap(),
+            resolve_auth_url(&wrapped, "st-1", WbRegion::Cn).unwrap(),
             "https://copilot.tencent.com/login?platform=CLI&state=st-1"
         );
     }
 
     /// ② 故障现场形态（参考得出的关键形态）：服务端只回裸登录页链接（query 缺 state）
     ///    → 不原样打开、也不给裸链接补参，按已验证卡密形态构造
-    ///    `copilot/login?platform=CLI&state=<state>`（antigravity-tools 卡密同款拼法）
+    ///    `{plugin_base}/login?platform=CLI&state=<state>`（antigravity-tools 卡密同款拼法）
     #[test]
     fn resolve_auth_url_bare_url_replaced_by_canonical_login_link() {
         let body = oauth_body(r#"{"state":"st-123","url":"https://www.codebuddy.cn/login?platform=CLI"}"#);
         assert_eq!(
-            resolve_auth_url(&body, "st-123").unwrap(),
+            resolve_auth_url(&body, "st-123", WbRegion::Cn).unwrap(),
             "https://copilot.tencent.com/login?platform=CLI&state=st-123"
         );
         let wrapped = oauth_body(r#"{"data":{"authState":"AB-9","authUrl":"https://cb.cn/login"}}"#);
         assert_eq!(
-            resolve_auth_url(&wrapped, "AB-9").unwrap(),
+            resolve_auth_url(&wrapped, "AB-9", WbRegion::Cn).unwrap(),
             "https://copilot.tencent.com/login?platform=CLI&state=AB-9"
         );
         assert_eq!(find_state_credential(&wrapped).map(|(_, v)| v), Some("AB-9".to_string()));
@@ -414,17 +444,61 @@ mod oauth_tests {
     #[test]
     fn resolve_auth_url_missing_or_invalid_errors() {
         assert_eq!(
-            resolve_auth_url(&oauth_body(r#"{"state":"s1"}"#), "s1").unwrap(),
+            resolve_auth_url(&oauth_body(r#"{"state":"s1"}"#), "s1", WbRegion::Cn).unwrap(),
             "https://copilot.tencent.com/login?platform=CLI&state=s1"
         );
         // 非法 authUrl（javascript:）视同缺失 → 构造，绝不打开
         assert_eq!(
-            resolve_auth_url(&oauth_body(r#"{"authUrl":"javascript:alert(1)","state":"s1"}"#), "s1").unwrap(),
+            resolve_auth_url(
+                &oauth_body(r#"{"authUrl":"javascript:alert(1)","state":"s1"}"#),
+                "s1",
+                WbRegion::Cn
+            )
+            .unwrap(),
             "https://copilot.tencent.com/login?platform=CLI&state=s1"
         );
         // 入参 state 为空（响应亦无 state 字段可兜底）→ 报错
-        assert!(resolve_auth_url(&oauth_body(r#"{"authUrl":"https://cb.cn/login?state=x"}"#), "").is_err());
-        assert!(resolve_auth_url(&serde_json::json!({}), "  ").is_err());
+        assert!(resolve_auth_url(
+            &oauth_body(r#"{"authUrl":"https://cb.cn/login?state=x"}"#),
+            "",
+            WbRegion::Cn
+        )
+        .is_err());
+        assert!(resolve_auth_url(&serde_json::json!({}), "  ", WbRegion::Cn).is_err());
+    }
+
+    /// ③-b Switch AI 新增：国际版回退链接必须指向 workbuddy.ai（不再固定 copilot 国内域名）。
+    ///     这是「WorkBuddy 国际版」账号录入能走通的前提——打到国内域名会拿到
+    ///     与 CLI 国际站登录流程不匹配的登录页。
+    #[test]
+    fn resolve_auth_url_falls_back_to_region_base() {
+        let gl = WbRegion::Global;
+        assert_eq!(
+            resolve_auth_url(&oauth_body(r#"{"state":"g-1"}"#), "g-1", gl).unwrap(),
+            "https://www.workbuddy.ai/login?platform=CLI&state=g-1"
+        );
+        // 服务端只回裸链接（缺 state）时同样落回国际版基址
+        assert_eq!(
+            resolve_auth_url(
+                &oauth_body(r#"{"url":"https://www.workbuddy.ai/login?platform=CLI"}"#),
+                "g-2",
+                gl
+            )
+            .unwrap(),
+            "https://www.workbuddy.ai/login?platform=CLI&state=g-2"
+        );
+        // 服务端返回完整国际版 authUrl 时原样保留（不因区域改写）
+        assert_eq!(
+            resolve_auth_url(
+                &oauth_body(
+                    r#"{"authUrl":"https://www.workbuddy.ai/login?platform=CLI&state=g-3"}"#
+                ),
+                "g-3",
+                gl
+            )
+            .unwrap(),
+            "https://www.workbuddy.ai/login?platform=CLI&state=g-3"
+        );
     }
 
     /// ④ OAuth 自动入池的幂等匹配决策（复用 accounts::find_uid_or_id）：

@@ -280,10 +280,16 @@ fn package_codes_from(body: &Value) -> Vec<String> {
     codes
 }
 
+/// 账号区域（Switch AI：WorkBuddy 国际版）——显式 `region` 优先，`domain` 兜底。
+/// 集中一处，避免各调用点重复 domain 字符串推断（并修正前导点漏判）。
+fn creds_region(creds: &wb_common::Creds) -> wb_common::WbRegion {
+    wb_common::resolve_region_str(&creds.region, &creds.domain)
+}
+
 /// 区域路由（T4.5/F-36，§5.2）：Global 账号 billing 走 www.workbuddy.ai。
 /// 返回 (summary, paid, free, old_resource) 四元组。
-fn billing_urls(domain: &str) -> (String, String, String, String) {
-    let base = wb_common::region_billing_base(domain);
+fn billing_urls(region: wb_common::WbRegion) -> (String, String, String, String) {
+    let base = region.billing_base();
     (
         format!("{base}/billing/meter/get-user-resource-summary"),
         format!("{base}/billing/meter/get-user-resource-paid-packages"),
@@ -386,12 +392,13 @@ fn fetch_credits_once(
     creds: &wb_common::Creds,
 ) -> (Vec<Value>, Option<f64>, &'static str, Option<wb_common::Creds>) {
     let headers = wb_common::build_auth_headers(creds, true);
-    let (summary_url, paid_url, free_url, old_url) = billing_urls(&creds.domain);
+    let region = creds_region(creds);
+    let (summary_url, paid_url, free_url, old_url) = billing_urls(region);
     let (mut pkgs, mut balance, mut saw_auth, net_down) =
         fetch_round(agent, &headers, (&summary_url, &paid_url, &free_url));
     if net_down && pkgs.is_empty() && balance.is_none() {
         // 双探测（§2.2）：主域名网络不可达 → 备用域名重试一轮
-        let alt = wb_common::billing_bases(&creds.domain)[1];
+        let alt = region.alt_billing_base();
         let (s2, p2, f2) = (
             format!("{alt}/billing/meter/get-user-resource-summary"),
             format!("{alt}/billing/meter/get-user-resource-paid-packages"),

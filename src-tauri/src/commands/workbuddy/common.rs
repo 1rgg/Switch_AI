@@ -93,6 +93,15 @@ pub struct WorkBuddyAccount {
     /// None = 无到期信息或全部包长期有效，键值随每次回写覆盖（不留 stale）
     #[serde(default)]
     pub credits_expire_at: Option<i64>,
+    /// 账号区域（Switch AI 二次开发新增：WorkBuddy 国际版支持）——
+    /// `"cn"` / `"global"`，**空串 = 按凭证 domain 推断**（旧数据兼容）。
+    ///
+    /// 为什么需要显式字段：`domain` 只在 auth 文件 / OAuth 返回里出现，
+    /// 手工录入与旧版导入的账号往往没有它；旧实现此时静默按国内版处理，
+    /// 国际版账号的签到/积分/chat 会被打到 codebuddy.cn / copilot.tencent.com 而失败。
+    /// 解析入口统一走 `tasks::wb_common::resolve_region` / `resolve_region_str`。
+    #[serde(default)]
+    pub region: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]

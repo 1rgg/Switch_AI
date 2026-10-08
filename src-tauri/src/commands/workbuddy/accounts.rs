@@ -24,6 +24,9 @@ pub struct WorkBuddyAccountView {
     pub nickname: String,
     pub phone_masked: String,
     pub edition_type: String,
+    /// 账号区域（Switch AI：`"cn"` / `"global"`）——已按显式字段 + 凭证 domain 解析后的**有效值**，
+    /// 前端据此展示「国际版」徽标并按区域筛选。
+    pub region: String,
     pub access_token_expires_at: Option<i64>,
     pub refresh_token_expires_at: Option<i64>,
     pub auth_saved_at: Option<i64>,
@@ -78,6 +81,9 @@ pub struct WorkBuddyScanResult {
     /// 同一账号（同 uid）已在池中：客户端换发 token 后 id 会变，但按账号身份（uid）判定已在池；
     /// 前端可后续据此展示，导入确认后走原位更新，不会重复入池
     pub already_in_pool: bool,
+    /// 扫描推断/指定的区域（Switch AI：`"cn"` / `"global"`）——
+    /// 来自调用方显式指定或 auth 文件 `domain`；前端据此预选区域并提示国际版账号
+    pub region: String,
 }
 
 // ── M1 环境检测（workbuddy_env_check）──────────────────────────────────────
@@ -160,12 +166,16 @@ fn accounts_list_inner(state: &AppState) -> Result<Vec<WorkBuddyAccountView>, St
             let has_cred = store_tokens.get(&a.id).is_some()
                 || auth_uid.as_deref() == Some(a.uid.as_str());
             let has_snapshot = snap_path.join(&a.id).is_dir();
+            // Switch AI：区域按「账号显式 region → 凭证 region/domain → CN」解析，
+            // 前端展示与筛选都以此为准（旧数据无 region 时自动按 domain 推断）
+            let region = crate::tasks::wb_common::resolve_region(&a.region, store_tokens.get(&a.id));
             WorkBuddyAccountView {
                 id: a.id.clone(),
                 uid: a.uid.clone(),
                 nickname: a.nickname.clone(),
                 phone_masked: a.phone_masked.clone(),
                 edition_type: a.edition_type.clone(),
+                region: region.as_str().to_string(),
                 access_token_expires_at: a.access_token_expires_at,
                 refresh_token_expires_at: a.refresh_token_expires_at,
                 auth_saved_at: a.auth_saved_at,
@@ -243,7 +253,10 @@ pub fn workbuddy_account_remove(state: State<AppState>, user_id: String, delete_
 
 /// 扫描本机 auth 文件（F-04 导入预览；不写盘）
 #[tauri::command(async)]
-pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBuddyScanResult>, String> {
+pub fn workbuddy_scan_auth_file(
+    state: State<AppState>,
+    region: Option<String>,
+) -> Result<Option<WorkBuddyScanResult>, String> {
     let path = auth_file_path_of(&state);
     if !path.exists() {
         return Ok(None);
@@ -260,6 +273,11 @@ pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBud
     let pool = load_pool(&state);
     let exists = pool.accounts.iter().any(|a| a.id == id);
     let already_in_pool = !uid.is_empty() && pool.accounts.iter().any(|a| a.uid == uid);
+    // Switch AI：区域 = 调用方显式指定优先，否则按 auth 文件 domain 推断
+    let region_key = crate::tasks::wb_common::resolve_region_str(
+        region.as_deref().unwrap_or(""),
+        &as_str(fs_utils::dig(&raw, &["domain"])).unwrap_or_default(),
+    );
     Ok(Some(WorkBuddyScanResult {
         id,
         uid,
@@ -274,6 +292,7 @@ pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBud
         )),
         exists,
         already_in_pool,
+        region: region_key.as_str().to_string(),
     }))
 }
 
@@ -364,6 +383,8 @@ struct AuthMerge {
     edition_type: String,
     access_token_expires_at: Option<i64>,
     refresh_token_expires_at: Option<i64>,
+    /// 区域（Switch AI：`"cn"` / `"global"`）；空串 = 不改动已存区域（导入时按 auth 文件推断）
+    region: String,
 }
 
 /// auth 文件入池合并（纯逻辑，便于单测）：按 uid（优先）/ id（兜底）匹配已有条目 →
@@ -385,6 +406,11 @@ fn merge_auth_entry(pool: &mut WbPool, m: AuthMerge) -> String {
         a.refresh_token_expires_at = m.refresh_token_expires_at;
         a.auth_saved_at = Some(chrono::Utc::now().timestamp());
         a.needs_relogin = false;
+        // Switch AI：区域非空才覆盖——允许「导入时显式纠正区域」，
+        // 同时避免空值把用户已标注的区域抹掉
+        if !m.region.is_empty() {
+            a.region = m.region;
+        }
         a.id.clone()
     } else {
         let id = m.id.clone();
@@ -396,6 +422,7 @@ fn merge_auth_entry(pool: &mut WbPool, m: AuthMerge) -> String {
             access_token_expires_at: m.access_token_expires_at,
             refresh_token_expires_at: m.refresh_token_expires_at,
             auth_saved_at: Some(chrono::Utc::now().timestamp()),
+            region: m.region,
             ..Default::default()
         });
         id
@@ -405,7 +432,11 @@ fn merge_auth_entry(pool: &mut WbPool, m: AuthMerge) -> String {
 /// auth 文件导入入池（F-04）：写账号池 + 工具侧凭证副本（掩码入池、凭证不外泄）。
 /// 按 uid 幂等：重复导入（同 token 或同账号换 token）原位更新并保留原 id，不产生重复条目。
 #[tauri::command(async)]
-pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String>) -> Result<WorkBuddyAccountView, String> {
+pub fn workbuddy_account_import_auth(
+    state: State<AppState>,
+    name: Option<String>,
+    region: Option<String>,
+) -> Result<WorkBuddyAccountView, String> {
     let path = auth_file_path_of(&state);
     if !path.exists() {
         return Err("未找到 auth 文件，请先在 WorkBuddy 客户端登录".into());
@@ -422,6 +453,14 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
         .unwrap_or_else(|| uid.chars().take(8).collect());
 
     let mut pool = load_pool(&state);
+    // Switch AI（WorkBuddy 国际版）：区域 = 调用方显式指定优先，否则按 auth 文件 domain 推断。
+    // 显式指定让「本机 auth 文件指向国际版客户端」的账号能被正确标注，
+    // 不依赖 auth 文件里是否带 domain。
+    let file_domain = as_str(fs_utils::dig(&raw, &["domain"])).unwrap_or_default();
+    let region_key = crate::tasks::wb_common::resolve_region_str(
+        region.as_deref().unwrap_or(""),
+        &file_domain,
+    );
     let target_id = merge_auth_entry(
         &mut pool,
         AuthMerge {
@@ -435,6 +474,7 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
                 &["expiresAtMs", "expires_at_ms", "expiresAt", "expires_in_ms", "accessTokenExpiresAtMs"],
             )),
             refresh_token_expires_at: as_ts_seconds(fs_utils::dig(&raw, &["refreshExpiresAt", "refresh_expires_at"])),
+            region: region_key.as_str().to_string(),
         },
     );
     save_pool(&state, &pool)?;
@@ -452,6 +492,8 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
         .map(|s| s * 1000),
         "uid": uid,
         "domain": as_str(fs_utils::dig(&raw, &["domain"])),
+        // Switch AI：区域一并落凭证记录，供上游取号与区域化刷新端点使用
+        "region": region_key.as_str(),
     });
     upsert_token_store(&state, &target_id, &creds)?;
 
@@ -560,11 +602,15 @@ pub fn workbuddy_refresh_token(
     }
 
     // 红线：X-Refresh-Token 仅出现在 refresh 端点；30s 超时（审查 P2，与其余 ureq 调用点一致）
+    // Switch AI（WorkBuddy 国际版）：刷新端点按账号区域选择——国际版账号的
+    // refresh token 打到国内 codebuddy.cn 会被拒（表现等同于凭证失效、误标需重登）。
+    let refresh_url =
+        crate::tasks::wb_common::resolve_region(&acct.region, Some(&rec)).refresh_url();
     let agent = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(30))
         .build();
     let resp = agent
-        .post("https://www.codebuddy.cn/v2/plugin/auth/token/refresh")
+        .post(&refresh_url)
         .set("Authorization", "Bearer")
         .set("User-Agent", crate::tasks::wb_common::WB_DESKTOP_UA)
         .set("X-Refresh-Token", &refresh)
@@ -637,7 +683,20 @@ pub(crate) fn wb_upstream_accounts(state: &AppState) -> Vec<crate::api_server::p
         if token.is_empty() {
             continue;
         }
-        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
+        // Switch AI：区域以账号显式 region 为准，凭证 domain 仅作旧数据兜底。
+        // 旧实现只看 domain → 手工录入/无 domain 的国际版账号会被当作国内版，
+        // chat 请求打到 copilot.tencent.com 而失败。
+        let region = crate::tasks::wb_common::resolve_region(&a.region, Some(&rec));
+        let domain = {
+            let d = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
+            if d.is_empty() && region.is_global() {
+                // 国际版兜底：显式区域已知时给出权威 domain，保证网关池的
+                // WB 形态判定（domain 非空）与区域路由都不落空
+                "www.workbuddy.ai".to_string()
+            } else {
+                d
+            }
+        };
         let eid = as_str(fs_utils::dig(&rec, &["enterprise_id", "enterpriseId"])).unwrap_or_default();
         out.push(crate::api_server::pool::WbSyncAccount {
             uid: a.id.clone(),
@@ -645,7 +704,7 @@ pub(crate) fn wb_upstream_accounts(state: &AppState) -> Vec<crate::api_server::p
             token,
             domain: domain.clone(),
             enterprise_id: eid,
-            global_region: domain.contains(".workbuddy.ai"),
+            global_region: region.is_global(),
             credits: a.credits_balance,
             credits_expire_at: a.credits_expire_at,
             needs_relogin: a.needs_relogin,
@@ -823,7 +882,29 @@ mod tests {
             edition_type: "pro".into(),
             access_token_expires_at: exp,
             refresh_token_expires_at: None,
+            region: String::new(),
         }
+    }
+
+    /// Switch AI：导入时显式区域会写进池条目；空区域不覆盖已标注区域（避免抹掉国际版标注）
+    #[test]
+    fn merge_auth_entry_applies_region_only_when_specified() {
+        let mut pool = WbPool { accounts: vec![entry("wb-bbbbbbbbbbbb", "u2", "n")] };
+        pool.accounts[0].region = "global".into();
+        // 空区域：保留原标注
+        merge_auth_entry(&mut pool, auth_merge("wb-bbbbbbbbbbbb", "u2", None));
+        assert_eq!(pool.accounts[0].region, "global");
+        // 显式区域：覆盖
+        let mut m = auth_merge("wb-bbbbbbbbbbbb", "u2", None);
+        m.region = "cn".into();
+        merge_auth_entry(&mut pool, m);
+        assert_eq!(pool.accounts[0].region, "cn");
+        // 新增条目：区域直接落库
+        let mut m2 = auth_merge("wb-cccccccccccc", "u3", None);
+        m2.region = "global".into();
+        let id = merge_auth_entry(&mut pool, m2);
+        let added = pool.accounts.iter().find(|a| a.id == id).unwrap();
+        assert_eq!(added.region, "global");
     }
 
     /// 重复导入同 token：池大小不变、id 不变、字段以新值覆盖

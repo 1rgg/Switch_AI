@@ -123,11 +123,16 @@ fn backfill_edition_from_payment_type(state: &AppState) -> usize {
             continue;
         };
         let domain = as_str(fs_utils::dig(rec, &["domain"])).unwrap_or_default();
-        let base = if domain.contains("workbuddy.ai") {
-            "https://www.workbuddy.ai"
-        } else {
-            "https://www.workbuddy.cn"
-        };
+        // Switch AI：区域以账号显式 region 为准（凭证 domain 仅兜底）；
+        // 国际版走 www.workbuddy.ai，国内版积分站是 www.workbuddy.cn
+        // （与 billing 的 codebuddy.cn 不同站，故用 credits_base 而非 billing_base）
+        let region = pool
+            .accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| crate::tasks::wb_common::resolve_region(&a.region, Some(rec)))
+            .unwrap_or_else(|| crate::tasks::wb_common::WbRegion::from_domain(&domain));
+        let base = region.credits_base();
         let Ok(v) = billing_post_json(&agent, &format!("{base}/v2/billing/meter/get-payment-type"), &token) else {
             continue;
         };
@@ -463,16 +468,31 @@ pub(crate) fn workbuddy_usage_official_impl(
     //（审查 P1：选号解析提到缓存命中判断之前——缓存按账号区分，命中须同账号）
     let store: serde_json::Value = crate::tasks::wb_common::load_token_store(&state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
+    let pool = load_pool(&state);
+    // Switch AI：把凭证 domain 规范化为「区域权威 domain」——
+    // 账号显式标注为国际版、但凭证记录里没有 domain 时补 www.workbuddy.ai，
+    // 否则下游官方用量基址会退回国内 workbuddy.cn，国际版账号恒取不到数据。
     let pick = |id: &str| -> Option<(String, String, String)> {
         let rec = tokens.get(id)?;
         let token = as_str(fs_utils::dig(&rec, &["access_token"]))?;
         if token.is_empty() {
             return None;
         }
-        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
+        let raw_domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
+        let explicit = pool
+            .accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.region.as_str())
+            .unwrap_or("");
+        let region = crate::tasks::wb_common::resolve_region(explicit, Some(rec));
+        let domain = if raw_domain.trim().is_empty() && region.is_global() {
+            "www.workbuddy.ai".to_string()
+        } else {
+            raw_domain
+        };
         Some((id.to_string(), token, domain))
     };
-    let pool = load_pool(&state);
     let chosen = user_id
         .as_deref()
         .and_then(|uid| pick(uid))
@@ -538,14 +558,17 @@ pub(crate) fn workbuddy_usage_official_impl(
 /// 拆出供单账号命令 `workbuddy_usage_official` 与全账号聚合命令
 /// `workbuddy_usage_official_all`（Buddy 积分看板近 7 日趋势数据源）复用。
 fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serde_json::Value, String> {
-    // 区域路由（T4.5/F-36，§5.2）：Global 账号（domain 含 workbuddy.ai）billing
-    // 全走 www.workbuddy.ai；CN 账号维持既有 workbuddy.cn 网关。
-    let base = if domain.contains("workbuddy.ai") {
-        "https://www.workbuddy.ai".to_string()
-    } else if domain.is_empty() {
-        "https://www.workbuddy.cn".to_string()
-    } else if domain.starts_with("http://") || domain.starts_with("https://") {
+    // 区域路由（T4.5/F-36，§5.2；Switch AI 国际版）：
+    // 国际版必须走 www.workbuddy.ai——原实现用 contains("workbuddy.ai") 判定，
+    // domain 恰为 workbuddy.ai（无子域前缀）时会漏判并打到国内站。
+    // 国内版保持既有语义不变：自定义 URL 透传 / 空值回落 workbuddy.cn / 否则 https://{domain}。
+    let region = crate::tasks::wb_common::WbRegion::from_domain(domain);
+    let base = if domain.starts_with("http://") || domain.starts_with("https://") {
         domain.trim_end_matches('/').to_string()
+    } else if region.is_global() {
+        crate::tasks::wb_common::WbRegion::Global.credits_base().to_string()
+    } else if domain.trim().is_empty() {
+        crate::tasks::wb_common::WbRegion::Cn.credits_base().to_string()
     } else {
         format!("https://{}", domain.trim_end_matches('/'))
     };
@@ -748,16 +771,30 @@ pub(crate) fn workbuddy_usage_official_all_impl(
     // 枚举有凭证账号：账号池优先，token store 补充（按 id 去重）
     let store: Value = crate::tasks::wb_common::load_token_store(state);
     let tokens = store.get("tokens").and_then(Value::as_object).cloned().unwrap_or_default();
+    let pool = load_pool(state);
+    // Switch AI：同 workbuddy_usage_official_impl——按账号显式 region 规范化 domain，
+    // 让国际版账号的官方用量也走 www.workbuddy.ai（凭证缺 domain 时不再退回国内站）
     let pick = |id: &str| -> Option<(String, String, String)> {
         let rec = tokens.get(id)?;
         let token = as_str(fs_utils::dig(&rec, &["access_token"]))?;
         if token.is_empty() {
             return None;
         }
-        let domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
+        let raw_domain = as_str(fs_utils::dig(&rec, &["domain"])).unwrap_or_default();
+        let explicit = pool
+            .accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.region.as_str())
+            .unwrap_or("");
+        let region = crate::tasks::wb_common::resolve_region(explicit, Some(rec));
+        let domain = if raw_domain.trim().is_empty() && region.is_global() {
+            "www.workbuddy.ai".to_string()
+        } else {
+            raw_domain
+        };
         Some((id.to_string(), token, domain))
     };
-    let pool = load_pool(state);
     let mut list: Vec<(String, String, String)> = Vec::new();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for a in &pool.accounts {
@@ -940,12 +977,12 @@ pub fn workbuddy_activity_info(
         }));
     };
 
-    // 区域路由（F-36，§5.2）：billing/activity 随账号 domain
-    let base = if domain.contains("workbuddy.ai") {
-        "https://www.workbuddy.ai".to_string()
-    } else {
-        "https://www.workbuddy.cn".to_string()
-    };
+    // 区域路由（F-36，§5.2；Switch AI 国际版）：billing/activity 随账号区域——
+    // 国际版 → www.workbuddy.ai，国内版 → www.workbuddy.cn。
+    // 判定改走 WbRegion（修正 domain 恰为 workbuddy.ai 时的漏判）。
+    let base = crate::tasks::wb_common::WbRegion::from_domain(&domain)
+        .credits_base()
+        .to_string();
     let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(10)).build();
     let mut errors: Vec<String> = vec![];
 

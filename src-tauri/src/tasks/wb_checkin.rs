@@ -490,7 +490,9 @@ fn process_account(state: &AppState, agent: &ureq::Agent, acct: &Value, opts: &C
     if refreshed {
         sync_pool_expiry(state, &aid, &creds);
     }
-    let base = wb_common::region_billing_base(&creds.domain);
+    // Switch AI：区域按凭证 region 优先、domain 兜底解析——
+    // 国际版账号签到必须打 www.workbuddy.ai（打到国内站会 404/失败）
+    let base = wb_common::resolve_region_str(&creds.region, &creds.domain).billing_base();
     let urls = urls_for(base);
     let mut headers = wb_common::build_auth_headers(&creds, false);
     let (checked, ok) = checkin_status(agent, &headers, &urls);
@@ -911,7 +913,8 @@ fn process_account_growth(state: &AppState, agent: &ureq::Agent, acct: &Value, f
     if creds.access_token.is_empty() {
         return json!({ "type": "growth", "user_id": aid, "name": base_ev["name"], "status": "fail", "message": format!("无可用凭证（{note}）") });
     }
-    let urls = urls_for(wb_common::region_billing_base(&creds.domain));
+    // Switch AI：成长中心同样按区域路由（国际版 → www.workbuddy.ai）
+    let urls = urls_for(wb_common::resolve_region_str(&creds.region, &creds.domain).billing_base());
 
     let mut result = Map::new();
     if flags.travel {

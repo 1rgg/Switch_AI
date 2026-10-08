@@ -1,0 +1,72 @@
+name: CI
+
+# Switch AI —— 持续集成：前端与后端检查、单元测试。
+# 与 release.yml 独立：release.yml 负责出安装包并发 Release，本工作流只做校验。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Frontend (tsc + vitest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Unit tests
+        run: npm run test
+
+  backend:
+    name: Backend (cargo check + test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-ci-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ci-cargo-
+
+      # tauri::generate_context! 需要 frontendDist（../dist）存在，
+      # 否则编译期即报 "frontendDist configuration is set to ../dist but this path doesn't exist"
+      - name: Build frontend (required by tauri codegen)
+        run: |
+          npm ci
+          npm run build
+
+      - name: Type-check all targets (incl. tests)
+        run: cargo check --all-targets --manifest-path src-tauri/Cargo.toml
+
+      - name: Unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml

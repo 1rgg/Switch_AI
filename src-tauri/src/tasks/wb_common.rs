@@ -53,6 +53,10 @@ pub struct Creds {
     pub uid: String,
     #[serde(default)]
     pub domain: String,
+    /// 账号区域（Switch AI：WorkBuddy 国际版）——`"cn"` / `"global"`，空串 = 按 domain 推断。
+    /// 国际版账号的签到/积分/刷新都据此路由；显式值优先于 domain 推断。
+    #[serde(default)]
+    pub region: String,
     #[serde(default)]
     pub nickname: String,
     #[serde(default)]
@@ -95,6 +99,9 @@ pub fn creds_of(source: &Value) -> Creds {
         )),
         uid: s_of(fs_utils::dig(account, &["uid", "userId", "user_id", "id"])),
         domain: s_of(fs_utils::dig(source, &["domain"])),
+        // Switch AI：区域随凭证一起提取（token store 记录里由 OAuth/导入写入），
+        // 与 domain 一起参与区域解析——domain 缺失时区域仍可靠。
+        region: s_of(fs_utils::dig(source, &["region"])),
         nickname: s_of(fs_utils::dig(account, &["nickname", "name", "displayName"])),
         edition: s_of(fs_utils::dig(account, &["editionType", "edition_type", "edition"])),
     }
@@ -465,35 +472,179 @@ pub fn get_json(
     }
 }
 
-// ── 区域路由（T4.5/F-36，§5.2）──────────────────────────────────────────────
-// CN：billing/积分 + 活动接口走 www.codebuddy.cn；Global（domain 含 .workbuddy.ai）：
-// 全走 www.workbuddy.ai。plugin 网关（token refresh）固定 codebuddy.cn 不随区域。
+// ── 区域路由（T4.5/F-36，§5.2；Switch AI 扩展：WorkBuddy 国际版）────────────
+// 三套区域基址**不可混用**（混用会把国际版账号请求打到国内网关）：
+//   billing_base  CN https://www.codebuddy.cn    Global https://www.workbuddy.ai
+//       用途：签到 / 成长中心 / billing meter 计量 / plugin token refresh
+//   credits_base  CN https://www.workbuddy.cn    Global https://www.workbuddy.ai
+//       用途：积分三件套 / 官方用量 / 活动 banner（工作台积分页）——
+//       注意 CN 的积分站是 workbuddy.cn，与 billing 的 codebuddy.cn 不是同一站点
+//   plugin_base   CN https://copilot.tencent.com Global https://www.workbuddy.ai
+//       用途：OAuth（auth/state、auth/token、login/account）+ chat 上游 + 模型目录
+//
+// 国际版实测（2026，Switch AI 二次开发新增）：
+//   POST https://www.workbuddy.ai/v2/plugin/auth/state?platform=CLI → 200
+//        data.authUrl = https://www.workbuddy.ai/login?platform=CLI&state=<uuid>
+//   GET  /v2/plugin/auth/token?state=  → {"code":11217,"msg":"...login ing..."}
+//   POST /v2/plugin/auth/token/refresh → 401（凭证无效时）
+//   即**国内版与国际版 OAuth 流程同构，仅基址不同**（无 PKCE / 无 client_id）。
 
 pub const BILLING_BASE_CN: &str = "https://www.codebuddy.cn";
 pub const BILLING_BASE_GLOBAL: &str = "https://www.workbuddy.ai";
-pub const REFRESH_URL: &str = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh";
+/// 积分三件套（工作台积分页）国内基址；与 billing 的 codebuddy.cn 不同站。
+pub const CREDITS_BASE_CN: &str = "https://www.workbuddy.cn";
+/// chat 上游 / OAuth / 模型目录国内基址。
+pub const CHAT_HOST_CN: &str = "https://copilot.tencent.com";
+/// plugin token refresh 路径（区域基址拼接）。
+pub const REFRESH_PATH: &str = "/v2/plugin/auth/token/refresh";
 
-pub fn is_global_region(domain: &str) -> bool {
-    domain.contains(".workbuddy.ai")
+/// WorkBuddy 账号区域（国内版 / 国际版）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WbRegion {
+    #[default]
+    Cn,
+    Global,
 }
 
-pub fn region_billing_base(domain: &str) -> &'static str {
-    if is_global_region(domain) {
-        BILLING_BASE_GLOBAL
-    } else {
-        BILLING_BASE_CN
+impl WbRegion {
+    /// 宽松字符串解析：接受前端 / 配置 / 导入文件里的各种写法。
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "global" | "intl" | "international" | "oversea" | "overseas" | "ai" | "en" => {
+                WbRegion::Global
+            }
+            _ => WbRegion::Cn,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WbRegion::Cn => "cn",
+            WbRegion::Global => "global",
+        }
+    }
+
+    pub fn is_global(self) -> bool {
+        matches!(self, WbRegion::Global)
+    }
+
+    /// 由账号 domain 推断区域。
+    ///
+    /// 修正历史缺陷：旧实现用 `domain.contains(".workbuddy.ai")`（**前导点**），
+    /// domain 恰为 `workbuddy.ai`（无子域前缀）时会被误判为国内版。
+    /// 此处改为主机名后缀匹配，并容忍带协议 / 端口 / 前导点 / 大小写的写法。
+    pub fn from_domain(domain: &str) -> Self {
+        let d = domain.trim().to_ascii_lowercase();
+        if d.is_empty() {
+            return WbRegion::Cn;
+        }
+        let host = d
+            .rsplit("://")
+            .next()
+            .unwrap_or(&d)
+            .split('/')
+            .next()
+            .unwrap_or(&d)
+            .split(':')
+            .next()
+            .unwrap_or(&d)
+            .trim_start_matches('.');
+        let is_intl = |h: &str, root: &str| h == root || h.ends_with(&format!(".{root}"));
+        if is_intl(host, "workbuddy.ai") || is_intl(host, "codebuddy.ai") {
+            WbRegion::Global
+        } else {
+            WbRegion::Cn
+        }
+    }
+
+    /// 签到 / 成长中心 / billing meter / plugin refresh 基址。
+    pub fn billing_base(self) -> &'static str {
+        match self {
+            WbRegion::Cn => BILLING_BASE_CN,
+            WbRegion::Global => BILLING_BASE_GLOBAL,
+        }
+    }
+
+    /// 积分三件套 / 官方用量 / 活动基址。
+    pub fn credits_base(self) -> &'static str {
+        match self {
+            WbRegion::Cn => CREDITS_BASE_CN,
+            WbRegion::Global => BILLING_BASE_GLOBAL,
+        }
+    }
+
+    /// chat 上游 / 模型目录基址。
+    pub fn chat_base(self) -> &'static str {
+        match self {
+            WbRegion::Cn => CHAT_HOST_CN,
+            WbRegion::Global => BILLING_BASE_GLOBAL,
+        }
+    }
+
+    /// OAuth（auth/state、auth/token、login/account）+ CLI 登录页基址。
+    pub fn plugin_base(self) -> &'static str {
+        self.chat_base()
+    }
+
+    /// OAuth Web 侧 Origin / Referer。
+    pub fn web_origin(self) -> &'static str {
+        match self {
+            WbRegion::Cn => BILLING_BASE_CN,
+            WbRegion::Global => BILLING_BASE_GLOBAL,
+        }
+    }
+
+    /// plugin token refresh 端点（区域感知；国际版账号必须走 workbuddy.ai）。
+    pub fn refresh_url(self) -> String {
+        format!("{}{}", self.billing_base(), REFRESH_PATH)
+    }
+
+    /// 备用域名（§2.2 双探测）：对侧区域的 billing 基址。
+    pub fn alt_billing_base(self) -> &'static str {
+        match self {
+            WbRegion::Cn => BILLING_BASE_GLOBAL,
+            WbRegion::Global => BILLING_BASE_CN,
+        }
     }
 }
 
 /// 域名双探测（§2.2 接口稳定性）：主域名在前、备用域名在后。
 pub fn billing_bases(domain: &str) -> [&'static str; 2] {
-    let main = region_billing_base(domain);
-    let alt = if main == BILLING_BASE_CN {
-        BILLING_BASE_GLOBAL
-    } else {
-        BILLING_BASE_CN
+    let r = WbRegion::from_domain(domain);
+    [r.billing_base(), r.alt_billing_base()]
+}
+
+/// 账号区域解析（Switch AI：WorkBuddy 国际版）——**区域权威来源**。
+///
+/// 优先级：账号显式 `region` 字段 > 凭证记录 `region` 键 > 凭证记录 `domain` > 默认 CN。
+///
+/// 为什么需要显式字段：`domain` 只在部分来源里出现（auth 文件 / OAuth 返回），
+/// 手工录入或旧版导入的账号往往没有 `domain`，此时旧实现会静默按 CN 处理——
+/// 国际版账号的签到/积分/chat 请求会被打到国内网关而失败。
+/// 显式 `region` 让国际版身份不依赖可缺失的推断字段。
+pub fn resolve_region(explicit: &str, token_rec: Option<&Value>) -> WbRegion {
+    if !explicit.trim().is_empty() {
+        return WbRegion::parse(explicit);
+    }
+    let (rec_region, rec_domain) = match token_rec {
+        Some(rec) => (
+            rec.get("region").and_then(Value::as_str).unwrap_or(""),
+            rec.get("domain").and_then(Value::as_str).unwrap_or(""),
+        ),
+        None => ("", ""),
     };
-    [main, alt]
+    if !rec_region.trim().is_empty() {
+        return WbRegion::parse(rec_region);
+    }
+    WbRegion::from_domain(rec_domain)
+}
+
+/// 便捷版：调用方只掌握 `domain` 字符串（如 `Creds.domain`）时使用。
+pub fn resolve_region_str(explicit: &str, domain: &str) -> WbRegion {
+    if !explicit.trim().is_empty() {
+        return WbRegion::parse(explicit);
+    }
+    WbRegion::from_domain(domain)
 }
 
 // ── token 刷新（F-09）──────────────────────────────────────────────────────
@@ -521,7 +672,24 @@ pub fn refresh_token_once(agent: &ureq::Agent, creds: &Creds) -> Option<Creds> {
 }
 
 /// refresh_token_once 的带失败原因版本（审查 P1-4）。
+/// 区域由 `creds.region` 优先、`creds.domain` 兜底推断——
+/// 国际版账号自动走 workbuddy.ai 的 refresh 端点。
 pub fn refresh_token_once_ex(agent: &ureq::Agent, creds: &Creds) -> (Option<Creds>, RefreshFail) {
+    refresh_token_once_region(
+        agent,
+        creds,
+        resolve_region_str(&creds.region, &creds.domain),
+    )
+}
+
+/// 区域感知刷新（Switch AI：WorkBuddy 国际版）。
+/// 国际版账号必须打 `https://www.workbuddy.ai/v2/plugin/auth/token/refresh`；
+/// 打国内 codebuddy.cn 会把 refresh token 送到错误的网关注销。
+pub fn refresh_token_once_region(
+    agent: &ureq::Agent,
+    creds: &Creds,
+    region: WbRegion,
+) -> (Option<Creds>, RefreshFail) {
     if creds.refresh_token.is_empty() {
         return (None, RefreshFail::NoRefreshToken);
     }
@@ -531,7 +699,8 @@ pub fn refresh_token_once_ex(agent: &ureq::Agent, creds: &Creds) -> (Option<Cred
         "X-Auth-Refresh-Source".to_string(),
         "workbuddy".to_string(),
     ));
-    let (status, body) = post_json(agent, REFRESH_URL, &h, &serde_json::json!({}));
+    let url = region.refresh_url();
+    let (status, body) = post_json(agent, &url, &h, &serde_json::json!({}));
     if status == 0 {
         return (None, RefreshFail::Network);
     }
@@ -801,6 +970,131 @@ pub fn refresh_token_once_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ============ WorkBuddy 区域路由（Switch AI：国际版支持） ============
+
+    #[test]
+    fn region_from_domain_covers_intl_and_cn_shapes() {
+        // 国际版各种写法
+        for d in [
+            "www.workbuddy.ai",
+            "workbuddy.ai",       // 历史缺陷：旧 contains(".workbuddy.ai") 会误判为 CN
+            ".workbuddy.ai",
+            "WORKBUDDY.AI",
+            "https://www.workbuddy.ai/v2/chat/completions",
+            "www.workbuddy.ai:443",
+            "codebuddy.ai",
+            "www.codebuddy.ai",
+        ] {
+            assert_eq!(WbRegion::from_domain(d), WbRegion::Global, "domain={d}");
+        }
+        // 国内版各种写法（含「看起来像但其实不是」的近似域名）
+        for d in [
+            "",
+            "   ",
+            "www.codebuddy.cn",
+            "codebuddy.cn",
+            "www.workbuddy.cn",
+            "copilot.tencent.com",
+            "https://www.codebuddy.cn/v2/activity/banner",
+            "notworkbuddy.ai.evil.com", // 后缀匹配不能被绕过
+            "workbuddy.ai.evil.com",
+            "evil-workbuddy.ai",
+        ] {
+            assert_eq!(WbRegion::from_domain(d), WbRegion::Cn, "domain={d}");
+        }
+    }
+
+    #[test]
+    fn region_parse_and_roundtrip() {
+        for s in ["global", "Global", " GLOBAL ", "intl", "international", "oversea", "overseas", "ai", "en"] {
+            assert_eq!(WbRegion::parse(s), WbRegion::Global, "s={s}");
+        }
+        for s in ["cn", "CN", "", "  ", "china", "zh", "unknown"] {
+            assert_eq!(WbRegion::parse(s), WbRegion::Cn, "s={s}");
+        }
+        // as_str ↔ parse 往返
+        for r in [WbRegion::Cn, WbRegion::Global] {
+            assert_eq!(WbRegion::parse(r.as_str()), r);
+        }
+        assert_eq!(WbRegion::default(), WbRegion::Cn);
+    }
+
+    #[test]
+    fn region_bases_are_distinct_and_correct() {
+        let cn = WbRegion::Cn;
+        let gl = WbRegion::Global;
+
+        // 三套基址不可混用：CN 的 billing 站 ≠ CN 的积分站
+        assert_eq!(cn.billing_base(), "https://www.codebuddy.cn");
+        assert_eq!(cn.credits_base(), "https://www.workbuddy.cn");
+        assert_eq!(cn.chat_base(), "https://copilot.tencent.com");
+        assert_eq!(cn.plugin_base(), "https://copilot.tencent.com");
+        assert_eq!(cn.web_origin(), "https://www.codebuddy.cn");
+        assert_ne!(cn.billing_base(), cn.credits_base(), "CN 两站必须区分");
+
+        // 国际版全部落到 workbuddy.ai
+        assert_eq!(gl.billing_base(), "https://www.workbuddy.ai");
+        assert_eq!(gl.credits_base(), "https://www.workbuddy.ai");
+        assert_eq!(gl.chat_base(), "https://www.workbuddy.ai");
+        assert_eq!(gl.plugin_base(), "https://www.workbuddy.ai");
+        assert_eq!(gl.web_origin(), "https://www.workbuddy.ai");
+
+        // refresh 端点必须区域化（国际版打国内网关会注销 refresh token）
+        assert_eq!(
+            gl.refresh_url(),
+            "https://www.workbuddy.ai/v2/plugin/auth/token/refresh"
+        );
+        assert_eq!(
+            cn.refresh_url(),
+            "https://www.codebuddy.cn/v2/plugin/auth/token/refresh"
+        );
+        assert!(gl.refresh_url() != cn.refresh_url());
+    }
+
+    #[test]
+    fn region_double_probe_puts_main_first() {
+        assert_eq!(
+            billing_bases("www.workbuddy.ai"),
+            ["https://www.workbuddy.ai", "https://www.codebuddy.cn"]
+        );
+        assert_eq!(
+            billing_bases(""),
+            ["https://www.codebuddy.cn", "https://www.workbuddy.ai"]
+        );
+        // 枚举判定本身即区域权威（原 is_global_region/region_billing_base 包装已内联）
+        assert!(WbRegion::from_domain("www.workbuddy.ai").is_global());
+        assert!(!WbRegion::from_domain("www.codebuddy.cn").is_global());
+        assert_eq!(WbRegion::from_domain("workbuddy.ai").billing_base(), BILLING_BASE_GLOBAL);
+        assert_eq!(WbRegion::from_domain("x.cn").billing_base(), BILLING_BASE_CN);
+    }
+
+    /// Switch AI：区域解析优先级（账号显式字段 > 凭证 region > 凭证 domain > CN）。
+    /// 这是「国际版账号不被误判为国内版」的核心保证。
+    #[test]
+    fn resolve_region_precedence() {
+        let intl_rec = serde_json::json!({ "domain": "www.workbuddy.ai" });
+        let cn_rec = serde_json::json!({ "domain": "www.codebuddy.cn" });
+        let region_only = serde_json::json!({ "region": "global" }); // 无 domain 的国际版账号
+        let empty = serde_json::json!({});
+
+        // 显式字段最优先（可覆盖凭证里的 domain）
+        assert_eq!(resolve_region("global", Some(&cn_rec)), WbRegion::Global);
+        assert_eq!(resolve_region("cn", Some(&intl_rec)), WbRegion::Cn);
+        // 凭证 region 次之：domain 缺失时仍能判定国际版（旧实现的核心缺口）
+        assert_eq!(resolve_region("", Some(&region_only)), WbRegion::Global);
+        // 凭证 domain 再次之
+        assert_eq!(resolve_region("", Some(&intl_rec)), WbRegion::Global);
+        assert_eq!(resolve_region("", Some(&cn_rec)), WbRegion::Cn);
+        // 全缺省 → CN
+        assert_eq!(resolve_region("", Some(&empty)), WbRegion::Cn);
+        assert_eq!(resolve_region("", None), WbRegion::Cn);
+        assert_eq!(resolve_region("  ", None), WbRegion::Cn);
+        // resolve_region_str 与之一致
+        assert_eq!(resolve_region_str("", "www.workbuddy.ai"), WbRegion::Global);
+        assert_eq!(resolve_region_str("global", ""), WbRegion::Global);
+        assert_eq!(resolve_region_str("", ""), WbRegion::Cn);
+    }
 
     // ==================== 客户端指纹伪装（issue #48） ====================
 

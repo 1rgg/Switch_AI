@@ -46,9 +46,11 @@ import type {
   WbCreditsResult,
   WbOauthDone,
   WbOauthProgress,
+  WbRegionKey,
   WbResetItem,
   WbResetResult,
 } from '../../types';
+import { WB_REGIONS, wbRegionLabel } from '../../types';
 
 /**
  * buddy-accounts 账号管理（§3.7.2，F-54/F-56/F-60/F-50/F-14）：
@@ -104,7 +106,10 @@ export default function BuddyAccounts() {
   const [checkinMap, setCheckinMap] = useState<Map<string, WbCheckinRecord>>(new Map());
   const [loading, setLoading] = useState(false);
   const [importing, setImporting] = useState(false);
-  const [scanPreview, setScanPreview] = useState<{ nickname: string; uid: string; exists: boolean; already_in_pool?: boolean } | null>(null);
+  // Switch AI（WorkBuddy 国际版）：录入区域。OAuth 扫码与「扫描本机账号」共用此选择——
+  // 决定登录站点（workbuddy.ai vs copilot.tencent.com）与入池后的区域路由。
+  const [regionChoice, setRegionChoice] = useState<WbRegionKey>('cn');
+  const [scanPreview, setScanPreview] = useState<{ nickname: string; uid: string; exists: boolean; already_in_pool?: boolean; region?: string } | null>(null);
   const [detailFor, setDetailFor] = useState<WorkBuddyAccountView | null>(null);
   const [deleteFor, setDeleteFor] = useState<WorkBuddyAccountView | null>(null);
   const [restoreFor, setRestoreFor] = useState<WorkBuddyAccountView | null>(null);
@@ -355,7 +360,7 @@ export default function BuddyAccounts() {
     setOauthAuthUrl(null);
     setOauthOpen(true);
     try {
-      await api.workbuddy.oauthLogin();
+      await api.workbuddy.oauthLogin(regionChoice);
     } catch (err) {
       setOauthStage('error');
       setOauthMessage(String(err));
@@ -424,7 +429,7 @@ export default function BuddyAccounts() {
   const importFromAuth = async () => {
     setImporting(true);
     try {
-      const scan = await withMinDelay(api.workbuddy.scanAuthFile(), 800);
+      const scan = await withMinDelay(api.workbuddy.scanAuthFile(regionChoice), 800);
       // 扫描成功但零条可导入（未登录 / 客户端退出登录后 auth 文件被清空，uid 为空或后端返回 null）：
       // 明确 warn 反馈并终止，不打开空预览弹框
       if (!scan || !scan.uid) {
@@ -436,7 +441,7 @@ export default function BuddyAccounts() {
         pushToast('info', `该账号已在池中（${scan.nickname || scan.id}）`);
         return;
       }
-      setScanPreview({ nickname: scan.nickname, uid: scan.uid, exists: scan.exists, already_in_pool: scan.already_in_pool });
+      setScanPreview({ nickname: scan.nickname, uid: scan.uid, exists: scan.exists, already_in_pool: scan.already_in_pool, region: scan.region });
     } catch (err) {
       pushToast('error', `扫描 auth 文件失败：${String(err)}`);
     } finally {
@@ -448,7 +453,7 @@ export default function BuddyAccounts() {
     setConfirmImportBusy(true);
     try {
       const name = scanPreview?.nickname || undefined;
-      const view = await withMinDelay(api.workbuddy.accountImportAuth(name), 1000);
+      const view = await withMinDelay(api.workbuddy.accountImportAuth(name, regionChoice), 1000);
       pushToast('success', `账号「${view.nickname || view.id}」已入池`);
       setScanPreview(null);
       await refresh();
@@ -746,6 +751,23 @@ export default function BuddyAccounts() {
             <button onClick={() => void refresh()} className="btn-outline" disabled={loading}>
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
             </button>
+            {/* Switch AI（WorkBuddy 国际版）：录入区域——决定扫码登录站点与入池后的区域路由。
+                国际版走 www.workbuddy.ai（Google / GitHub 登录，Claude/GPT/Gemini）；
+                选错会把请求打到国内网关而失败。 */}
+            <select
+              className="input !py-1.5 !text-xs w-[7.5rem]"
+              value={regionChoice}
+              onChange={(e) => setRegionChoice(e.target.value as WbRegionKey)}
+              disabled={oauthBusy || importing}
+              title={WB_REGIONS.find((r) => r.key === regionChoice)?.hint}
+              aria-label="账号区域"
+            >
+              {WB_REGIONS.map((r) => (
+                <option key={r.key} value={r.key}>
+                  {r.label}
+                </option>
+              ))}
+            </select>
             <button
               className="btn-outline"
               onClick={() => void startOauth()}
@@ -873,6 +895,17 @@ export default function BuddyAccounts() {
                       <div className="flex items-center gap-1.5">
                         <span className="font-medium">{a.nickname || a.id}</span>
                         {a.is_current && <Badge tone="green">当前</Badge>}
+                        {/* Switch AI（WorkBuddy 国际版）：区域徽标——国际版请求走 workbuddy.ai */}
+                        <Badge
+                          tone={a.region === 'global' ? 'violet' : 'slate'}
+                          title={
+                            a.region === 'global'
+                              ? '国际版：workbuddy.ai（Google / GitHub 登录，Claude/GPT/Gemini）'
+                              : '国内版：codebuddy.cn / workbuddy.cn'
+                          }
+                        >
+                          {wbRegionLabel(a.region)}
+                        </Badge>
                         {a.needs_relogin && (
                           <span title={a.relogin_reason} className="text-rose-500">
                             <ShieldAlert size={12} />
@@ -1156,6 +1189,12 @@ export default function BuddyAccounts() {
           <div className="rounded-lg bg-slate-50 p-3 text-xs dark:bg-zinc-900">
             <div>昵称：{scanPreview?.nickname || '(未识别)'}</div>
             <div className="font-mono">uid：{scanPreview?.uid || '(未识别)'}</div>
+            <div>
+              区域：<span className="font-medium">{wbRegionLabel(scanPreview?.region)}</span>
+              <span className="text-slate-400">
+                （按 auth 文件推断；如为国际版账号请先将上方区域切到「国际版」再导入）
+              </span>
+            </div>
             <div className="mt-1 text-slate-400">凭证将仅存本地（等同密码，全程掩码展示）</div>
           </div>
         </div>
@@ -1387,6 +1426,18 @@ export default function BuddyAccounts() {
         title="OAuth 登录"
       >
         <div className="space-y-3 text-sm">
+          <div className="flex items-center gap-2 rounded-lg bg-slate-50 p-2 text-xs dark:bg-zinc-900">
+            <Badge tone={regionChoice === 'global' ? 'violet' : 'slate'}>
+              {wbRegionLabel(regionChoice)}
+            </Badge>
+            <span className="text-slate-500 dark:text-zinc-400">
+              登录站点：
+              <span className="font-mono">
+                {regionChoice === 'global' ? 'www.workbuddy.ai' : 'copilot.tencent.com'}
+              </span>
+              {regionChoice === 'global' && '（Google / GitHub 账号登录）'}
+            </span>
+          </div>
           <div className="flex items-center gap-2">
             {oauthStage === 'success' ? (
               <Badge tone="green">完成</Badge>

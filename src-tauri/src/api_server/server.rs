@@ -287,9 +287,10 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
                 }
             }
         }
-        // 探测目标：WB 上游对话主域名（CN）的轻量 GET 路径
-        const PROBE_URL: &str =
-            concat!("https://copilot.tencent.com", "/console/enterprises/personal/models");
+        // 探测目标：WB 上游对话主域名。
+        // Switch AI（WorkBuddy 国际版）：按**池内在用区域**探测——国际版账号的 chat
+        // 走 www.workbuddy.ai，只探国内 copilot.tencent.com 会给出错误的健康结论。
+        // 池内无 WB 账号时回退国内域名（保持既有语义）。
         loop {
             // 5min 基础间隔 + 0-60s 抖动（多实例同时启动时错峰；零新增依赖，纳秒派生）
             let jitter = std::time::SystemTime::now()
@@ -300,25 +301,44 @@ fn spawn_wb_health_probe(state: Arc<ApiSharedState>) {
             let agent = ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(10))
                 .build();
-            let ok = match agent
-                .get(PROBE_URL)
-                .set("User-Agent", super::wb_upstream::WB_UA)
-                .call()
-            {
-                Ok(_) => true,
-                Err(ureq::Error::Status(_, _)) => true, // 有 HTTP 响应 = 服务在线
-                Err(_) => false,                        // 网络/超时 = 不可达
+            let regions = {
+                let rs = state.wb_pool.wb_regions_in_use();
+                if rs.is_empty() {
+                    vec![crate::tasks::wb_common::WbRegion::Cn]
+                } else {
+                    rs
+                }
             };
+            let mut ok = true;
+            for region in regions {
+                let probe_url = format!(
+                    "{}/console/enterprises/personal/models",
+                    region.chat_base()
+                );
+                let reached = match agent
+                    .get(&probe_url)
+                    .set("User-Agent", super::wb_upstream::WB_UA)
+                    .call()
+                {
+                    Ok(_) => true,
+                    Err(ureq::Error::Status(_, _)) => true, // 有 HTTP 响应 = 服务在线
+                    Err(_) => false,                        // 网络/超时 = 不可达
+                };
+                if !reached {
+                    ok = false;
+                    // 失败明示（§2.2 接口稳定性）：记日志不静默，标明区域便于定位
+                    eprintln!(
+                        "[wb-probe] 上游健康检测失败（{} 区）: {probe_url}",
+                        region.as_str()
+                    );
+                }
+            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             state.wb_probe_ts_ms.store(now, Ordering::Relaxed);
             state.wb_probe_ok.store(if ok { 1 } else { 0 }, Ordering::Relaxed);
-            if !ok {
-                // 失败明示（§2.2 接口稳定性）：记日志不静默
-                eprintln!("[wb-probe] 上游健康检测失败: {PROBE_URL}");
-            }
         }
     });
 }

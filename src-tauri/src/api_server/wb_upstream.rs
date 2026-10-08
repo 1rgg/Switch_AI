@@ -24,6 +24,11 @@ pub const WB_UA: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
 /// CLI 客户端版本（与 WB_UA 版本一致；X-IDE-Version 指纹头用，issue #48）
 pub const WB_CLI_VERSION: &str = "2.63.2";
 /// 刷新端点（红线：唯一允许携带 X-Refresh-Token 的地方）
+/// 兼容旧引用：plugin refresh 端点（国内）。
+/// **区域感知请改用 `crate::tasks::wb_common::WbRegion::refresh_url`**——
+/// 国际版账号必须打 workbuddy.ai，用本常量会把 refresh token 送到错误的网关。
+/// （Switch AI：网关侧刷新已改为按账号区域解析，本常量不再被引用。）
+#[allow(dead_code)]
 pub const WB_REFRESH_URL: &str = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh";
 /// 首字超时（F-34）：上游建连后 10s 内未产出任何字节 → 故障转移
 pub const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -434,7 +439,7 @@ static TOKEN_STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Result<String, String> {
     // SQLite 化（P4）：死引用修复——原读写 data_dir **根**路径的 workbuddy_token_store.json
     // （正牌在 data/ 子目录，此分叉使网关 401 刷新永远读写错位文件），现统一走 store wb_tokens 表
-    let refresh = {
+    let (refresh, refresh_url) = {
         let _guard = TOKEN_STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 凭证收敛（P0-1）：secure 回填（DB 占位 + vault 明文内存态）
         let store: serde_json::Value =
@@ -444,11 +449,16 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
             .and_then(|t| t.get(account_id))
             .cloned()
             .unwrap_or_default();
-        rec.get("refresh_token")
+        let refresh = rec
+            .get("refresh_token")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .ok_or("该账号无 refreshToken（不可刷新，需重新登录）")?
-            .to_string()
+            .to_string();
+        // Switch AI（WorkBuddy 国际版）：刷新端点必须按账号区域选择——
+        // 国际版 refresh token 打到国内 codebuddy.cn 会被拒（等价于凭证失效）。
+        let region = crate::tasks::wb_common::resolve_region("", Some(&rec));
+        (refresh, region.refresh_url())
     };
 
     // 红线：X-Refresh-Token 仅出现在 refresh 端点
@@ -456,7 +466,7 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()
-        .post(WB_REFRESH_URL)
+        .post(&refresh_url)
         .set("Authorization", "Bearer")
         .set("User-Agent", wb_common::WB_DESKTOP_UA)
         .set("X-Refresh-Token", &refresh)

@@ -57,6 +57,7 @@ import type {
   WorkBuddyEnvCheck,
   WorkBuddyScanResult,
   WorkBuddySettings,
+  WbRegionKey,
   WbCreditsResult,
   WbCreditsSnapshot,
   WbCheckinRecord,
@@ -336,9 +337,16 @@ export const api = {
     },
     accountRemove: (userId: string, deleteSnapshot?: boolean) =>
       invoke('workbuddy_account_remove', { userId, deleteSnapshot: deleteSnapshot ?? null }),
-    scanAuthFile: () => invoke<WorkBuddyScanResult | null>('workbuddy_scan_auth_file'),
-    accountImportAuth: (name?: string) =>
-      invoke<WorkBuddyAccountView>('workbuddy_account_import_auth', { name: name ?? null }),
+    scanAuthFile: (region?: WbRegionKey) =>
+      invoke<WorkBuddyScanResult | null>('workbuddy_scan_auth_file', {
+        region: region ?? null,
+      }),
+    /** 导入本机 auth 文件入池；`region` 显式指定区域（国际版账号请传 'global'） */
+    accountImportAuth: (name?: string, region?: WbRegionKey) =>
+      invoke<WorkBuddyAccountView>('workbuddy_account_import_auth', {
+        name: name ?? null,
+        region: region ?? null,
+      }),
     refreshToken: (userId: string, force = false) =>
       invoke<string>('workbuddy_refresh_token', { userId, force }),
     checkinStart: (opts: { user_ids?: string[]; skip_checked_in: boolean; skip_expired: boolean }) =>
@@ -398,7 +406,10 @@ export const api = {
     accountsImport: (payload: Record<string, unknown>) =>
       invoke<WbPoolImportResult>('workbuddy_accounts_import', { payload }),
     // OAuth 扫码 + 环境重置（F-50/F-14，批次3）
-    oauthLogin: () => invoke<void>('workbuddy_oauth_login'),
+    /** OAuth 扫码登录；`region` 决定登录站点与入池区域
+     *  （'global' = WorkBuddy 国际版 workbuddy.ai，Google / GitHub 登录） */
+    oauthLogin: (region?: WbRegionKey) =>
+      invoke<void>('workbuddy_oauth_login', { region: region ?? null }),
     envResetItems: () => invoke<WbResetItem[]>('workbuddy_env_reset_items'),
     envReset: (items: string[], keycloakLogout: boolean) =>
       invoke<WbResetResult[]>('workbuddy_env_reset', { items, keycloakLogout }),
