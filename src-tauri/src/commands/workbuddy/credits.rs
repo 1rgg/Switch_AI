@@ -439,6 +439,38 @@ fn usage_row_date(item: &Value) -> Option<String> {
     None
 }
 
+/// requestTime → 展示串 "YYYY-MM-DD HH:MM:SS"（与 usage_row_date 同一套兼容逻辑，
+/// 仅保留到秒）。明细表按此列排序：定宽 + 字典序 == 时间序。
+fn usage_row_time_text(item: &Value) -> Option<String> {
+    use chrono::TimeZone;
+    let raw = item.get("requestTime").or_else(|| item.get("request_time"))?;
+    if let Some(n) = raw.as_f64() {
+        if !n.is_finite() {
+            return None;
+        }
+        let ms = if n.abs() < 10_000_000_000.0 { (n * 1000.0).round() as i64 } else { n.round() as i64 };
+        return chrono::DateTime::from_timestamp_millis(ms).map(|d| {
+            d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string()
+        });
+    }
+    let text = raw.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Some(parsed.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string());
+    }
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(parsed) = chrono::NaiveDateTime::parse_from_str(text, fmt) {
+            return Some(parsed.format("%Y-%m-%d %H:%M:%S").to_string());
+        }
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return Some(format!("{} 00:00:00", d.format("%Y-%m-%d")));
+    }
+    None
+}
+
 fn usage_credit(item: &Value) -> Option<f64> {
     let v = item.get("credit")?;
     let n = v.as_f64().or_else(|| v.as_str()?.trim().parse::<f64>().ok())?;
@@ -554,6 +586,23 @@ pub(crate) fn workbuddy_usage_official_impl(
     Ok(payload)
 }
 
+/// 按版本（国内 / 国际）分桶的中间聚合态（仅服务 `workbuddy_usage_official_all`）。
+/// 字段与全量聚合一一对应，保证「切版本」与「合并」是同一套口径的不同范围。
+#[derive(Default)]
+struct RegionUsageAgg {
+    daily: std::collections::HashMap<String, f64>,
+    /// model → (请求数, 积分)
+    models: std::collections::HashMap<String, (u64, f64)>,
+    request_count_total: u64,
+    accounts_total: usize,
+    accounts_ok: usize,
+}
+
+/// 单账号请求明细保留上限（M6 积分看板「请求用量」分栏，对齐 Switch-API 口径）：
+/// 上游近 31 天可达上万条，明细只用于排查「哪几笔最贵」；合计/趋势/模型排行
+/// 仍走全量聚合（不受本上限影响），故截断不失真。
+const DETAIL_LIMIT_PER_ACCOUNT: usize = 200;
+
 /// 官方用量核心（拉取近 31 天分页明细 + 聚合，缓存逻辑留在命令层）。
 /// 拆出供单账号命令 `workbuddy_usage_official` 与全账号聚合命令
 /// `workbuddy_usage_official_all`（Buddy 积分看板近 7 日趋势数据源）复用。
@@ -582,6 +631,9 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
 
     // 分页拉取（≤20 页 × 3000 行；requestId 去重；跳过 credit 缺失/负值/时间不可解析行）
     let mut rows: Vec<(String, f64, String)> = vec![]; // (date, credit, model)
+    // 请求明细（M6 看板「请求用量」数据源）：与 rows 同步收集，逐条只保留白名单字段
+    //（时间/模型/积分/客户端/请求 ID）——上游可能携带的 prompt、input 等一律不落盘（脱敏红线）。
+    let mut details: Vec<serde_json::Value> = vec![];
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut reported_total: u64 = 0;
     for page in 1u64..=20 {
@@ -629,7 +681,26 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
                 .unwrap_or_else(|| "未知模型".into());
             let rid = as_str(fs_utils::dig(item, &["requestId", "request_id"]))
                 .unwrap_or_else(|| uuidless_key(&date, &model, &credit));
-            if seen.insert(rid) {
+            if seen.insert(rid.clone()) {
+                // 明细行：时间缺失（仅有日期）时以当日 00:00:00 兜底，保证表格可读
+                let request_time =
+                    usage_row_time_text(item).unwrap_or_else(|| format!("{date} 00:00:00"));
+                let client = as_str(fs_utils::dig(item, &[
+                    "client",
+                    "clientType",
+                    "client_type",
+                    "platform",
+                    "source",
+                ]))
+                .filter(|c| !c.trim().is_empty())
+                .unwrap_or_else(|| "—".into());
+                details.push(serde_json::json!({
+                    "request_id": rid,
+                    "request_time": request_time,
+                    "model": model.clone(),
+                    "credit": credit,
+                    "client": client,
+                }));
                 rows.push((date, credit, model));
             }
         }
@@ -708,6 +779,16 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
         }));
     }
 
+    // 请求明细：按请求时间倒序（最近的请求最有用），单账号截断到上限。
+    // 截断只影响明细表；上方 daily/models/summary 仍为全量口径。
+    details.sort_by(|a, b| {
+        let ta = a.get("request_time").and_then(Value::as_str).unwrap_or("");
+        let tb = b.get("request_time").and_then(Value::as_str).unwrap_or("");
+        tb.cmp(ta)
+    });
+    let detail_truncated = details.len() > DETAIL_LIMIT_PER_ACCOUNT;
+    details.truncate(DETAIL_LIMIT_PER_ACCOUNT);
+
     Ok(serde_json::json!({
         "status": "complete",
         "account_id": acct_id,
@@ -716,6 +797,8 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
         "range_end": today.format("%Y-%m-%d").to_string(),
         "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
         "request_count_total": seen.len(),
+        // 上游自报总数（分页 data.total）：明细被截断时前端用它标注「共 N 条」
+        "reported_total": reported_total,
         "summary": {
             "usage_today": usage_today,
             "usage_7days": usage_week,
@@ -723,6 +806,9 @@ fn usage_official_fetch(acct_id: &str, token: &str, domain: &str) -> Result<serd
         },
         "daily": daily_out,
         "models": models_out,
+        "requests": details,
+        "detail_limit_per_account": DETAIL_LIMIT_PER_ACCOUNT,
+        "detail_truncated": detail_truncated,
     }))
 }
 
@@ -753,7 +839,10 @@ pub(crate) fn workbuddy_usage_official_all_impl(
     if !force {
         if let Some(cached) = &cached_val {
             let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
-            if chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000 {
+            // schema_version 门禁：v2 起才带「按版本（国内/国际）拆分 + 请求用量明细」。
+            // 旧结构缓存直接视为未命中重拉——否则看板的版本切换会静默无数据可切。
+            let v2 = cached.get("schema_version").and_then(Value::as_i64) == Some(2);
+            if v2 && chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000 {
                 return Ok(cached.clone());
             }
         }
@@ -815,32 +904,123 @@ pub(crate) fn workbuddy_usage_official_all_impl(
         return Err("无可用账号凭证（请先在账号管理导入/扫码入池并续期）".into());
     }
 
+    // 账号维度元信息（版本切换 / 请求用量明细的账号列都靠它）：
+    // region 走 resolve_region（显式字段优先，缺省按凭证 domain 推断），与上游路由同源，
+    // 保证「看板上归到国际版的账号」就是「实际请求 www.workbuddy.ai 的账号」。
+    let region_of = |id: &str| -> &'static str {
+        let explicit = pool
+            .accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.region.as_str())
+            .unwrap_or("");
+        if crate::tasks::wb_common::resolve_region(explicit, tokens.get(id)).is_global() {
+            "global"
+        } else {
+            "cn"
+        }
+    };
+    let name_of = |id: &str| -> String {
+        pool.accounts
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.nickname.clone())
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| id.to_string())
+    };
+
     // 逐账号拉取 + 按日/按模型聚合（单账号失败跳过，不让一个失效凭证拖垮整板趋势）
+    // 同步按版本（国内 / 国际）分桶，供看板顶部版本切换消费（对齐 Switch-API credits/stats）。
     let mut daily_credits: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     let mut model_totals: std::collections::HashMap<String, (u64, f64)> = std::collections::HashMap::new();
+    let mut region_aggs: std::collections::HashMap<String, RegionUsageAgg> =
+        std::collections::HashMap::new();
+    let mut accounts_out: Vec<serde_json::Value> = Vec::new();
+    let mut requests_out: Vec<serde_json::Value> = Vec::new();
     let mut ok = 0usize;
     let mut req_total = 0u64;
     for (id, token, domain) in &list {
-        if let Ok(p) = usage_official_fetch(id, token, domain) {
-            ok += 1;
-            req_total += p.get("request_count_total").and_then(Value::as_u64).unwrap_or(0);
-            for row in p.get("daily").and_then(Value::as_array).into_iter().flatten() {
-                let Some(date) = row.get("date").and_then(Value::as_str) else { continue };
-                let Some(u) = row.get("usage").and_then(Value::as_f64) else { continue };
-                *daily_credits.entry(date.to_string()).or_insert(0.0) += u;
+        let rkey = region_of(id);
+        let aname = name_of(id);
+        let agg = region_aggs.entry(rkey.to_string()).or_default();
+        agg.accounts_total += 1;
+        match usage_official_fetch(id, token, domain) {
+            Ok(p) => {
+                ok += 1;
+                agg.accounts_ok += 1;
+                let rc = p.get("request_count_total").and_then(Value::as_u64).unwrap_or(0);
+                req_total += rc;
+                agg.request_count_total += rc;
+                for row in p.get("daily").and_then(Value::as_array).into_iter().flatten() {
+                    let Some(date) = row.get("date").and_then(Value::as_str) else { continue };
+                    let Some(u) = row.get("usage").and_then(Value::as_f64) else { continue };
+                    *daily_credits.entry(date.to_string()).or_insert(0.0) += u;
+                    *agg.daily.entry(date.to_string()).or_insert(0.0) += u;
+                }
+                // 按模型汇总（单账号接口 31 天全窗口口径，跨账号合并；此前丢弃导致看板模型排行无数据）
+                for m in p.get("models").and_then(Value::as_array).into_iter().flatten() {
+                    let Some(model) = m.get("model").and_then(Value::as_str) else { continue };
+                    let count = m.get("request_count").and_then(Value::as_u64).unwrap_or(0);
+                    let credit = m.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+                    let e = model_totals.entry(model.to_string()).or_insert((0, 0.0));
+                    e.0 += count;
+                    e.1 += credit;
+                    let re = agg.models.entry(model.to_string()).or_insert((0, 0.0));
+                    re.0 += count;
+                    re.1 += credit;
+                }
+                // 请求用量明细（每账号已在上游层截断到 DETAIL_LIMIT_PER_ACCOUNT）
+                for mut r in p
+                    .get("requests")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .take(DETAIL_LIMIT_PER_ACCOUNT)
+                {
+                    r["account_id"] = serde_json::json!(id);
+                    r["account_name"] = serde_json::json!(aname);
+                    r["region"] = serde_json::json!(rkey);
+                    requests_out.push(r);
+                }
+                accounts_out.push(serde_json::json!({
+                    "account_id": id,
+                    "name": aname,
+                    "region": rkey,
+                    "ok": true,
+                    "request_count": rc,
+                    "reported_total": p.get("reported_total").and_then(Value::as_u64).unwrap_or(rc),
+                    "usage_today": p.get("summary").and_then(|s| s.get("usage_today")).and_then(Value::as_f64).unwrap_or(0.0),
+                    "usage_7days": p.get("summary").and_then(|s| s.get("usage_7days")).and_then(Value::as_f64).unwrap_or(0.0),
+                    "usage_this_month": p.get("summary").and_then(|s| s.get("usage_this_month")).and_then(Value::as_f64).unwrap_or(0.0),
+                }));
             }
-            // 按模型汇总（单账号接口 31 天全窗口口径，跨账号合并；此前丢弃导致看板模型排行无数据）
-            for m in p.get("models").and_then(Value::as_array).into_iter().flatten() {
-                let Some(model) = m.get("model").and_then(Value::as_str) else { continue };
-                let e = model_totals.entry(model.to_string()).or_insert((0, 0.0));
-                e.0 += m.get("request_count").and_then(Value::as_u64).unwrap_or(0);
-                e.1 += m.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+            Err(e) => {
+                // 失败账号也入账（ok=false + error）：看板可逐账号说明「某个版本取数失败」，
+                // 而不是让用户面对一个对不上总数的合计发懵
+                accounts_out.push(serde_json::json!({
+                    "account_id": id,
+                    "name": aname,
+                    "region": rkey,
+                    "ok": false,
+                    "request_count": 0,
+                    "usage_today": null,
+                    "usage_7days": null,
+                    "usage_this_month": null,
+                    "error": e,
+                }));
             }
         }
     }
     if ok == 0 {
         return fail("全部账号官方用量拉取失败（凭证可能已失效，请续期后重试）");
     }
+    // 明细跨账号合并后按请求时间倒序（与单账号口径一致：最近的请求排最前）
+    requests_out.sort_by(|a, b| {
+        let ta = a.get("request_time").and_then(Value::as_str).unwrap_or("");
+        let tb = b.get("request_time").and_then(Value::as_str).unwrap_or("");
+        tb.cmp(ta)
+    });
 
     let mut models_out: Vec<serde_json::Value> = model_totals
         .into_iter()
@@ -878,9 +1058,67 @@ pub(crate) fn workbuddy_usage_official_all_impl(
         daily_out.push(serde_json::json!({ "date": key, "usage": u }));
     }
 
+    // ── 按版本（国内 / 国际）拆分的同构输出 ──
+    // 与上方全量口径完全同构（同样的 31 天零填充 / 同样的模型排序），只是数据范围
+    // 收窄到该版本的账号集合；版本切换因此不需要前端做任何二次聚合。
+    let mut daily_by_region: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
+    let mut models_by_region: std::collections::HashMap<String, Vec<Value>> =
+        std::collections::HashMap::new();
+    let mut summary_by_region: std::collections::HashMap<String, Value> =
+        std::collections::HashMap::new();
+    for (rkey, agg) in &region_aggs {
+        let mut r_today = 0.0f64;
+        let mut r_week = 0.0f64;
+        let mut r_month = 0.0f64;
+        let mut r_daily: Vec<Value> = vec![];
+        for i in (0..=30).rev() {
+            let d = today - chrono::Duration::days(i);
+            let key = d.format("%Y-%m-%d").to_string();
+            let u = agg.daily.get(&key).copied().unwrap_or(0.0);
+            if i == 0 {
+                r_today = u;
+            }
+            if i < 7 {
+                r_week += u;
+            }
+            if d.year() == today.year() && d.month() == today.month() {
+                r_month += u;
+            }
+            r_daily.push(serde_json::json!({ "date": key, "usage": u }));
+        }
+        let mut r_models: Vec<Value> = agg
+            .models
+            .iter()
+            .map(|(model, (count, credit))| {
+                serde_json::json!({ "model": model, "request_count": *count, "credit": *credit })
+            })
+            .collect();
+        r_models.sort_by(|a, b| {
+            let ca = a.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+            let cb = b.get("credit").and_then(Value::as_f64).unwrap_or(0.0);
+            cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        daily_by_region.insert(rkey.clone(), r_daily);
+        models_by_region.insert(rkey.clone(), r_models);
+        summary_by_region.insert(
+            rkey.clone(),
+            serde_json::json!({
+                "usage_today": r_today,
+                "usage_7days": r_week,
+                "usage_this_month": r_month,
+                "request_count_total": agg.request_count_total,
+                "accounts_total": agg.accounts_total,
+                "accounts_ok": agg.accounts_ok,
+            }),
+        );
+    }
+
     let payload = serde_json::json!({
         "status": "complete",
         "source": "official_all",
+        // v2：新增按版本拆分（daily/models/summary_by_region）+ 账号级 account 列表 + 请求用量明细
+        "schema_version": 2,
         "accounts_total": list.len(),
         "accounts_ok": ok,
         "range_start": start.format("%Y-%m-%d").to_string(),
@@ -894,6 +1132,12 @@ pub(crate) fn workbuddy_usage_official_all_impl(
         },
         "daily": daily_out,
         "models": models_out,
+        "accounts": accounts_out,
+        "requests": requests_out,
+        "detail_limit_per_account": DETAIL_LIMIT_PER_ACCOUNT,
+        "daily_by_region": daily_by_region,
+        "models_by_region": models_by_region,
+        "summary_by_region": summary_by_region,
     });
     let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
     fs_utils::app_log(

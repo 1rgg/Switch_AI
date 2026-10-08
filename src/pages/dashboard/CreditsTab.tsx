@@ -19,7 +19,9 @@ import type {
 } from '../../types';
 import type { PlatformScope } from './KpiRow';
 import type { GatewayDays } from './TokensTab';
+import RequestUsageTable from './RequestUsageTable';
 import {
+  REGION_LABELS,
   mergeEarned,
   qoderEarnedByDate,
   qoderSnapshotsToPoints,
@@ -28,8 +30,32 @@ import {
   wbCheckinEarnedByDate,
   wbFallbackToPoints,
   wbOfficialAllToPoints,
+  wbOfficialModels,
   wbSnapshotEarnedByDate,
+  type WbRegionFilter,
 } from './adapters';
+
+/** 版本切换记忆键（各平台独立记忆，不与账号管理页联动；对齐 Switch-API 行为） */
+const REGION_STORAGE_KEY = 'switch-ai:buddy-credits:region';
+
+const REGION_KEYS: WbRegionFilter[] = ['cn', 'global', 'all'];
+
+function readPreferredRegion(): WbRegionFilter {
+  try {
+    const v = window.localStorage.getItem(REGION_STORAGE_KEY);
+    return v === 'cn' || v === 'global' || v === 'all' ? v : 'all';
+  } catch {
+    return 'all';
+  }
+}
+
+function persistPreferredRegion(r: WbRegionFilter) {
+  try {
+    window.localStorage.setItem(REGION_STORAGE_KEY, r);
+  } catch {
+    // 隐私模式下 localStorage 不可写：不影响本次会话内的切换
+  }
+}
 
 /**
  * 积分统计 Tab（credits-dashboard-plan.md §3.1/§5.1）：
@@ -86,6 +112,10 @@ export default function CreditsTab({
   const isDark = useIsDark();
   const { range, setRange, startStr, todayStr, dateList } = useDateRange('7d');
   const [modelFilter, setModelFilter] = useState('');
+  // 版本（国内 / 国际 / 合并）：仅 Buddy 官网源有此维度——官网用量按账号版本分桶返回，
+  // Trae/Qoder 无版本概念（Trae 分产品线、Qoder 无消耗明细接口），故只在 buddy+official 暴露。
+  const [region, setRegion] = useState<WbRegionFilter>(() => readPreferredRegion());
+  useEffect(() => persistPreferredRegion(region), [region]);
   // 切源时清空模型筛选：旧源的模型在新源列表中不存在，残留会让趋势静默归零（审查修复）
   useEffect(() => setModelFilter(''), [source]);
 
@@ -95,13 +125,39 @@ export default function CreditsTab({
   // 本地自然日 ISO 字符串可直接比较；作为 memo 依赖以 startStr/todayStr 表达
   const inRange = (date: string) => date >= startStr && date <= todayStr;
   const isGateway = source === 'gateway';
+  // 版本维度是否可用：Buddy + 官网源 + 后端返回 v2 结构（含按版本分桶）
+  const regionAvailable = buddyActive && source === 'official' && !!wbOfficial?.daily_by_region;
+  const effectiveRegion: WbRegionFilter = regionAvailable ? region : 'all';
 
   // ---- 各源 → BoardPoint ----
   const traePoints = useMemo(() => (source === 'official' ? traeUsageToPoints(usage) : []), [source, usage]);
   const buddyPoints = useMemo(
-    () => (source === 'official' ? wbOfficialAllToPoints(wbOfficial) : wbFallbackToPoints(wbFallback)),
-    [source, wbOfficial, wbFallback],
+    () =>
+      source === 'official'
+        ? wbOfficialAllToPoints(wbOfficial, effectiveRegion)
+        : wbFallbackToPoints(wbFallback),
+    [source, wbOfficial, wbFallback, effectiveRegion],
   );
+  // 所选版本的模型汇总（Buddy 官网源：31 天全窗口跨账号；无分桶时回落全量）
+  const buddyRegionModels = useMemo(
+    () => (buddyActive && source === 'official' ? wbOfficialModels(wbOfficial, effectiveRegion) : []),
+    [buddyActive, source, wbOfficial, effectiveRegion],
+  );
+  // 请求用量明细：按版本 + 模型筛选（截断在后端，合计仍走全量口径）
+  const requestRows = useMemo(() => {
+    if (!buddyActive || source !== 'official') return [];
+    const all = wbOfficial?.requests ?? [];
+    return all.filter(
+      (r) =>
+        (effectiveRegion === 'all' || r.region === effectiveRegion) &&
+        (!modelFilter || r.model === modelFilter),
+    );
+  }, [buddyActive, source, wbOfficial, effectiveRegion, modelFilter]);
+  // 该版本下的官方请求总数（不受明细截断影响）
+  const regionRequestTotal = useMemo(() => {
+    if (effectiveRegion === 'all') return wbOfficial?.request_count_total ?? 0;
+    return wbOfficial?.summary_by_region?.[effectiveRegion]?.request_count_total ?? 0;
+  }, [wbOfficial, effectiveRegion]);
   // Qoder 本地快照差分（官网无按日明细，本地为唯一消耗来源；快照无模型粒度）
   const qoderPoints = useMemo(
     () => (qoderActive && source === 'local' ? qoderSnapshotsToPoints(qoderSnapshots) : []),
@@ -123,8 +179,12 @@ export default function CreditsTab({
       const pools = scope === 'trae' ? (gateway?.trae ?? []) : scope === 'buddy' ? (gateway?.buddy ?? []) : (gateway?.qoder ?? []);
       return [...new Set(pools.flatMap((d) => d.models.map((m) => m.name)))].sort();
     }
+    // Buddy 官网源：模型清单随版本切换（国际版与国内版模型集合不同）
+    if (source === 'official' && buddyActive) {
+      return buddyRegionModels.map((m) => m.model);
+    }
     return [];
-  }, [source, traeActive, traePoints, gateway, scope]);
+  }, [source, traeActive, traePoints, gateway, scope, buddyActive, buddyRegionModels]);
 
   // ---- 范围 × 模型 × 平台 聚合 ----
   const agg = useMemo(() => {
@@ -181,9 +241,9 @@ export default function CreditsTab({
           addConsume(p.date, p.credits ?? 0);
         }
       }
-      // Buddy 模型排行（官网源：wbOfficial.models = 官网接口 31 天全窗口跨账号汇总；本地快照差分无模型明细）
-      if (buddyActive && source === 'official' && wbOfficial?.models) {
-        for (const m of wbOfficial.models) {
+      // Buddy 模型排行（官网源：所选版本的 31 天全窗口跨账号汇总；本地快照差分无模型明细）
+      if (buddyActive && source === 'official') {
+        for (const m of buddyRegionModels) {
           if (modelFilter && m.model !== modelFilter) continue;
           modelTotals.set(m.model, (modelTotals.get(m.model) ?? 0) + m.credit);
         }
@@ -290,12 +350,55 @@ export default function CreditsTab({
 
   return (
     <div className="card p-5">
+      {/* 版本切换（国内版 / 国际版 / 合并）：仅 Buddy 官网源有此维度——
+          官网用量按账号版本分桶返回；Trae/Qoder 侧无版本概念，故不暴露避免误导。 */}
+      {buddyActive && source === 'official' && (
+        <div className="mb-3 flex flex-wrap items-center gap-2 border-b border-slate-100 pb-3 dark:border-zinc-800">
+          <span className="text-xs font-medium text-slate-500 dark:text-zinc-400">版本</span>
+          <div className="flex rounded-lg bg-slate-100 p-1 dark:bg-zinc-900">
+            {REGION_KEYS.map((rk) => (
+              <button
+                key={rk}
+                disabled={!regionAvailable}
+                title={
+                  regionAvailable
+                    ? `仅统计${REGION_LABELS[rk]}账号的官方用量`
+                    : '当前缓存未包含按版本拆分数据，点「刷新数据」重新拉取后可用'
+                }
+                className={`rounded-md px-3 py-1 text-xs font-medium transition ${
+                  effectiveRegion === rk
+                    ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-800 dark:text-zinc-100'
+                    : 'text-slate-500 dark:text-zinc-400'
+                } ${!regionAvailable ? 'cursor-not-allowed opacity-40' : ''}`}
+                onClick={() => setRegion(rk)}
+              >
+                {REGION_LABELS[rk]}
+              </button>
+            ))}
+          </div>
+          {regionAvailable ? (
+            <span className="text-xs text-slate-400">
+              {effectiveRegion === 'all'
+                ? `国内版 ${wbOfficial?.summary_by_region?.cn?.accounts_ok ?? 0} 个账号 · 国际版 ${wbOfficial?.summary_by_region?.global?.accounts_ok ?? 0} 个账号（取数成功）`
+                : `${REGION_LABELS[effectiveRegion]}取数成功 ${wbOfficial?.summary_by_region?.[effectiveRegion]?.accounts_ok ?? 0}/${wbOfficial?.summary_by_region?.[effectiveRegion]?.accounts_total ?? 0} 个账号`}
+            </span>
+          ) : (
+            <span className="text-xs text-slate-400">当前为合并口径（缓存未含版本拆分，刷新数据后可按版本查看）</span>
+          )}
+        </div>
+      )}
+
       <ChartFilterBar
         title="积分统计"
         icon={<Coins size={16} className="text-violet-500" />}
         badges={
           <>
             <Badge tone="slate">{SOURCE_LABELS[source]}源</Badge>
+            {regionAvailable && effectiveRegion !== 'all' && (
+              <Badge tone="violet" title="消耗侧按所选版本统计；获得侧（签到/快照）无版本维度，仍为全版本合计。">
+                {REGION_LABELS[effectiveRegion]}口径
+              </Badge>
+            )}
             {isGateway && (
               <Badge tone="amber" title="api_usage 仅记录 tokens，不记录积分扣减；按倍率估算易失真，故以请求数为主要口径（§3.1 决策）。">
                 口径 = 请求数（不估算积分）
@@ -375,7 +478,13 @@ export default function CreditsTab({
                   value={fmtCredits(agg.earned)}
                   hint={[
                     traeActive && source === 'official' ? 'Trae 积分包归日' : null,
-                    buddyActive ? 'Buddy 快照 earned（缺失日回退签到口径）' : null,
+                    // 获得侧（签到/快照）无版本维度：切版本时明确标注仍为全版本合计，
+                    // 避免「净获得」被误读成该版本口径（口径诚实 §8）
+                    buddyActive
+                      ? regionAvailable && effectiveRegion !== 'all'
+                        ? 'Buddy 快照 earned（全版本合计 · 签到无版本维度）'
+                        : 'Buddy 快照 earned（缺失日回退签到口径）'
+                      : null,
                     qoderActive ? 'Qoder 快照 earned（签到合计）' : null,
                   ]
                     .filter(Boolean)
@@ -385,7 +494,7 @@ export default function CreditsTab({
                 <StatCard
                   label="区间总消耗"
                   value={fmtCredits(agg.consumed)}
-                  hint={`${SOURCE_LABELS[source]}源${modelFilter ? ` · ${modelFilter}` : ''}${source === 'official' && traeActive ? ` · 会话 ${agg.sessions.toLocaleString()}` : ''}`}
+                  hint={`${SOURCE_LABELS[source]}源${regionAvailable && effectiveRegion !== 'all' ? ` · ${REGION_LABELS[effectiveRegion]}` : ''}${modelFilter ? ` · ${modelFilter}` : ''}${source === 'official' && traeActive ? ` · 会话 ${agg.sessions.toLocaleString()}` : ''}`}
                   tone="amber"
                 />
                 <StatCard
@@ -464,11 +573,11 @@ export default function CreditsTab({
             <div className="mb-2 flex items-center gap-2">
               <h4 className="text-sm font-medium">模型消耗排行</h4>
               <span className="text-xs text-slate-400">
-                {source === 'official' && buddyActive && (wbOfficial?.models?.length ?? 0) > 0
+                {source === 'official' && buddyActive && buddyRegionModels.length > 0
                   ? 'Top8 + 其余合计'
                   : '所选区间 · Top8 + 其余合计'}
               </span>
-              {source === 'official' && buddyActive && (wbOfficial?.models?.length ?? 0) > 0 && (
+              {source === 'official' && buddyActive && buddyRegionModels.length > 0 && (
                 <Badge
                   tone="slate"
                   title="Buddy 模型积分为官网接口 31 天全窗口跨账号汇总，不随上方区间筛选变化；Trae 部分为所选区间口径，同名模型两者相加。"
@@ -494,6 +603,31 @@ export default function CreditsTab({
               }
             />
           </div>
+
+          {/* ③′ 官网请求用量明细（Buddy 官网源专属；对齐 Switch-API 积分统计「请求用量」分栏） */}
+          {buddyActive && source === 'official' && (
+            <div className="mt-5 border-t border-slate-100 pt-4 dark:border-zinc-800">
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <h4 className="text-sm font-medium">请求用量明细</h4>
+                <span className="text-xs text-slate-400">
+                  官方 get-user-request-usage 逐条记录 · {wbOfficial?.range_start} 至 {wbOfficial?.range_end}
+                </span>
+                <Badge
+                  tone="slate"
+                  title="明细按每账号保留最近若干条展示（排查「哪几笔最贵」用）；上方趋势与合计走全量聚合，不受明细截断影响。"
+                >
+                  明细截断 · 合计走全量
+                </Badge>
+              </div>
+              <RequestUsageTable
+                requests={requestRows}
+                region={effectiveRegion}
+                modelFilter={modelFilter}
+                detailLimit={wbOfficial?.detail_limit_per_account}
+                totalRequests={regionRequestTotal}
+              />
+            </div>
+          )}
 
           {/* ④ 年度活动热力图 */}
           <div className="mt-5 border-t border-slate-100 pt-4 dark:border-zinc-800">

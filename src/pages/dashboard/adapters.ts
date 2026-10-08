@@ -5,6 +5,7 @@ import type {
   WbCheckinRecord,
   WbCreditsSnapshot,
   WbUsageFallback,
+  WbUsageModelPoint,
   WbUsageOfficialAll,
 } from '../../types';
 
@@ -46,10 +47,39 @@ export function traeUsageToPoints(usage: UsageHistoryResult | null): BoardPoint[
   return [...byDate.values()].sort((x, y) => x.date.localeCompare(y.date));
 }
 
-/** Buddy 官网用量聚合（workbuddy_usage_official_all，日合计，31 天零填充） */
-export function wbOfficialAllToPoints(r: WbUsageOfficialAll | null): BoardPoint[] {
+/**
+ * Buddy 官网用量聚合（workbuddy_usage_official_all，日合计，31 天零填充）。
+ * region = 'cn' / 'global' 且后端返回了 `daily_by_region` 时取该版本的序列；
+ * 其余（合并视图 / 旧结构缓存）回落全量 `daily`——不静默造数，缺哪个版本就走合并口径。
+ */
+export function wbOfficialAllToPoints(
+  r: WbUsageOfficialAll | null,
+  region: WbRegionFilter = 'all',
+): BoardPoint[] {
   if (!r) return [];
-  return r.daily.map((d) => ({ date: d.date.slice(0, 10), credits: d.usage, models: {} }));
+  const daily =
+    region !== 'all' ? (r.daily_by_region?.[region] ?? r.daily) : r.daily;
+  return daily.map((d) => ({ date: d.date.slice(0, 10), credits: d.usage, models: {} }));
+}
+
+/** Buddy 积分看板「版本」维度：国内版 / 国际版 / 合并（对齐 Switch-API RegionFilter） */
+export type WbRegionFilter = 'cn' | 'global' | 'all';
+
+/** 版本筛选标签（国内版 / 国际版 / 合并） */
+export const REGION_LABELS: Record<WbRegionFilter, string> = {
+  cn: '国内版',
+  global: '国际版',
+  all: '合并',
+};
+
+/** 指定版本的模型汇总；无该版本分桶时回落全量（调用方据此标注口径） */
+export function wbOfficialModels(
+  r: WbUsageOfficialAll | null,
+  region: WbRegionFilter,
+): WbUsageModelPoint[] {
+  if (!r) return [];
+  if (region !== 'all') return r.models_by_region?.[region] ?? (r.models ?? []);
+  return r.models ?? [];
 }
 
 /**

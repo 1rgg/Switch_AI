@@ -6,6 +6,41 @@
 
 ---
 
+## [Switch AI 3.8.0] · Buddy 积分看板：官网源按版本拆分 + 请求用量明细
+
+> 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。
+> 对齐 [Switch-API](https://github.com/1rgg/Switch-API) 积分统计（`/api/credits/stats`）的
+> 区域维度与「请求用量」分栏。
+
+### 新增
+
+- **积分统计 · 官网源区分国内版 / 国际版**：Buddy 积分看板顶部新增「版本」切换
+  （国内版 / 国际版 / 合并，选择记忆在 localStorage）。官方用量按账号版本分桶返回
+  （`daily_by_region` / `models_by_region` / `summary_by_region`），切换后趋势图、
+  区间总消耗、模型排行、请求用量明细**同步收窄到该版本**；账号版本由
+  `resolve_region`（显式字段优先，缺省按凭证 domain 推断）判定，与实际请求的上游站点同源。
+- **积分统计 · 请求用量明细**：新增「请求用量明细」区块（Buddy 官网源专属），
+  逐条展示 请求时间 / 账号（含版本徽标）/ 消耗 / 模型 / 客户端 / 请求 ID，
+  支持表头排序与分页，并跟随上方版本与模型筛选联动。
+- 后端 `workbuddy_usage_official`（单账号）与 `workbuddy_usage_official_all`（全账号聚合）
+  输出新增：`requests`（请求明细）、`accounts`（账号级汇总 + 版本归属）、
+  `schema_version: 2` 与按版本分桶的三组字段。
+
+### 口径说明（诚实标注，不做静默合并）
+
+- 明细为**每账号最近 200 条**（后端截断，用于排查「哪几笔最贵」）；
+  趋势、合计、模型排行仍走全量聚合，**不受截断影响**，区块内已显式标注。
+- **获得积分侧（签到 / 余额快照）无版本维度**，切到单一版本时统计卡标注
+  「全版本合计」，避免「净获得」被误读为该版本口径。
+- 旧缓存（无 `schema_version: 2`）不再命中 10 分钟缓存窗口，首次进入会重拉一次；
+  重拉前版本切换控件置灰并给出「刷新数据后可用」提示，不会静默显示空数据。
+
+### 其他
+
+- 版本号同步至 3.8.0（Cargo.toml / Cargo.lock / package.json / AGENT.md）。
+
+---
+
 ## [Switch AI 3.7.7] · 国际版模型目录端点修正
 
 > 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。

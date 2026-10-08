@@ -1182,10 +1182,51 @@ export interface WbUsageModelPoint {
   credit: number;
 }
 
+/** 单账号官方用量汇总（账号级，供版本切换后的口径对账） */
+export interface WbUsageOfficialAccount {
+  account_id: string;
+  name: string;
+  /** `cn` 国内版 / `global` 国际版（由后端 ResolveRegion 判定，与上游路由同源） */
+  region: string;
+  ok: boolean;
+  request_count: number;
+  reported_total?: number | null;
+  usage_today: number | null;
+  usage_7days: number | null;
+  usage_this_month: number | null;
+  error?: string | null;
+}
+
+/** 单条请求用量明细（脱敏：仅时间/模型/积分/客户端/请求 ID） */
+export interface WbUsageOfficialRequest {
+  account_id: string;
+  account_name: string;
+  /** `cn` 国内版 / `global` 国际版 */
+  region: string;
+  request_id: string;
+  /** "YYYY-MM-DD HH:MM:SS"（定宽，字典序 == 时间序） */
+  request_time: string;
+  model: string;
+  credit: number;
+  client: string;
+}
+
+/** 版本（国内 / 国际）聚合汇总 */
+export interface WbUsageRegionSummary {
+  usage_today: number;
+  usage_7days: number;
+  usage_this_month: number;
+  request_count_total: number;
+  accounts_total: number;
+  accounts_ok: number;
+}
+
 /** 全账号官方用量聚合（Buddy 积分看板近 7 日消耗主数据源；31 天零填充） */
 export interface WbUsageOfficialAll {
   status: 'complete';
   source: 'official_all';
+  /** 结构版本：2 = 含按版本拆分 + 请求用量明细；缺省 = 旧缓存（版本切换不可用） */
+  schema_version?: number;
   accounts_total: number;
   accounts_ok: number;
   range_start: string;
@@ -1199,6 +1240,18 @@ export interface WbUsageOfficialAll {
   daily: { date: string; usage: number }[];
   /** 按模型汇总（31 天全窗口、跨账号合并；stale 旧缓存可能缺省） */
   models?: WbUsageModelPoint[];
+  /** 账号级汇总（含版本归属）；v2 起提供 */
+  accounts?: WbUsageOfficialAccount[];
+  /** 请求用量明细（每账号最近 N 条，按请求时间倒序）；v2 起提供 */
+  requests?: WbUsageOfficialRequest[];
+  /** 明细每账号保留上限 */
+  detail_limit_per_account?: number;
+  /** 按版本拆分的逐日消耗（31 天零填充）；v2 起提供 */
+  daily_by_region?: Record<string, { date: string; usage: number }[]>;
+  /** 按版本拆分的模型汇总；v2 起提供 */
+  models_by_region?: Record<string, WbUsageModelPoint[]>;
+  /** 按版本拆分的汇总；v2 起提供 */
+  summary_by_region?: Record<string, WbUsageRegionSummary>;
 }
 
 /** 活动信息三端点聚合（F-51）：banner（公开）+ 付费类型 + 用量提醒 */
