@@ -100,6 +100,10 @@ GET  /v2/plugin/login/account?state=<uuid>  (Bearer)               → uid / nic
 - 签到与成长中心：按账号区域选择 `billing_base()`
 - 积分三件套与官方用量：按账号区域选择 `credits_base()`，并把凭证 `domain` 规范化为「区域权威 domain」
 - token 刷新（3 处）：按账号区域选择 `refresh_url()`——国际版 refresh token 打到国内网关会被拒
+- **备用域名（域名双探测）不跨区**：原实现对国际版返回国内 `codebuddy.cn` 作为备用域名，
+  会把国际版 bearer token 发往国内网关——按本项目自身契约
+  「令牌域与请求域不一致会被网关拒绝」**不可能成功**，且等于把凭证暴露给错误区域。
+  现国际版的备用域名为**同区兄弟站** `www.codebuddy.ai`
 - API 网关上游：`global_region` 改由账号区域推导（不再只看 `domain`）
 - 上游健康探测：改为**按池内在用区域**探测（原先硬编码只探国内域名，纯国际版部署会得到错误的健康结论）
 
@@ -189,22 +193,32 @@ npx tsc --noEmit        # 类型检查
 | 验证项 | 结果 |
 | --- | --- |
 | `cargo check --all-targets`（含测试代码，x86_64-pc-windows-gnu） | ✅ 通过，无 error / warning |
+| `cargo test` + `npm run test`（GitHub Actions, MSVC） | ✅ 后端与前端全部通过（vitest 6 文件 / 59 用例） |
 | `tsc` + `vite build` 前端构建 | ✅ 通过 |
-| `vitest run` 前端测试 | ✅ 6 个文件 / 59 个用例全通过 |
-| 新增区域逻辑断言（从真实源码机械提取后用 `rustc` 运行） | ✅ 55 条断言全通过 |
-| 国际版端点连通性探测（未认证） | ✅ `auth/state` 返回 200 + authUrl；`auth/token`、`billing/meter/*`、`v2/activity/growth/tasks`、`v2/chat/completions`、`plugin/auth/token/refresh` 均存在（401/400 = 需鉴权，非 404） |
+| 区域逻辑断言（从真实源码机械提取后用 `rustc` 运行） | ✅ 45 条断言全通过（含「备用域名不跨区」） |
+| 区域分类 vs **厂商自己的域名表** | ✅ 与 `product.json` 的 `internalDomain` / `externalDomain` 一致（已固化为单测） |
+| 国际版端点连通性探测（未认证） | ✅ `auth/state` 返回 200 + authUrl；`billing/meter/*`、`v2/activity/growth/tasks`、`v2/chat/completions`、`plugin/auth/token/refresh` 均存在（401/400 = 需鉴权，非 404）；`www.codebuddy.ai` 同类端点同样存在 |
+
+> **区域分类的权威依据**：国际版 CodeBuddy CLI 包内 `product.json` 明示
+> `endpoint = https://www.codebuddy.ai`、`productFeatures.InternationalLogin = true`，
+> 并在 `authentication.attributes` 中给出域名分组——
+> 国内 `internalDomain`：`copilot.tencent.com`、`www.codebuddy.cn`、`www.workbuddy.cn` 等；
+> 国际 `externalDomain`：`www.codebuddy.ai`。
+> 本分支的区域判定与该表一致（把厂商域名表作为测试固化的依据，而非自行臆测）。
 
 **未验证 / 已知限制**（请知悉）：
 
 1. **未用真实的 WorkBuddy 国际版账号做过端到端实测**——开发环境没有国际版账号，
    因此「登录 → 签到 → 积分 → 网关调用」的完整链路**未经真实账号验证**。
-   端点结构与国内版同构是实测得出的，但服务端行为仍可能随版本变化。
+   端点结构与国内版同构、域名分组均已实测/对齐厂商定义，但服务端行为仍可能随版本变化。
 2. Windows 安装包由 **GitHub Actions 以 MSVC 工具链**构建（本机无 MSVC，仅有 mingw）。
    本地验证用的是 `x86_64-pc-windows-gnu` 目标，因此 `cargo test` 的**链接**步骤在本地无法执行
    （mingw 下 `libsodium` 的 `memset_explicit` 与 manifest 合并会失败），
-   这是本地工具链限制，与代码无关；CI 使用 MSVC 不受影响。
+   这是本地工具链限制，与代码无关；CI 使用 MSVC 不受影响（已实测通过）。
 3. 国际版的**积分/计费响应结构与国内版是否逐字段一致未验证**——代码沿用原项目宽容解析逻辑，
    若国际版返回字段不同，可能需要后续适配。
+4. **国内版**的备用域名仍沿用上游既有语义（CN → 国际镜像探测）。上游自身契约表明跨区必被拒，
+   但该路径已被上游验证，本分支**有意不改动**以避免回归；如需同样收敛可后续单独评估。
 
 ---
 

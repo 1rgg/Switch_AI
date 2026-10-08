@@ -6,6 +6,32 @@
 
 ---
 
+## [Switch AI 3.7.4] · 备用域名不跨区 + 区域分类对齐厂商域名表
+
+> 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。
+
+### 修复加强
+
+- **备用域名（域名双探测）不再跨区**：`WbRegion::alt_billing_base()` 原对国际版返回
+  国内 `codebuddy.cn`，使「主域名网络不可达 → 备用域名重试」这一步把**国际版 bearer
+  token 发往国内网关**。按项目自身技术契约（tech-framework §B.2
+  「令牌域与请求域不一致会被网关拒绝」）该重试**不可能成功**，且等于把凭证暴露给错误区域。
+  现国际版的备用域名改为同区兄弟站 `www.codebuddy.ai`（实测 `/billing/meter/*` 与
+  `/v2/chat/completions` 均存在）。受影响调用点：`tasks/wb_checkin.rs` 的
+  `Urls::alt()`（原固定按 "" 即国内推导）与 `fetch_balance`（原硬编码 CN↔Global 互换）。
+  > 国内分支**有意保持上游既有语义**（CN → 国际镜像探测）不变：该路径已被上游验证，
+  > 本次不做改动以免引入回归。
+
+### 内部改进
+
+- **区域分类改为对齐厂商自己的域名表**，并固化为单测：
+  国际版 CodeBuddy CLI 包内 `product.json` 明示 `endpoint = https://www.codebuddy.ai`、
+  `productFeatures.InternationalLogin = true`，且 `authentication.attributes` 给出域名分组——
+  国内 `internalDomain`：`copilot.tencent.com` / `www.codebuddy.cn` / `www.workbuddy.cn` 等；
+  国际 `externalDomain`：`www.codebuddy.ai`。
+  新增单测 `region_classification_matches_vendor_domain_tables` 与
+  `global_alt_domain_never_crosses_region` 固化这两条约束。
+
 ## [Switch AI 分支 · 基于 3.7.3] · WorkBuddy 国际版（workbuddy.ai）支持
 
 > 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支，

@@ -92,9 +92,11 @@ fn urls_for(base: &'static str) -> Urls {
 }
 
 impl Urls {
-    /// 备用域名端点表（§2.2 域名双探测）：主域名网络不可达时切换重试一次
+    /// 备用域名端点表（§2.2 域名双探测）：主域名网络不可达时切换重试一次。
+    /// Switch AI：备用域名由**主域名所在区域**推导（不再固定用 "" 即国内），
+    /// 否则国际版账号会拿国内网关当备用域名——跨区必被网关拒绝。
     fn alt(&self) -> Urls {
-        let bases = wb_common::billing_bases("");
+        let bases = wb_common::billing_bases(self.base);
         let alt = if bases[0] == self.base { bases[1] } else { bases[0] };
         urls_for(alt)
     }
@@ -372,11 +374,9 @@ fn fetch_balance(agent: &ureq::Agent, headers: &[(String, String)], base: &str) 
     let path = "/billing/meter/get-user-resource-summary";
     let (mut status, mut body) = wb_common::post_json(agent, &format!("{base}{path}"), headers, &json!({}));
     if status == 0 {
-        let alt = if base == wb_common::BILLING_BASE_CN {
-            wb_common::BILLING_BASE_GLOBAL
-        } else {
-            wb_common::BILLING_BASE_CN
-        };
+        // Switch AI：备用域名按 base 所属区域推导（同区），不再硬编码 CN↔Global 互换——
+        // 原写法在国际版账号上会把 bearer token 发往国内网关（跨区必被拒）
+        let alt = wb_common::WbRegion::from_domain(base).alt_billing_base();
         if alt != base {
             let r = wb_common::post_json(agent, &format!("{alt}{path}"), headers, &json!({}));
             status = r.0;

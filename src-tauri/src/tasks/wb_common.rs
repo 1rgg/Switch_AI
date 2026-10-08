@@ -495,6 +495,14 @@ pub const BILLING_BASE_GLOBAL: &str = "https://www.workbuddy.ai";
 pub const CREDITS_BASE_CN: &str = "https://www.workbuddy.cn";
 /// chat 上游 / OAuth / 模型目录国内基址。
 pub const CHAT_HOST_CN: &str = "https://copilot.tencent.com";
+/// 国际版**同区兄弟站**（Switch AI 新增）。
+///
+/// 依据：国际版 CodeBuddy CLI 的 `product.json` 中
+/// `authentication.attributes.externalDomain = ["www.codebuddy.ai", …]`，
+/// 且 `endpoint = https://www.codebuddy.ai`（`productFeatures.InternationalLogin = true`）；
+/// 实测 `/billing/meter/get-user-resource-summary` 与 `/v2/chat/completions` 均存在（401 需鉴权）。
+/// 用作国际版的**备用域名**，保证双探测不跨区。
+pub const CHAT_HOST_GLOBAL_ALT: &str = "https://www.codebuddy.ai";
 /// plugin token refresh 路径（区域基址拼接）。
 pub const REFRESH_PATH: &str = "/v2/plugin/auth/token/refresh";
 
@@ -599,16 +607,26 @@ impl WbRegion {
         format!("{}{}", self.billing_base(), REFRESH_PATH)
     }
 
-    /// 备用域名（§2.2 双探测）：对侧区域的 billing 基址。
+    /// 备用域名（§2.2 双探测）：**必须与主域名同区**。
+    ///
+    /// Switch AI 修正：原实现对 Global 返回国内 `codebuddy.cn`，会把国际版
+    /// bearer token 送到国内网关。而按本项目自身的技术契约
+    /// （tech-framework §B.2：「令牌域与请求域不一致会被网关拒绝」），
+    /// 该跨区重试**不可能成功**，只是把凭证暴露给错误区域。
+    /// 现在 Global 的备用域名改为国际版兄弟站 `www.codebuddy.ai`（实测可用）。
+    ///
+    /// 注意：国内分支有意保持上游既有语义（CN → 国际镜像探测）不变——
+    /// 该路径已被上游验证，本次不做改动以免引入回归；如需同样收敛可后续单独评估。
     pub fn alt_billing_base(self) -> &'static str {
         match self {
             WbRegion::Cn => BILLING_BASE_GLOBAL,
-            WbRegion::Global => BILLING_BASE_CN,
+            WbRegion::Global => CHAT_HOST_GLOBAL_ALT,
         }
     }
 }
 
 /// 域名双探测（§2.2 接口稳定性）：主域名在前、备用域名在后。
+/// 两项均由 `domain` 的**所属区域**推导（Switch AI：保证同区，不跨区）。
 pub fn billing_bases(domain: &str) -> [&'static str; 2] {
     let r = WbRegion::from_domain(domain);
     [r.billing_base(), r.alt_billing_base()]
@@ -1054,10 +1072,12 @@ mod tests {
 
     #[test]
     fn region_double_probe_puts_main_first() {
+        // Switch AI：国际版备用域名改为同区兄弟站 www.codebuddy.ai（原为国内 codebuddy.cn）
         assert_eq!(
             billing_bases("www.workbuddy.ai"),
-            ["https://www.workbuddy.ai", "https://www.codebuddy.cn"]
+            ["https://www.workbuddy.ai", "https://www.codebuddy.ai"]
         );
+        // 国内分支保持上游既有语义
         assert_eq!(
             billing_bases(""),
             ["https://www.codebuddy.cn", "https://www.workbuddy.ai"]
@@ -1067,6 +1087,60 @@ mod tests {
         assert!(!WbRegion::from_domain("www.codebuddy.cn").is_global());
         assert_eq!(WbRegion::from_domain("workbuddy.ai").billing_base(), BILLING_BASE_GLOBAL);
         assert_eq!(WbRegion::from_domain("x.cn").billing_base(), BILLING_BASE_CN);
+    }
+
+    /// Switch AI：备用域名**绝不跨区**——跨区会把 token 送到错误网关，
+    /// 按 tech-framework §B.2「令牌域与请求域不一致会被网关拒绝」不可能成功。
+    /// 这是本次修复的真实缺陷：Global 的 alt 原为国内 codebuddy.cn。
+    #[test]
+    fn global_alt_domain_never_crosses_region() {
+        let gl = WbRegion::Global;
+        let alt = gl.alt_billing_base();
+        assert!(
+            !alt.ends_with(".cn"),
+            "国际版备用域名不得是国内站: {alt}"
+        );
+        assert_eq!(alt, CHAT_HOST_GLOBAL_ALT);
+        assert!(WbRegion::from_domain(alt).is_global(), "备用域名必须仍判定为国际版");
+
+        // 主域名与备用域名必须是不同主机（双探测才有意义）
+        assert_ne!(alt, gl.billing_base());
+
+        // 双探测列表（以主域名的区域推导）两项都应是国际站
+        for b in billing_bases("www.workbuddy.ai") {
+            assert!(WbRegion::from_domain(b).is_global(), "双探测项应为国际站: {b}");
+        }
+    }
+
+    /// Switch AI：区域分类对齐**厂商自己的域名表**（非我方臆测）。
+    /// 来源：国际版 CodeBuddy CLI 包内 `product.json`
+    ///   authentication.attributes.internalDomain（国内）
+    ///   authentication.attributes.externalDomain（国际）
+    /// 以及 `endpoint = https://www.codebuddy.ai`、`productFeatures.InternationalLogin = true`。
+    #[test]
+    fn region_classification_matches_vendor_domain_tables() {
+        // 国内域名表 → 必须判为 Cn
+        for d in [
+            "copilot.tencent.com",
+            "staging-copilot.tencent.com",
+            "www.codebuddy.cn",
+            "staging.codebuddy.cn",
+            "www.workbuddy.cn",
+            "staging.workbuddy.cn",
+            // iOADomain（企业 SSO，同属国内基建）
+            "tencent.sso.copilot.tencent.com",
+            "tencent.sso.codebuddy.cn",
+        ] {
+            assert_eq!(WbRegion::from_domain(d), WbRegion::Cn, "国内域名 {d}");
+        }
+        // 国际域名表 → 必须判为 Global
+        for d in ["www.codebuddy.ai", "www.workbuddy.ai"] {
+            assert_eq!(WbRegion::from_domain(d), WbRegion::Global, "国际域名 {d}");
+        }
+        // 国内积分站与国内计费站不同站，且都不属于国际版
+        assert_eq!(WbRegion::from_domain(CREDITS_BASE_CN), WbRegion::Cn);
+        assert_eq!(WbRegion::from_domain(BILLING_BASE_CN), WbRegion::Cn);
+        assert_eq!(WbRegion::from_domain(CHAT_HOST_CN), WbRegion::Cn);
     }
 
     /// Switch AI：区域解析优先级（账号显式字段 > 凭证 region > 凭证 domain > CN）。

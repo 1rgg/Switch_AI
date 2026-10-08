@@ -354,6 +354,17 @@ node scripts/package_portable.mjs  # 便携版 zip
 | Global | `WbRegion::Global`（`domain` 为 `*.workbuddy.ai` / `*.codebuddy.ai`） | `www.workbuddy.ai` | `www.workbuddy.ai` | `www.workbuddy.ai` |
 
 - **令牌域与请求域不一致会被网关拒绝**。
+- **备用域名绝不跨区**（Switch AI 修正）：域名双探测（§2.2）的备用域名必须与主域名
+  同区。原实现对 Global 返回国内 `codebuddy.cn`，会把国际版 bearer token 发往国内网关——
+  按上面这条自身契约**不可能成功**，且等于把凭证暴露给错误区域。
+  现 Global 的备用域名为同区兄弟站 `www.codebuddy.ai`（`CHAT_HOST_GLOBAL_ALT`）；
+  国内分支有意保持上游既有语义不变（该路径已被上游验证，避免回归）。
+  `Urls::alt()` 与 `fetch_balance` 的备用域名改为由主域名所属区域推导。
+- **区域分类对齐厂商域名表（非臆测）**：国际版 CodeBuddy CLI 包内 `product.json` 明示
+  `endpoint = https://www.codebuddy.ai`、`productFeatures.InternationalLogin = true`，且
+  `authentication.attributes.internalDomain`（国内）= `copilot.tencent.com` / `www.codebuddy.cn` /
+  `www.workbuddy.cn` 等，`externalDomain`（国际）= `www.codebuddy.ai`。
+  `WbRegion::from_domain` 的分类与本表一致（单测 `region_classification_matches_vendor_domain_tables` 固化）。
 - **国内版有两个不同站点**：计费/签走在 `codebuddy.cn`，积分页在 `workbuddy.cn`——
   代码中以 `billing_base()` 与 `credits_base()` 分别表达，**不可合并**。
 - plugin 网关（token refresh）原固定 `codebuddy.cn`；Switch AI 起改为按账号区域
@@ -361,6 +372,10 @@ node scripts/package_portable.mjs  # 便携版 zip
 - 国际版 OAuth 实测（2026）：`POST www.workbuddy.ai/v2/plugin/auth/state?platform=CLI` → 200，
   `data.authUrl = https://www.workbuddy.ai/login?platform=CLI&state=…`；轮询语义同 CN。
   **两端流程同构，仅基址不同**（无 PKCE / 无 client_id）。
+- **登录态切换/快照与区域无关**：快照槽位以账号 id（`wb-<sha256 前 12 位>`）为键，
+  auth 文件是客户端自身的单一登录载体（内容决定登录成哪个账号）——区域只影响
+  **工具侧** API 路由，不影响切换管线。因此国际版账号沿用既有切换/快照管线即可，
+  区域字段的作用是保证切换后工具侧请求落到正确网关。
 - 三铁律：① Origin/Referer 必带（按区域）；② 缺省字段显式 `X-No-User-Id / X-No-Enterprise-Id / X-No-Department-Info: 1` 占位；③ **chat 请求绝不携带 `X-Refresh-Token`**。UA 伪装 `CLI/2.63.2 CodeBuddy/2.63.2`。
 - 签到/活动接口可用极简头（`User-Agent: WorkBuddy` + Bearer + X-User-Id）。
 - 上游健康探测按**池内在用区域**逐区探测（`ApiPool::wb_regions_in_use`），
