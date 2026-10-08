@@ -6,6 +6,26 @@
 
 ---
 
+## [Switch AI 3.7.7] · 国际版模型目录端点修正
+
+> 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。
+
+### 修复（真实缺陷，3.7.6 首发实测踩坑）
+
+- **「同步官网模型仍无国际模型」**：3.7.6 把目录同步拆成了国内/国际双区域，
+  但国际侧仍复用国内的目录端点 `{站点}/console/enterprises/personal/models` +
+  CLI 形态 UA——国际站（workbuddy.ai）上该路径**恒 HTTP 500（HTML）**，
+  国际目录永远拉不到。且同步实现把单侧失败静默吞掉（另一侧成功即报 ok），
+  用户只见「同步成功」却看不到国际模型，无从排障。
+- **目录端点与请求形态按区域分叉**（对照 Switch-API 实测口径）：
+  国际版走 `{www.workbuddy.ai}/v3/config`，App 形态 UA
+  （`WorkBuddyAI/5.5.2`，**无空格**），附 `X-Requested-With` /
+  `X-Product: SaaS`；国内版维持原端点与 CLI 形态 UA 不变。
+- **同步失败不再静默**：任一区域失败即整体报错（错误信息含分侧明细），
+  同时落 app_log（运行日志页可查），调度器据此正常重试。
+
+---
+
 ## [Switch AI 3.7.6] · API 网关 WorkBuddy 国内/国际区域拆分
 
 > 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。

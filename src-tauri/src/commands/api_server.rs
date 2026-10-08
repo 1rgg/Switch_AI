@@ -1204,11 +1204,20 @@ pub(crate) fn wb_catalog_sync_impl(
             acct.global_region,
         ) {
             Ok(n) => total += n,
-            Err(e) => errs.push(format!("{}: {e}", if global { "国际版" } else { "国内版" })),
+            Err(e) => {
+                // 失败必须可见（app_log + Err 透传）：静默吞掉会复现
+                // 「同步成功但看不到国际模型」的排障黑洞（3.7.6 首发教训）
+                let side = if global { "国际版" } else { "国内版" };
+                crate::fs_utils::app_log(
+                    data_dir,
+                    &format!("WB 模型目录同步失败（{side}）: {e}"),
+                );
+                errs.push(format!("{side}: {e}"));
+            }
         }
     }
-    if total == 0 && !errs.is_empty() {
-        return Err(errs.join("；"));
+    if !errs.is_empty() {
+        return Err(format!("模型目录同步部分失败（成功 {total} 个）——{}", errs.join("；")));
     }
     Ok(total)
 }

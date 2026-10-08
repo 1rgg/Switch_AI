@@ -545,11 +545,41 @@ pub fn fetch_and_replace(
         enterprise_id: enterprise_id.to_string(),
         global_region,
     };
-    let url = format!("{}/console/enterprises/personal/models", creds.chat_base());
-    let mut req = wb_agent().get(&url).timeout(std::time::Duration::from_secs(20));
-    for (k, v) in build_chat_headers(&creds) {
+    // Switch AI 区域拆分：目录端点与请求形态**按区域分叉**（对照 Switch-API
+    // region.rs RegionSpec 实测口径）——
+    //   国内：{copilot.tencent.com}/console/enterprises/personal/models，
+    //         CLI 形态 UA（build_chat_headers 同款）
+    //   国际：{www.workbuddy.ai}/v3/config，App 形态 UA（`WorkBuddyAI/版本`，
+    //         **无空格**），附 X-Requested-With / X-Product: SaaS。
+    //         对国际站打国内目录路径恒 500（HTML）——3.7.6 首发实测踩坑，
+    //         这就是「同步官网模型仍无国际模型」的根因
+    let (url, headers): (String, Vec<(&'static str, String)>) = if global_region {
+        let base = creds.chat_base();
+        (
+            format!("{base}/v3/config"),
+            vec![
+                ("accept", "application/json".into()),
+                ("user-agent", "WorkBuddyAI/5.5.2".into()),
+                ("origin", base.into()),
+                ("referer", format!("{base}/")),
+                ("X-Requested-With", "XMLHttpRequest".into()),
+                ("X-Product", "SaaS".into()),
+                ("Authorization", format!("Bearer {}", creds.token)),
+            ],
+        )
+    } else {
+        let url = format!("{}/console/enterprises/personal/models", creds.chat_base());
+        let mut h = build_chat_headers(&creds);
         // 目录为 GET JSON：accept 覆盖 build_chat_headers 的 text/event-stream 默认
-        let v = if k.eq_ignore_ascii_case("accept") { "application/json".into() } else { v };
+        for (k, v) in h.iter_mut() {
+            if k.eq_ignore_ascii_case("accept") {
+                *v = "application/json".into();
+            }
+        }
+        (url, h)
+    };
+    let mut req = wb_agent().get(&url).timeout(std::time::Duration::from_secs(20));
+    for (k, v) in headers {
         req = req.set(k, &v);
     }
     let body: Value = match req.call() {
