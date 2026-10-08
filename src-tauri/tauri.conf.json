@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AI Work 助手",
+  "productName": "Switch AI",
   "mainBinaryName": "ai-work-assistant",
   "identifier": "com.aiwork.assistant",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "AI Work 助手",
+        "title": "Switch AI",
         "width": 1180,
         "height": 760,
         "minWidth": 960,
@@ -33,9 +33,9 @@
     "active": true,
     "targets": ["msi", "nsis"],
     "icon": ["icons/icon.ico"],
-    "shortDescription": "AI Work 多账号签到与管理助手",
-    "longDescription": "整合多账号签到、登录态切换、设备隔离与账号分组的 Windows 桌面端工具，支持 Trae / WorkBuddy / 豆包等多应用扩展。",
-    "publisher": "AI Work 助手",
+    "shortDescription": "Switch AI 多账号签到与管理助手",
+    "longDescription": "整合多账号签到、登录态切换、设备隔离与账号分组的 Windows 桌面端工具，支持 Trae / WorkBuddy（含国际版）/ CodeBuddy / 豆包 / Qoder 等应用扩展。",
+    "publisher": "Switch AI",
     "windows": {
       "wix": {
         "language": "zh-CN"

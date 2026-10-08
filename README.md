@@ -181,11 +181,32 @@ Release 页面提供三类 Windows 产物（由 GitHub Actions 在 `windows-late
 
 | 文件 | 说明 |
 | --- | --- |
-| `*_x64-setup.exe` | NSIS 安装包（推荐，支持原地升级） |
-| `*.msi` | MSI 安装包（企业分发） |
-| `*_x64_portable.zip` | 便携版（解压即用） |
+| `Switch AI_<版本>_x64-setup.exe` | NSIS 安装包（推荐） |
+| `Switch AI_<版本>_x64_zh-CN.msi` | MSI 安装包（企业分发） |
+| `Switch AI_<版本>_x64_portable.zip` | 便携版（解压即用，无需安装） |
 
 运行要求：Windows 10/11 x64、WebView2 Runtime（Win11 及较新 Win10 通常已内置）。
+
+### 品牌与「内部标识」的取舍（重要）
+
+本分支把**对外显示品牌**改为 **Switch AI**（`tauri.conf.json` 的 `productName` / 窗口标题 /
+publisher / 安装包与便携版文件名均随之变化），但**有意不改动内部标识**：
+
+| 保持不变 | 值 | 原因 |
+| --- | --- | --- |
+| `identifier` | `com.aiwork.assistant` | — |
+| `mainBinaryName` | `ai-work-assistant` | 安装包内主程序名；变更会牵动安装钩子与旧版清理逻辑 |
+| 数据目录 | `%APPDATA%\AIWorkAssistant` | 由 `state.rs` 的**硬编码常量** `DATA_DIR_NAME` 决定，与 `productName` 无关 |
+| 计划任务前缀 | `AIWorkAssistant_*` | 硬编码常量；变更会让用户既有定时任务失联 |
+| vault / 快照目录 | 沿用 | 变更会导致无法解密既有凭证 |
+
+这样做的效果是：**重新品牌化不会移动任何用户数据**，已有账号、分组、快照、凭证、
+设置与定时任务全部继续可用。
+
+> ⚠️ 唯一副作用：由于安装包的**产品名**变了，从本分支早于重品牌化的构建
+> （v3.7.3 / v3.7.4）升级时，NSIS 会视为**另一款产品**而**并存安装**，而非原地升级。
+> 如需干净升级，请先卸载旧版本再安装新版本（数据目录不受影响）。
+> 从 v3.7.5 起的后续版本之间可正常原地升级。
 
 ---
 

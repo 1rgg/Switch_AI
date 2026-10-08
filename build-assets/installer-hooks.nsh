@@ -1,5 +1,5 @@
-﻿; AI Work 助手 — NSIS 安装钩子（installerHooks）
-; 品牌并存策略：老品牌（Trae Work 助手）与新版本 AI Work 助手 **并存运行、互不干扰**。
+﻿; Switch AI — NSIS 安装钩子（installerHooks）
+; 品牌并存策略：老品牌（Trae Work 助手 / AI Work 助手）与当前品牌 Switch AI **并存运行、互不干扰**。
 ; 安装/升级本产品时绝不卸载老品牌应用，也绝不清理其安装目录、卸载键与快捷方式；
 ; 用户数据目录（%APPDATA%\TraeWorkAssistant → %APPDATA%\AIWorkAssistant）
 ; 由应用首次启动时自动**复制**迁移（复制语义，老版本数据原地保留），此处同样绝不删除。
@@ -7,7 +7,7 @@
 
 !macro NSIS_HOOK_PREINSTALL
   ; 结束本产品线历史命名进程，避免文件占用导致升级安装失败
-  ;    （含本地重打包的过渡版主程序 "AI Work 助手.exe"，防止其运行中锁住 POSTINSTALL 清理）
+  ;    （含历史品牌/本地重打包的过渡版主程序 "AI Work 助手.exe"，防止其运行中锁住 POSTINSTALL 清理）
   ;    应用内「检查更新」自动安装时安装器先于应用退出启动，靠此兜底解锁文件占用
   ;    （正常流程应用已自行退出）。
   ;    注意：不结束老品牌进程 "Trae Work 助手.exe"——两版并存，不得干扰老版本运行。

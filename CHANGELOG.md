@@ -6,6 +6,41 @@
 
 ---
 
+## [Switch AI 3.7.5] · 品牌化为 Switch AI
+
+> 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。
+
+### 新功能
+
+- **对外显示品牌改为 Switch AI**：`tauri.conf.json` 的 `productName` / 窗口标题 /
+  `publisher` / 简短与详细描述均改为 Switch AI，安装包与便携版文件名随之变为
+  `Switch AI_<版本>_x64-setup.exe` / `Switch AI_<版本>_x64_portable.zip` 等。
+- **内部标识有意保持不变**（关键取舍）：`identifier`（`com.aiwork.assistant`）、
+  `mainBinaryName`（`ai-work-assistant`）、数据目录（`%APPDATA%\AIWorkAssistant`，由
+  `state.rs` 的硬编码常量 `DATA_DIR_NAME` 决定，与 `productName` 无关）、计划任务前缀
+  （`AIWorkAssistant_*`）、vault 与快照目录均不动——因此**重新品牌化不会移动任何用户
+  数据**，已有账号 / 分组 / 快照 / 凭证 / 设置 / 定时任务继续可用。
+  若连内部标识一起改，会导致既有用户升级后「数据目录变了、凭证解不开、定时任务失联」。
+
+### 修复加强
+
+- **修复发布包串版本**（本仓库真实发生过）：release 工作流用 `actions/cache` 缓存
+  `src-tauri/target` 以加速构建，但 `target/release/bundle/` 是「上次构建的安装包输出
+  目录」，缓存恢复后旧版本安装包仍在其中，`cp .../bundle/nsis/*.exe` 会把**新旧两版
+  安装包**一起带进本次 release（实测：v3.7.4 的 Release 里混进了 3.7.3 的
+  `setup.exe` 与 `.msi`）。修复为双保险：
+  ① 构建前 `rm -rf src-tauri/target/release/bundle`（保留 target 缓存带来的加速，
+  仅丢弃体积小且必须重建的安装包目录）；
+  ② 暂存步骤加**版本守卫**——从 `Cargo.toml` 读取本次版本号，若暂存目录中出现任何
+  不含 `_<version>_` 的产物即 `exit 1` 并 `::error::` 列出违规文件。宁可发布失败，
+  也不发布串版本的包。
+
+### 已知影响
+
+- 安装包产品名变更后，从重品牌化之前的构建（v3.7.3 / v3.7.4）升级会被 NSIS 视为
+  另一款产品而**并存安装**；如需干净升级请先卸载旧版（数据目录不受影响）。
+  自 v3.7.5 起版本之间可正常原地升级。
+
 ## [Switch AI 3.7.4] · 备用域名不跨区 + 区域分类对齐厂商域名表
 
 > 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。

@@ -4,10 +4,10 @@
  *
  * 用法：node scripts/rename_release.mjs [--strict]
  *   --strict  任一产物缺失时以非零码退出（默认仅告警）
- *   src-tauri/target/release/bundle/nsis/AI Work 助手_<ver>_x64-setup.exe
- *       → release/AI Work 助手_<ver>_x64-setup.exe
- *   src-tauri/target/release/bundle/msi/AI Work 助手_<ver>_x64_zh-CN.msi
- *       → release/AI Work 助手_<ver>_x64_zh-CN.msi
+ *   src-tauri/target/release/bundle/nsis/Switch AI_<ver>_x64-setup.exe
+ *       → release/Switch AI_<ver>_x64-setup.exe
+ *   src-tauri/target/release/bundle/msi/Switch AI_<ver>_x64_zh-CN.msi
+ *       → release/Switch AI_<ver>_x64_zh-CN.msi
  *   portable zip 由 package_portable.mjs 直接生成同名（无需重命名）。
  */
 import { createHash } from 'node:crypto';
