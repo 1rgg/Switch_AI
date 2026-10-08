@@ -337,14 +337,34 @@ node scripts/package_portable.mjs  # 便携版 zip
 
 ### B.2 域名路由与请求头铁律
 
-| 区域 | 判定 | chat 上游 | billing/积分 |
-|---|---|---|---|
-| CN | domain 不含 `.workbuddy.ai` | `copilot.tencent.com` | `www.codebuddy.cn` |
-| Global | domain 含 `.workbuddy.ai` | `www.workbuddy.ai` | `www.workbuddy.ai` |
+> **Switch AI 二次开发更新（WorkBuddy 国际版）**：区域不再只靠 `domain` 推断。
+> 新增 `WbRegion { Cn, Global }`（`tasks/wb_common.rs`）作为唯一区域权威，并提供
+> `billing_base / credits_base / chat_base / plugin_base / web_origin / refresh_url`。
+> 账号新增**显式 `region` 字段**（落 SQLite `wb_accounts`），解析优先级：
+> **账号 `region` > 凭证 `region` > 凭证 `domain` > 默认 CN**。
+> 起因：`domain` 在手工录入 / 旧版导入 / 部分 OAuth 返回中经常缺失，
+> 旧实现此时静默按 CN 处理，使国际版账号请求打到国内网关而失败。
+> 同时修正旧判定 `contains(".workbuddy.ai")` 的**前导点缺陷**（`domain` 恰为
+> `workbuddy.ai` 时误判 CN），改为后缀匹配并拒绝后缀伪造域名。
+> token refresh **已区域化**（原先固定 codebuddy.cn，见下表注）。
 
-- **令牌域与请求域不一致会被网关拒绝**；plugin 网关（token refresh）固定 codebuddy.cn 不随区域。
+| 区域 | 判定 | chat 上游 | billing/签到 | 积分/活动 |
+|---|---|---|---|---|
+| CN | `WbRegion::Cn`（`domain` 非 `.ai`） | `copilot.tencent.com` | `www.codebuddy.cn` | `www.workbuddy.cn` |
+| Global | `WbRegion::Global`（`domain` 为 `*.workbuddy.ai` / `*.codebuddy.ai`） | `www.workbuddy.ai` | `www.workbuddy.ai` | `www.workbuddy.ai` |
+
+- **令牌域与请求域不一致会被网关拒绝**。
+- **国内版有两个不同站点**：计费/签走在 `codebuddy.cn`，积分页在 `workbuddy.cn`——
+  代码中以 `billing_base()` 与 `credits_base()` 分别表达，**不可合并**。
+- plugin 网关（token refresh）原固定 `codebuddy.cn`；Switch AI 起改为按账号区域
+  （`WbRegion::refresh_url()`）——国际版 refresh token 打到国内网关会被拒（表现为凭证失效）。
+- 国际版 OAuth 实测（2026）：`POST www.workbuddy.ai/v2/plugin/auth/state?platform=CLI` → 200，
+  `data.authUrl = https://www.workbuddy.ai/login?platform=CLI&state=…`；轮询语义同 CN。
+  **两端流程同构，仅基址不同**（无 PKCE / 无 client_id）。
 - 三铁律：① Origin/Referer 必带（按区域）；② 缺省字段显式 `X-No-User-Id / X-No-Enterprise-Id / X-No-Department-Info: 1` 占位；③ **chat 请求绝不携带 `X-Refresh-Token`**。UA 伪装 `CLI/2.63.2 CodeBuddy/2.63.2`。
 - 签到/活动接口可用极简头（`User-Agent: WorkBuddy` + Bearer + X-User-Id）。
+- 上游健康探测按**池内在用区域**逐区探测（`ApiPool::wb_regions_in_use`），
+  池内无 WB 账号时回退 CN。
 
 ### B.3 联调避坑清单（实测实证）
 

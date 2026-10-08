@@ -27,6 +27,15 @@ ManifestDPIAwareness PerMonitorV2
 !include "FileAssociation.nsh"
 !include "Win\COM.nsh"
 !include "Win\Propkey.nsh"
+; Switch AI 修复：Tauri 新版模板的 utils.nsh 中 CheckIfAppIsRunning 宏会展开
+; RestartManager_StartSession / EndSession / RegisterFile，这些宏定义在
+; Win\RestartManager.nsh（随 Tauri 的 NSIS 分发包提供）。
+; 本文件是 Tauri 模板的定制副本，早于该改动，缺此 include 时 makensis 报
+;   !insertmacro: macro named "RestartManager_StartSession" not found!
+;   Error in macro CheckIfAppIsRunning / aborting creation process
+; 导致 NSIS 安装包构建整体失败。补上即可（宏体在 !insertmacro 处展开，
+; 因此置于 utils.nsh 之后、第 662 行调用之前均有效）。
+!include "Win\RestartManager.nsh"
 !include "StrFunc.nsh"
 ${StrCase}
 ${StrLoc}

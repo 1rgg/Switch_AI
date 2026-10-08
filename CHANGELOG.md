@@ -6,6 +6,51 @@
 
 ---
 
+## [Switch AI 分支 · 基于 3.7.3] · WorkBuddy 国际版（workbuddy.ai）支持
+
+> 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支，
+> 基于 [TraeWorkAssistant](https://github.com/smart-open/TraeWorkAssistant) 3.7.3。
+
+### 新功能
+
+- **WorkBuddy 国际版账号支持**：可把国际版（`www.workbuddy.ai`，Google / GitHub 登录，
+  Claude / GPT-5 / Gemini）账号作为一等账号录入与管理，签到、积分看板、
+  登录态切换与 API 网关均按账号区域自动路由。
+  - 账号管理页新增**区域选择器**（OAuth 扫码与扫描本机账号共用），并提示将要登录的站点；
+  - 账号列表新增**区域徽标**（国内版 / 国际版）；
+  - 扫描本机账号的预览弹框展示推断出的区域，并提示如何纠正。
+
+### 修复加强
+
+- **区域判定不再依赖可能缺失的 `domain` 字段**（本次最关键修复）：原先区域完全由凭证
+  `domain` 推断，而该字段在手工录入 / 旧版导入 / 部分 OAuth 返回中经常缺失，
+  此时国际版账号会被**静默当作国内版**，签到 / 积分 / chat 全部打到国内网关而失败。
+  现新增账号级显式 `region` 字段并落库，解析优先级为
+  **账号 `region` > 凭证 `region` > 凭证 `domain` > 默认 CN**。
+- **修正区域判定漏判**：旧实现用 `domain.contains(".workbuddy.ai")`（前导点），
+  `domain` 恰为 `workbuddy.ai` 时误判为国内版；改为后缀匹配，并拒绝
+  `workbuddy.ai.evil.com` 之类的后缀伪造域名。
+- **token 刷新端点区域化**：原先固定国内 `codebuddy.cn`，国际版账号刷新会被拒
+  （表现为凭证失效、误标「需重新登录」）；现按账号区域选择刷新端点。
+- **上游健康探测区域化**：原先硬编码只探测国内域名，纯国际版部署会得到错误的健康结论；
+  现按网关池内**实际在用区域**逐区探测。
+- **修复 `package-lock.json` 与 `package.json` 不同步**：原 lockfile 会使 `npm ci`
+  直接以 `EUSAGE` 失败，阻塞 CI 与发版。
+
+### 内部改进
+
+- 新增 `WbRegion { Cn, Global }` 统一区域权威，替换 9 处分散且不一致的 domain 字符串判断；
+  明确区分国内两个站点（计费/签到 `codebuddy.cn`、积分 `workbuddy.cn`，不可合并）。
+- 新增 `.github/workflows/ci.yml`（前端 `tsc`/`vitest` + 后端 `cargo check --all-targets`/`cargo test`）
+  与 `.github/workflows/release.yml`（构建 NSIS / MSI / 便携版并发布 GitHub Release）。
+- 补充区域解析与 OAuth 回退的单元测试。
+
+> ⚠️ 截至本条目，**未使用真实 WorkBuddy 国际版账号做端到端实测**（开发环境无此类账号）。
+> 国际版端点连通性已实测（`auth/state` 返回 200 + authUrl，其余端点存在且需鉴权），
+> 但完整链路行为仍可能随服务端版本变化。请谨慎评估后使用。
+
+---
+
 ## [3.7.3] · 2026-10-07 · Qoder 签到健壮性 + 网关调度五连修 + 三大列表性能优化
 
 ### 性能优化
