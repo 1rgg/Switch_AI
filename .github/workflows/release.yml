@@ -102,6 +102,35 @@ jobs:
           fi
           echo "版本守卫通过：$MATCH/$TOTAL 个产物均为 $VERSION"
 
+      # 发布校验清单 latest.json：版本号 + 各资产 SHA-256，作为 Release 资产一并上传。
+      # 更新器（updater.rs::fetch_manifest_hash）下载安装包后与清单比对，不匹配即拒绝安装。
+      # 清单缺失时更新器会回退「正文 SHA256 约定行」，而本工作流的正文是自动生成的、
+      # 不含 SHA 行 —— 于是完整性校验被静默跳过（能装但没有校验）。必须在此显式生成。
+      - name: Generate update manifest (latest.json)
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const { createHash } = require("node:crypto");
+            const { readFileSync, writeFileSync, existsSync, readdirSync } = require("node:fs");
+            const ver = readFileSync("src-tauri/Cargo.toml", "utf8")
+              .match(/^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"/m)[1];
+            const dir = "release/windows";
+            const assets = {};
+            for (const name of readdirSync(dir)) {
+              if (name === "latest.json") continue;
+              assets[name] = createHash("sha256")
+                .update(readFileSync(`${dir}/${name}`))
+                .digest("hex");
+            }
+            const setup = Object.keys(assets).find((n) => n.endsWith("-setup.exe"));
+            if (!setup) { console.error("::error::清单生成失败：未找到 NSIS setup.exe"); process.exit(1); }
+            writeFileSync(`${dir}/latest.json`, JSON.stringify({ version: ver, assets }, null, 2));
+            console.log(`latest.json: version=${ver}, ${Object.keys(assets).length} 个资产`);
+            for (const [n, h] of Object.entries(assets)) console.log(`  ${h}  ${n}`);
+          '
+          ls -la release/windows/
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:

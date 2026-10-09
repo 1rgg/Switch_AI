@@ -64,20 +64,19 @@ struct DownloadProgress {
 }
 
 /// 解析 "v3.0.1" / "3.0.1" → (3,0,1)。不合法返回 None。
+///
+/// 容忍预发布/构建后缀（`3.8.2-beta.1` / `3.8.2+build.7` → `(3,8,2)`）：
+/// **先在首个 '-' / '+' 处截断整串**，再按 '.' 切分。若只对第三段做后缀剥离，
+/// `3.8.2-beta.1` 会被 `split('.')` 切成 4 段（`2-beta`、`1`）而误判为不合法。
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let t = s.trim().trim_start_matches(['v', 'V']);
-    let mut it = t.split('.');
-    let a: u64 = it.next()?.trim().split(['-', '+']).next()?.trim().parse().ok()?;
+    // 预发布/构建元数据一律丢弃：3.8.2-beta.1 → 3.8.2，3.8.2+build.7 → 3.8.2
+    let core = t.split(['-', '+']).next()?.trim();
+    let mut it = core.split('.');
+    let a: u64 = it.next()?.trim().parse().ok()?;
     let b: u64 = it.next()?.trim().parse().ok()?;
-    // 第三段可能带预发布/构建后缀（如 "0-beta.1"），只取数字前缀
     let c_raw = it.next().unwrap_or("0").trim();
-    let c: u64 = (if c_raw.is_empty() { "0" } else { c_raw })
-        .split(['-', '+'])
-        .next()
-        .unwrap_or("0")
-        .trim()
-        .parse()
-        .unwrap_or(0);
+    let c: u64 = (if c_raw.is_empty() { "0" } else { c_raw }).parse().unwrap_or(0);
     if it.next().is_some() {
         return None;
     }
