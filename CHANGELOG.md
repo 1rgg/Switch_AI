@@ -6,6 +6,45 @@
 
 ---
 
+## [Switch AI 3.8.2] · 修复「检查更新」无法原地更新 + 关于页品牌更新
+
+> 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。
+
+### 修复
+
+- **「检查更新」恒失败、永远无法客户端原地更新**：由四个叠加缺陷导致，任一都会让更新
+  链路死在起点：
+  1. 更新检查请求的仍是**上游仓库** `smart-open/TraeWorkAssistant` 的 Releases——
+     本分支的 Release 发布在 `1rgg/Switch_AI`，永远查不到自己的新版本。
+  2. 下载校验清单（`latest.json`）用的是 `browser_download_url` 裸链。该链接会 302 到
+     `release-assets.githubusercontent.com`，而 HTTP 客户端默认不跟随重定向，
+     于是读到的是**空响应体**，恒判定「校验清单损坏」，fail-closed 拒绝一切自动更新。
+     现改为走 `api.github.com/repos/.../releases/assets/{id}` + `Accept: application/octet-stream`，
+     并在所有通道开启跟随重定向；同时**显式拒绝空响应体**（宁可回退下一通道）。
+  3. 安装包下载通道同样未开启重定向，会下到 302 的中间响应（表现为「下载不完整」或校验失败）。
+  4. 资产匹配规则仍假设上游的产物名前缀（`AI Work 助手_x64-setup.exe`），而本分支产物是
+     `Switch.AI_<版本>_x64-setup.exe`，导致「没有可用的安装包资产」。现按产品关键字 + 后缀
+     匹配，并**排除 portable.zip**（便携版不能原地升级）。
+- **版本下限硬编码**：原实现写死 `3.0.0`（用于排除同仓库的 2.x 上游版本）。本分支是独立
+  仓库、全部 release 均为本产品，改为按当前版本动态取值（`当前版本 − 1`），不再依赖常量。
+- **同版本 release 会阻断检查**：资产版本与 release 版本原要求严格相等，tag 带四段
+  （如 `v3.8.2.1`）或资产名只保留三段时会被误拦。放宽为「资产版本不低于 release 版本」，
+  但**低于则仍中止**（防误装旧产物/其他产品线）。
+
+### 变更
+
+- **关于页文案与品牌更新**：应用名、简介、免责声明改用多平台表述（Trae Work / Trae /
+  WorkBuddy 国内版与**国际版** / Qoder），链接改指向本分支仓库与作者主页，
+  并新增一行对上游「AI Work 助手」的二次开发署名（不抹除来源）。
+
+### 其他
+
+- 新增更新器单测：`parse_version` 预发布后缀容错、`version_from_asset` 全段扫描、
+  `pick_asset` 优先 NSIS 且排除 portable、`product_floor` 逐级退位。
+- 版本号同步至 3.8.2（Cargo.toml / Cargo.lock / package.json / AGENT.md）。
+
+---
+
 ## [Switch AI 3.8.1] · 修复「今日获取积分」虚增（国际版尤为明显）
 
 > 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。

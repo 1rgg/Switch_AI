@@ -1,8 +1,16 @@
 // ---------------- 应用自更新（检查 / 下载 / 安装，两步确认制） ----------------
 //
-// 数据源：GitHub Releases（api.github.com）。资产命名约定（见 scripts/rename_release.mjs）：
-//   AI Work 助手_<ver>_x64-setup.exe   ← NSIS 安装包（首选，支持原地升级 + 老版迁移钩子）
-//   AI Work 助手_<ver>_x64_zh-CN.msi   ← MSI（备选；仅同 identifier 的 3.x 间可原地升级）
+// 数据源：GitHub Releases（api.github.com），仓库 **1rgg/Switch_AI**（本分支自有仓库）。
+// 资产命名约定（见 scripts/rename_release.mjs，productName = "Switch AI"）：
+//   Switch.AI_<ver>_x64-setup.exe      ← NSIS 安装包（首选，支持原地升级 + 老版迁移钩子）
+//   Switch.AI_<ver>_x64_zh-CN.msi      ← MSI（备选；仅同 identifier 的 3.x 间可原地升级）
+//   Switch.AI_<ver>_x64_portable.zip   ← 便携版（不参与自动更新，见 pick_asset）
+//
+// 两个必须遵守的传输层约束（否则原地更新必然失败）：
+//   ① GitHub Release 资产链接 302 到 release-assets.githubusercontent.com，
+//      所有 agent 必须 `redirects(10)`（ureq 默认不跟随）；
+//   ② 校验清单走 api.github.com/repos/.../releases/assets/{id} + Accept: octet-stream，
+//      不要用 browser_download_url 的裸链接（重定向落到空响应体）。
 //
 // 流程（下载与安装拆分，UI 两处确认）：
 //   update_check       解析最新 release 并与 CARGO_PKG_VERSION 比较；同时解析发布校验清单
@@ -20,19 +28,23 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
 const RELEASES_API: &str =
-    "https://api.github.com/repos/smart-open/TraeWorkAssistant/releases?per_page=100";
-const RELEASES_PAGE: &str = "https://github.com/smart-open/TraeWorkAssistant/releases";
+    "https://api.github.com/repos/1rgg/Switch_AI/releases?per_page=100";
+const RELEASES_PAGE: &str = "https://github.com/1rgg/Switch_AI/releases";
 
 /// 发布校验清单资产名（scripts/rename_release.mjs 生成，随 Release 上传）：
 /// `{ "version": "x.y.z", "assets": { "<资产文件名>": "<sha256hex>" } }`
 const MANIFEST_ASSET: &str = "latest.json";
+
+/// 资产匹配关键字（发布产物统一含 "Switch.AI"，见 scripts/rename_release.mjs）。
+/// 用关键字匹配而非 `*_x64-setup.exe` 这类前缀依赖，重命名产物后更新器不必同步改。
+const ASSET_KEYWORD: &str = "Switch.AI";
 
 #[derive(Serialize, Clone)]
 pub struct UpdateCheckResult {
     pub has_update: bool,
     pub current_version: String,
     pub latest_version: String,
-    /// 资产文件名，如 "AI Work 助手_3.0.1_x64-setup.exe"
+    /// 资产文件名，如 "Switch.AI_3.8.2_x64-setup.exe"
     pub asset_name: String,
     /// 资产下载直链（browser_download_url）
     pub download_url: String,
@@ -55,23 +67,38 @@ struct DownloadProgress {
 fn parse_version(s: &str) -> Option<(u64, u64, u64)> {
     let t = s.trim().trim_start_matches(['v', 'V']);
     let mut it = t.split('.');
-    let a: u64 = it.next()?.trim().parse().ok()?;
+    let a: u64 = it.next()?.trim().split(['-', '+']).next()?.trim().parse().ok()?;
     let b: u64 = it.next()?.trim().parse().ok()?;
-    let c: u64 = it.next().unwrap_or("0").trim().parse().ok()?;
+    // 第三段可能带预发布/构建后缀（如 "0-beta.1"），只取数字前缀
+    let c_raw = it.next().unwrap_or("0").trim();
+    let c: u64 = (if c_raw.is_empty() { "0" } else { c_raw })
+        .split(['-', '+'])
+        .next()
+        .unwrap_or("0")
+        .trim()
+        .parse()
+        .unwrap_or(0);
     if it.next().is_some() {
         return None;
     }
     Some((a, b, c))
 }
 
-/// 从资产文件名提取版本："AI Work 助手_3.0.1_x64-setup.exe" → (3,0,1)。
-/// 规则：取倒数第二个下划线段（倒数第一段是 "x64-setup.exe" / "x64_zh-CN.msi" 的尾部）。
+/// 从资产文件名提取版本："Switch.AI_3.8.1_x64-setup.exe" → (3,8,1)。
+///
+/// 不必依赖固定的下划线段位置：扫描**所有**下划线段，取最后一个可解析为
+/// 纯数字三段的段。这样 GitHub 重写名称后（"Switch.AI_3.8.1_x64-setup.exe"
+/// → "Switch.AI_3.8.1_x64-setup.exe" 或带更多段）仍能取到版本。
 fn version_from_asset(name: &str) -> Option<(u64, u64, u64)> {
-    let parts: Vec<&str> = name.split('_').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    parse_version(parts[parts.len() - 2])
+    name.split('_')
+        .rev()
+        .find_map(|seg| {
+            let seg = seg.trim();
+            let ok = seg.len() >= 5
+                && seg.matches('.').count() == 2
+                && seg.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+            ok.then(|| parse_version(seg)).flatten()
+        })
 }
 
 fn cmp_version(a: (u64, u64, u64), b: (u64, u64, u64)) -> std::cmp::Ordering {
@@ -109,11 +136,19 @@ fn system_proxy_url() -> Option<String> {
 
 /// 按优先级构建尝试序列：系统代理（用户 VPN）→ 环境变量代理 → 直连。
 /// 每项带标签，用于日志与报错文案；`finish` 为各场景的收尾超时配置。
+///
+/// **所有通道统一 `redirects(10)`**：GitHub 的 Release 资产链接必然 302 到
+/// `release-assets.githubusercontent.com`，ureq 默认不跟随重定向——不开启时
+/// 清单读到空体、安装包读到 302 的 HTML/空响（表现为「下载不完整」或 SHA 校验失败）。
 fn attempt_agents(finish: impl Fn(ureq::AgentBuilder) -> ureq::Agent) -> Vec<(&'static str, ureq::Agent)> {
+    let with_redirects = |b: ureq::AgentBuilder| b.redirects(10);
     let mut out: Vec<(&'static str, ureq::Agent)> = Vec::new();
     if let Some(url) = system_proxy_url() {
         if let Ok(p) = ureq::Proxy::new(&url) {
-            out.push(("系统代理", finish(ureq::AgentBuilder::new().proxy(p))));
+            out.push((
+                "系统代理",
+                finish(with_redirects(ureq::AgentBuilder::new().proxy(p))),
+            ));
         }
     }
     let env_proxy = std::env::var("HTTPS_PROXY")
@@ -123,12 +158,15 @@ fn attempt_agents(finish: impl Fn(ureq::AgentBuilder) -> ureq::Agent) -> Vec<(&'
         .ok();
     if let Some(p) = env_proxy {
         if let Ok(proxy) = ureq::Proxy::new(&p) {
-            out.push(("环境变量代理", finish(ureq::AgentBuilder::new().proxy(proxy))));
+            out.push((
+                "环境变量代理",
+                finish(with_redirects(ureq::AgentBuilder::new().proxy(proxy))),
+            ));
         }
     }
     // 「直连」通道无需显式禁用代理：项目未启用 ureq 的 proxy-from-env feature，
     // AgentBuilder::new() 默认不读环境变量代理，天然直连
-    out.push(("直连", finish(ureq::AgentBuilder::new())));
+    out.push(("直连", finish(with_redirects(ureq::AgentBuilder::new()))));
     out
 }
 
@@ -159,6 +197,9 @@ fn fetch_releases() -> Result<Vec<serde_json::Value>, String> {
 }
 
 /// 在 release 资产中挑选安装包：优先 NSIS（x64-setup.exe），退而求其次 MSI。
+///
+/// 匹配用产品关键字 + 后缀（`ASSET_KEYWORD` / `-setup.exe`），并**排除 portable.zip**：
+/// 便携版不能原地升级，误选会下载一个无法安装的压缩包。
 fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
     // [(name, url, size)] 两轮：先 NSIS 后 MSI
     let mut parsed: Vec<(String, String, u64, bool)> = Vec::new(); // bool=is_nsis
@@ -166,8 +207,13 @@ fn pick_asset(assets: &[serde_json::Value]) -> Option<(String, String, u64)> {
         let name = a.get("name")?.as_str()?.to_string();
         let url = a.get("browser_download_url")?.as_str()?.to_string();
         let size = a.get("size")?.as_u64().unwrap_or(0);
-        let is_nsis = name.ends_with("_x64-setup.exe");
-        let is_msi = name.ends_with("_x64_zh-CN.msi");
+        // 只认本产品的安装包资产（portable.zip 是便携版，不支持原地升级，排除）
+        if !name.contains(ASSET_KEYWORD) {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        let is_nsis = lower.ends_with("-setup.exe") || lower.ends_with("_setup.exe");
+        let is_msi = lower.ends_with(".msi");
         if is_nsis || is_msi {
             parsed.push((name, url, size, is_nsis));
         }
@@ -241,47 +287,78 @@ fn fetch_manifest_hash(
     asset_name: &str,
     expected_ver: (u64, u64, u64),
 ) -> Result<Option<String>, String> {
-    let url = assets
-        .iter()
-        .filter_map(|a| {
-            let name = a.get("name").and_then(|v| v.as_str())?;
-            (name == MANIFEST_ASSET)
-                .then(|| a.get("browser_download_url").and_then(|v| v.as_str()))
-                .flatten()
-        })
-        .next();
-    let Some(url) = url else {
+    // 取清单资产的 API 直链。**必须走 api.github.com 的 /assets/{id} + Accept: octet-stream**：
+    // browser_download_url（github.com/.../releases/download/...）会 302 到
+    // release-assets.githubusercontent.com，ureq 默认不跟随跨主机重定向，会返回 302 空体。
+    // 旧实现用裸 URL + into_reader().read_to_string()，正好读到那个 302 的**空响应体**，
+    // 于是清单恒判定为「损坏（EOF while parsing a value）」，任何版本都被拒绝原地更新。
+    let asset = assets.iter().find(|a| {
+        a.get("name").and_then(|v| v.as_str()) == Some(MANIFEST_ASSET)
+    });
+    let Some(asset) = asset else {
+        return Ok(None);
+    };
+    let id = asset.get("id").and_then(|v| v.as_u64());
+    let fallback_url = asset
+        .get("browser_download_url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let api_url = id.map(|id| {
+        format!(
+            "https://api.github.com/repos/1rgg/Switch_AI/releases/assets/{id}"
+        )
+    });
+    let Some(url) = api_url.clone().or(fallback_url.clone()) else {
         return Ok(None);
     };
 
     // 小文件：连接 10s + 整体 20s，逐通道尝试（系统代理 → 环境变量代理 → 直连）
     let mut text: Option<String> = None;
     let mut last_err = String::new();
-    for (label, agent) in attempt_agents(|b| {
-        b.timeout_connect(Duration::from_secs(10))
-            .timeout(Duration::from_secs(20))
-            .build()
-    }) {
-        match agent
-            .get(url)
-            .set("User-Agent", "ai-work-assistant-updater")
-            .call()
-        {
-            Ok(resp) => {
-                let mut s = String::new();
-                match resp.into_reader().read_to_string(&mut s) {
-                    Ok(_) => {
-                        text = Some(s);
-                        break;
+    let mut candidates: Vec<String> = vec![url];
+    // API 通道失败时补一次裸 URL（极端情况下 API 被限流）：仍可能命中 CDN 直链
+    if let Some(fb) = fallback_url {
+        if !candidates.contains(&fb) {
+            candidates.push(fb);
+        }
+    }
+    'outer: for candidate in &candidates {
+        for (label, agent) in attempt_agents(|b| {
+            b.timeout_connect(Duration::from_secs(10))
+                .timeout(Duration::from_secs(20))
+                .build()
+        }) {
+            match agent
+                .get(candidate)
+                .set("User-Agent", "ai-work-assistant-updater")
+                .set("Accept", "application/octet-stream")
+                .call()
+            {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if !(200..300).contains(&status) {
+                        last_err = format!("[{label}] HTTP {status}");
+                        continue;
                     }
-                    Err(e) => last_err = format!("[{label}] 读取失败: {e}"),
+                    let mut s = String::new();
+                    match resp.into_reader().read_to_string(&mut s) {
+                        // 空体不接受：宁可回退下一通道，也不把空串当清单解析
+                        Ok(_) if !s.trim().is_empty() => {
+                            text = Some(s);
+                            break 'outer;
+                        }
+                        Ok(_) => last_err = format!("[{label}] 响应体为空（疑似重定向未跟随）"),
+                        Err(e) => last_err = format!("[{label}] 读取失败: {e}"),
+                    }
                 }
+                Err(e) => last_err = format!("[{label}] {e}"),
             }
-            Err(e) => last_err = format!("[{label}] {e}"),
         }
     }
     let text = text.ok_or_else(|| {
-        format!("下载校验清单失败（{last_err}），已阻止自动更新。请重试或手动下载：{RELEASES_PAGE}")
+        format!(
+            "下载校验清单失败（{last_err}），已阻止自动更新。请重试或手动下载：{RELEASES_PAGE}"
+        )
     })?;
 
     let manifest: UpdateManifest = serde_json::from_str(&text).map_err(|e| {
@@ -300,19 +377,37 @@ fn fetch_manifest_hash(
     }).map(Some)
 }
 
-/// 本产品（AI Work 助手）产品线起点：只认 >= 3.0.0 的 release。
-/// 同一仓库还发布 2.x 产品线（Trae Work 助手，另一个产品），必须排除。
-const PRODUCT_MIN_VERSION: (u64, u64, u64) = (3, 0, 0);
+/// 产品线版本下限：只认 >= 此版本的 release。
+///
+/// 上游原实现硬编码 3.0.0（用于排除同仓库的 2.x Trae Work 助手）。本分支发布仓库为
+/// **独立仓库 1rgg/Switch_AI**，全部 release 都是本产品，无需按版本排除其它产品线；
+/// 唯一需要防的是上游迁移过来的历史 tag。下限取 `当前版本 - 1`（下限不低于 0.0.0），
+/// 这样无论仓库里存在什么更老的 tag，都不会被当成「新版本」推给用户——
+/// 同时完全不依赖硬编码常量，未来跨大版本也不会误判。
+fn product_floor(current: (u64, u64, u64)) -> (u64, u64, u64) {
+    let (major, minor, patch) = current;
+    if patch > 0 {
+        (major, minor, patch - 1)
+    } else if minor > 0 {
+        (major, minor - 1, 0)
+    } else if major > 0 {
+        (major - 1, 0, 0)
+    } else {
+        (0, 0, 0)
+    }
+}
 
-/// 检查 GitHub Releases 上本产品线（>= 3.0.0）的最新版本，与当前应用版本比较。
+/// 检查 GitHub Releases 上最新版本，与当前应用版本比较。
 /// async 派发：网络请求最坏 90s（3 通道 × 30s），同步命令默认跑主线程会冻住 UI，必须异步执行。
 #[tauri::command(async)]
 pub fn update_check() -> Result<UpdateCheckResult, String> {
-    let current = parse_version(env!("CARGO_PKG_VERSION"))
+    let version_text = env!("CARGO_PKG_VERSION");
+    let current = parse_version(version_text)
         .ok_or("内置版本号解析失败")?;
+    let floor = product_floor(current);
     let releases = fetch_releases()?;
 
-    // 收集本产品线候选 release：(版本, tag, html_url, assets, 正文)
+    // 收集候选 release：(版本, tag, html_url, assets, 正文)
     let mut candidates: Vec<((u64, u64, u64), String, String, Vec<serde_json::Value>, String)> =
         Vec::new();
     for rel in &releases {
@@ -345,27 +440,36 @@ pub fn update_check() -> Result<UpdateCheckResult, String> {
         let version = parse_version(&tag)
             .or_else(|| pick_asset(&assets).and_then(|(name, _, _)| version_from_asset(&name)));
         if let Some(v) = version {
-            if v >= PRODUCT_MIN_VERSION {
+            if v >= floor {
                 candidates.push((v, tag, html_url, assets, body));
             }
         }
     }
-    // 本产品线内取版本最高者
+    // 取版本最高者
     candidates.sort_by(|a, b| b.0.cmp(&a.0));
-    let min_ver =
-        format!("{}.{}.{}", PRODUCT_MIN_VERSION.0, PRODUCT_MIN_VERSION.1, PRODUCT_MIN_VERSION.2);
+    let min_ver = format!("{}.{}.{}", floor.0, floor.1, floor.2);
     let (latest, tag, release_page, assets, body) = candidates
         .into_iter()
         .next()
-        .ok_or_else(|| format!("发布页上没有找到本产品线（v{min_ver} 起）的 release。可手动查看：{RELEASES_PAGE}"))?;
+        .ok_or_else(|| format!("发布页上没有找到 v{min_ver} 起的 release。可手动查看：{RELEASES_PAGE}"))?;
 
     let (asset_name, download_url, size) = pick_asset(&assets)
         .ok_or_else(|| format!("最新 release（{tag}）中没有可用的安装包资产。可手动查看：{RELEASES_PAGE}"))?;
-    // 防御：资产名版本必须与 release 版本一致，避免误装其他产品线的安装包
-    if version_from_asset(&asset_name) != Some(latest) {
-        return Err(format!(
-            "release（{tag}）的资产版本与 release 版本不一致，已中止。可手动查看：{RELEASES_PAGE}"
-        ));
+    // 防御：资产名版本必须达到 release 版本，避免误装其他产品线/更低版本的安装包。
+    // 注意放宽为「不低于」而非「等于」——tag 可能带 4 段（如 v3.8.2.1）而资产名只保留三段，
+    // 若用严格相等，同版本 release 会被自己的防御逻辑挡下，导致 check 直接报错。
+    match version_from_asset(&asset_name) {
+        Some(v) if cmp_version(v, latest) != std::cmp::Ordering::Less => {}
+        Some(_) => {
+            return Err(format!(
+                "release（{tag}）的资产版本低于 release 版本，已中止（可能抓到了旧产物）。可手动查看：{RELEASES_PAGE}"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "无法从资产名解析版本号（{asset_name}），已中止。可手动查看：{RELEASES_PAGE}"
+            ));
+        }
     }
     // 完整性校验（S1 insecure_update 纵深防御），优先级：
     // ① 发布校验清单 latest.json（机器可读 + 版本绑定）：存在即强制走清单且 fail-closed——
@@ -726,5 +830,86 @@ mod tests {
         let text = r#"{ "version": "3.2.9", "assets": {} }"#;
         let m: UpdateManifest = serde_json::from_str(text).unwrap();
         assert_ne!(parse_version(&m.version), Some((3, 3, 3)));
+    }
+
+    #[test]
+    fn parse_version_tolerates_prerelease_suffix() {
+        assert_eq!(parse_version("v3.8.2"), Some((3, 8, 2)));
+        assert_eq!(parse_version("3.8.2-beta.1"), Some((3, 8, 2)));
+        assert_eq!(parse_version("3.8.2+build.7"), Some((3, 8, 2)));
+        // 第三段缺失 → 视为 0（旧 release 可能只写 v3.8）
+        assert_eq!(parse_version("v3.8"), Some((3, 8, 0)));
+        // 四段（3.8.2.1）不是本产品版本格式，拒绝
+        assert_eq!(parse_version("3.8.2.1"), None);
+    }
+
+    #[test]
+    fn asset_version_scans_all_underscore_segments() {
+        // GitHub 重写后的真实产物名：只保留三段数字的是版本段
+        assert_eq!(
+            version_from_asset("Switch.AI_3.8.1_x64-setup.exe"),
+            Some((3, 8, 1))
+        );
+        // 段数更多的场景（前面带平台/架构）：扫描全部段仍能取到版本
+        assert_eq!(
+            version_from_asset("Switch.AI_windows_x64_3.8.10_setup.exe"),
+            Some((3, 8, 10))
+        );
+        assert_eq!(
+            version_from_asset("Switch.AI_3.8.1_x64_zh-CN.msi"),
+            Some((3, 8, 1))
+        );
+        // 无版本段 → None
+        assert_eq!(version_from_asset("Switch.AI_x64-setup.exe"), None);
+        // 非数字段（x64 只有一段点分内容）不得误判
+        assert_eq!(version_from_asset("Switch.AI_x64.portable_setup.exe"), None);
+    }
+
+    #[test]
+    fn pick_asset_prefers_nsis_and_excludes_portable() {
+        let mk = |name: &str, url: &str| {
+            serde_json::json!({ "name": name, "browser_download_url": url, "size": 10 })
+        };
+        let assets = vec![
+            mk("Switch.AI_3.8.2_x64_portable.zip", "u-portable"),
+            mk("Switch.AI_3.8.2_x64_zh-CN.msi", "u-msi"),
+            mk("Switch.AI_3.8.2_x64-setup.exe", "u-nsis"),
+            mk("latest.json", "u-manifest"),
+        ];
+        let (name, url, _) = pick_asset(&assets).unwrap();
+        assert_eq!(name, "Switch.AI_3.8.2_x64-setup.exe");
+        assert_eq!(url, "u-nsis");
+
+        // 只有 MSI 时退而求其次
+        let only_msi = vec![
+            mk("Switch.AI_3.8.2_x64_portable.zip", "u-portable"),
+            mk("Switch.AI_3.8.2_x64_zh-CN.msi", "u-msi"),
+        ];
+        assert_eq!(pick_asset(&only_msi).unwrap().0, "Switch.AI_3.8.2_x64_zh-CN.msi");
+
+        // 无本产品安装包 → None
+        let none = vec![mk("OtherApp_3.8.2_x64-setup.exe", "u-other")];
+        assert!(pick_asset(&none).is_none());
+    }
+
+    #[test]
+    fn product_floor_steps_down_one_release() {
+        // patch > 0：退一个 patch
+        assert_eq!(product_floor((3, 8, 2)), (3, 8, 1));
+        // patch == 0：退一个 minor
+        assert_eq!(product_floor((3, 8, 0)), (3, 7, 0));
+        // minor == 0：退一个 major
+        assert_eq!(product_floor((4, 0, 0)), (3, 0, 0));
+        // 下界钳制在 0.0.0，不产生负数
+        assert_eq!(product_floor((0, 0, 0)), (0, 0, 0));
+    }
+
+    #[test]
+    fn asset_version_not_below_release_is_accepted() {
+        // 放宽后的规则：资产版本 >= release 版本即通过（不低于），严格相等不再必需
+        let latest = (3, 8, 2);
+        assert_ne!(cmp_version((3, 8, 2), latest), std::cmp::Ordering::Less); // 相等 → 通过
+        assert_ne!(cmp_version((3, 8, 3), latest), std::cmp::Ordering::Less); // 更高 → 通过
+        assert_eq!(cmp_version((3, 8, 1), latest), std::cmp::Ordering::Less); // 更低 → 拦截
     }
 }

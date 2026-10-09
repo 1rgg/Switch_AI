@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.8.1
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.8.2
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
@@ -15,7 +15,7 @@ cd ai-work-assistant   # 本机目录暂为 trae-work-assistant，见文首说�
 npm install
 npm run tauri dev          # 开发模式（Tauri WebView 加载 Vite 5173）
 npm run tauri build        # 打包 MSI + NSIS 到 src-tauri/target/release/bundle/
-node scripts/rename_release.mjs     # 产物统一输出到 release/，中文命名 AI Work 助手_<版本>_x64*
+node scripts/rename_release.mjs     # 产物统一输出到 release/，按 productName 命名 Switch AI_<版本>_x64*
 ```
 
 测试：
@@ -393,7 +393,7 @@ ai-work-assistant/
 
 | 平台 | 资产 |
 |---|---|
-| Windows | `AI Work 助手_<版本>_x64-setup.exe` / `_x64_zh-CN.msi` / `_x64_portable.zip` |
+| Windows | `Switch AI_<版本>_x64-setup.exe` / `_x64_zh-CN.msi` / `_x64_portable.zip` |
 | macOS | `AI Work 助手_<版本>_aarch64.dmg` / `_x64.dmg` / `_universal.dmg` |
 | 校验清单 | `latest.json`（**必须收录上述全部 6 个资产**的 SHA-256） |
 
@@ -449,7 +449,7 @@ ai-work-assistant/
 - **进程三级关闭策略（F-47，process.rs）**：优雅关闭（taskkill 不带 /F 发 WM_CLOSE，等 3s 让 Electron 正常落盘）→ 树杀（/T /F，等 2s）→ 仍存活则返回 Err 由前端提示人工介入。仅按主程序映像名精确匹配；所有子进程以 CREATE_NO_WINDOW 拉起。
 - **API 模型同步**：官网同步重放 Trae 客户端 `batch_get_detail_param` 配置接口；内置模型 glm-5.3-flash / qwen3.8-flash / Doubao-Seed-Code 不在配置接口响应中，需经 llm_utils_chat 以 `function=solo_agent` 调用补齐。
 - **品牌迁移（v3.0.0）**：identifier `com.traework.assistant`→`com.aiwork.assistant`，数据目录 `%APPDATA%\TraeWorkAssistant`→`AIWorkAssistant`（`state.rs::migrate_legacy_dirs` 启动时**复制**迁移——旧目录原地保留，老应用可继续使用、两版并存；新目录已有数据则跳过；含 WebView2 目录，排除 Cache/GPUCache 等 8 类缓存子目录，复制失败回滚半成品），计划任务由 `misc.rs::try_migrate_legacy_task` 按旧触发时间重建（**旧任务保留**，`task_unregister` 只删新任务）。环境变量统一为 `AIWORKDATA_DIR`。
-- **老安装包升级**：升级兼容按**安装时产品名**判定（非版本号）。NSIS 通过 `build-assets/installer-hooks.nsh` 静默卸载清理旧品牌「Trae Work 助手」安装（已发布的 v2.4.4 及更早均属旧品牌，UTF-8 with BOM）；「AI Work 助手」品牌（v3.0.0 起）走 NSIS 原生原地升级；老 MSI 因 UpgradeCode 随 identifier 变化无法原地升级，需先卸载或改用 NSIS 包升级。打包产物统一输出到 `release/`，使用中文产品名命名 `AI Work 助手_<版本>_x64*`（`scripts/rename_release.mjs`）。
+- **老安装包升级**：升级兼容按**安装时产品名**判定（非版本号）。NSIS 通过 `build-assets/installer-hooks.nsh` 静默卸载清理旧品牌「Trae Work 助手」安装（已发布的 v2.4.4 及更早均属旧品牌，UTF-8 with BOM）；「AI Work 助手」品牌（v3.0.0 起）走 NSIS 原生原地升级；老 MSI 因 UpgradeCode 随 identifier 变化无法原地升级，需先卸载或改用 NSIS 包升级。打包产物统一输出到 `release/`，按 `productName`（`Switch AI`）命名 `Switch AI_<版本>_x64*`（`scripts/rename_release.mjs`；GitHub 上传会重写为 `Switch.AI_<版本>_x64*`，更新器用宽松键归一匹配）。
 - **版本线与数据迁移**：新版本自 v3.0.0 起，**之前所有 2.x 版本升级到 3.x 均需数据迁移（安装/首次启动自动完成）**；原「Trae Work 助手」产品线在 `trae_work_main` 分支维护（仅 Trae Work 单应用，2.x.x，仅必要修复），仅使用 Trae Work 的用户可不升级，用该分支的 v2.x.x 最新版本即可。
 - **分支矩阵**：`main` = Windows 主线（默认分支）；`macos_main` = **macOS 产品分支**（F-75 平台支持产品化落地于此——platform 服务层 + 平台门控 + dmg 构建流水线，`build-macos.yml` push 触发产出 aarch64/x64/universal 三 dmg，与 main 保持合并对齐、随 3.6.x 同步发版）；`docker_main` = **Docker 简化分支**（Web-only 单体 `aiwork-server`：管理 REST + OpenAI 网关 + 调度器 + 浏览器 UI，裁剪桌面壳/MITM/账号切换/豆包，独立 1.x 版本线，`docker compose up` 部署）。
 - **NSIS 安装器**：使用自定义模板 `build-assets/installer.nsi`（基于 tauri v2.11.4 上游模板，配置于 tauri.conf.json `bundle.windows.nsis.template`）——升级安装时跳过「卸载旧版/不卸载」选择页，**默认直接覆盖安装**（同版本重装/降级仍显示选择页）。升级 Tauri CLI 后如构建报错，需从对应版本 tag 的 `crates/tauri-bundler/src/bundle/windows/nsis/installer.nsi` 重新同步模板并重做定制。

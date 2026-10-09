@@ -19,6 +19,7 @@ import {
   APP_OVERVIEW,
   APP_AUTHOR,
   APP_COPYRIGHT,
+  APP_CREDIT,
   APP_DISCLAIMER,
   LINK_GITHUB,
   LINK_BLOG,
@@ -272,13 +273,13 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
             onClick={() => void openUrl(LINK_GITHUB)}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium transition hover:bg-slate-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
           >
-            <Github size={14} /> GitHub
+            <Github size={14} /> 我的 GitHub
           </button>
           <button
             onClick={() => void openUrl(LINK_BLOG)}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium transition hover:bg-slate-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
           >
-            <Globe size={14} /> 个人博客
+            <Globe size={14} /> 项目主页
           </button>
           <button
             onClick={() => void openUrl(LINK_REPO)}
@@ -292,7 +293,7 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
         <div className="overflow-hidden rounded-xl border border-slate-200 dark:border-zinc-700">
           <img
             src={promoBanner}
-            alt="AI Work 助手 — 多账号签到与管理一站式工作台"
+            alt="Switch AI — 多平台账号签到与积分管理一站式工作台"
             className="w-full"
           />
         </div>
@@ -301,7 +302,10 @@ export default function AboutDialog({ open, onClose }: { open: boolean; onClose:
         <div className="space-y-0.5 text-xs text-slate-500 dark:text-zinc-400">
           <div>作者：{APP_AUTHOR}</div>
           <div>{APP_COPYRIGHT}</div>
-          <div className="pt-1 text-[11px] leading-relaxed text-slate-400 dark:text-zinc-500">{APP_DISCLAIMER}</div>
+          <div className="pt-1 text-[11px] leading-relaxed text-slate-400 dark:text-zinc-500">
+            {APP_CREDIT}
+          </div>
+          <div className="text-[11px] leading-relaxed text-slate-400 dark:text-zinc-500">{APP_DISCLAIMER}</div>
         </div>
       </div>
     </Modal>
