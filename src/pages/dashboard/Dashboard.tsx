@@ -107,16 +107,19 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
 
   const loadBuddy = useCallback(
     async (fresh: boolean) => {
+      // 串行：creditsFetch 成功后后端才写入当日快照（append_credits_snapshot）。
+      // 与 creditsHistoryList 并行时读到的可能是写入前的旧快照，「今日获取」滞后一次刷新
+      // （Trae/Qoder 侧已是串行写法，此处对齐）
+      await api.workbuddy
+        .creditsFetch(undefined, fresh)
+        .then((r) => {
+          setWbCredits(r);
+          if (fresh && r.stale) {
+            pushToast('warn', 'Buddy 积分刷新失败，已回退展示历史缓存数据');
+          }
+        })
+        .catch((err) => pushToast('error', `Buddy 积分查询失败：${String(err)}`));
       await Promise.allSettled([
-        api.workbuddy
-          .creditsFetch(undefined, fresh)
-          .then((r) => {
-            setWbCredits(r);
-            if (fresh && r.stale) {
-              pushToast('warn', 'Buddy 积分刷新失败，已回退展示历史缓存数据');
-            }
-          })
-          .catch((err) => pushToast('error', `Buddy 积分查询失败：${String(err)}`)),
         // 今日新增（§2.2 方案 A）+ 积分统计「区间总获得」：签到日志 reward 聚合（90 天）
         api.workbuddy
           .checkinResults(90)

@@ -188,6 +188,48 @@ fn snapshot_fingerprint(snapshot: &Value) -> Option<Vec<String>> {
     accounts_fingerprint(snapshot.get("accounts").and_then(Value::as_array)?)
 }
 
+/// 账号余额映射（user_id → balance）。
+///
+/// **只收录 balance 为数值的账号**：积分查询失败时该账号 balance 为 null
+/// （`ok:false`），不入选。这是「逐账号差分」可信的前提——缺失余额的账号不得
+/// 以 0 参与任何差分运算。
+fn balance_map(items: &[Value]) -> std::collections::BTreeMap<String, f64> {
+    let mut m = std::collections::BTreeMap::new();
+    for a in items {
+        let Some(id) = a.get("user_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if id.is_empty() {
+            continue;
+        }
+        let Some(b) = a.get("balance").and_then(Value::as_f64) else {
+            continue;
+        };
+        m.insert(id.to_string(), b);
+    }
+    m
+}
+
+/// 逐账号正差分之和 → (获得额, 参与比较的账号数)。
+///
+/// **只统计两次都取到数值余额的账号**：任一侧缺失即跳过。这是「查询失败的账号
+/// 恢复后其全额余额被记成当日获得」的修复点——缺失侧既不按 0 参与，也不产生差分。
+/// 负差分（纯消耗）记 0。
+fn positive_balance_delta(
+    cur: &std::collections::BTreeMap<String, f64>,
+    prev: &std::collections::BTreeMap<String, f64>,
+) -> (f64, usize) {
+    let mut sum = 0.0;
+    let mut compared = 0usize;
+    for (id, c) in cur {
+        if let Some(p) = prev.get(id) {
+            compared += 1;
+            sum += (c - p).max(0.0);
+        }
+    }
+    (sum, compared)
+}
+
 /// 追加每日积分余额快照（F-27）：SQLite 化 P6 → wb_credits_history 表，同日覆盖最新 + 365 天裁剪。
 /// credits-dashboard-plan.md §2.2 方案 B：快照行新增 earned（当日新增积分）——
 /// 口径 = max(当日余额差分(≥0), 当日签到 reward 合计)；首日无历史差分时退化为仅签到 reward。
@@ -195,6 +237,17 @@ fn snapshot_fingerprint(snapshot: &Value) -> Option<Vec<String>> {
 /// 余额差分不可比——新账号余额直接抬高 total，会被当成「当日获得」（实测 2026-10-05/10-06
 /// 加号后 earned 虚增 2217.83/3059.06），且 fallback 侧消耗被 .max(0.0) 钳成 0；
 /// 此时 earned 只取签到 reward。对齐 Qoder 侧账号数不一致即不采信差分的既有口径。
+///
+/// **逐账号差分（2026-10-09 修复，替代 total 差分）**：原口径 `total - prev_total`
+/// 把「某个账号上一快照查询失败（balance=null → 计入 0）、本次恢复（真实余额入账）」
+/// 的差额整体记成当日获得——国际版账号积分接口（`credits_base` = www.workbuddy.ai，
+/// 与国内站 www.workbuddy.cn 不同站）偶发失败时尤其明显，表现为「今天什么都没做，
+/// 今日获取却显示该账号的全部余额」。账号集合守卫检测不到这种情形（user_id 仍在
+/// accounts 数组里，只是 balance 为 null）。
+///
+/// 现口径：只对**本次与上次都取到数值余额**的账号求逐账号正差分之和；任一侧缺失
+/// 的账号本轮不参与差分（其「恢复」不构成获得）。上次快照无逐账号明细时退回 total
+/// 差分，并要求本次无缺失余额的账号，否则仅取签到 reward。
 fn append_credits_snapshot(state: &AppState, parsed: &Value) {
     let store = crate::store::db(&state.data_dir);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -237,12 +290,44 @@ fn append_credits_snapshot(state: &AppState, parsed: &Value) {
         (Some(prev), Some(cur)) => prev != cur,
         _ => false,
     };
+    // 本次取到数值余额的账号；balance 为 null 即该账号本次查询失败，不得按 0 参与差分
+    let cur_balances = balance_map(&accounts);
+    let missing_now = accounts
+        .iter()
+        .filter(|a| a.get("balance").and_then(Value::as_f64).is_none())
+        .count();
+    // 上次快照的逐账号余额（旧快照无 accounts 明细时为空 → 退回 total 差分）
+    let prev_balances = prev_snapshot
+        .and_then(|s| s.get("accounts").and_then(Value::as_array))
+        .map(|arr| balance_map(arr))
+        .unwrap_or_default();
+
     let earned = if set_changed {
+        // 账号集合变动：新账号余额直接抬高 total，差分不可信
         checkin_reward
+    } else if !prev_balances.is_empty() {
+        // 逐账号正差分：仅两次都有数值余额的账号参与；缺失侧不参与（其恢复不算获得）
+        let (diff, compared) = positive_balance_delta(&cur_balances, &prev_balances);
+        // 诊断（可证伪：虚增消失时该行不再出现）
+        if missing_now > 0 || compared < cur_balances.len() {
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "workbuddy 积分快照 earned 逐账号差分：本次 {}/{} 账号有余额，可比 {} 个（上次 {} 个）；\
+                     缺失账号已排除出差分，不计为当日获得",
+                    cur_balances.len(),
+                    accounts.len(),
+                    compared,
+                    prev_balances.len(),
+                ),
+            );
+        }
+        diff.max(checkin_reward)
     } else {
+        // 退回 total 差分：要求本次全部账号都有余额，否则 total 被低估、差分虚增
         match prev_total {
-            Some(prev) => (total - prev).max(0.0).max(checkin_reward),
-            None => checkin_reward,
+            Some(prev) if missing_now == 0 => (total - prev).max(0.0).max(checkin_reward),
+            _ => checkin_reward,
         }
     };
     let snap = serde_json::json!({
@@ -1392,6 +1477,75 @@ mod credits_tests {
             snapshot_fingerprint(&serde_json::json!({
                 "accounts": [{"user_id": "wb-b", "balance": 1.0}, {"user_id": "wb-a", "balance": 2.0}]
             }))
+        );
+    }
+
+    // ── 逐账号差分（2026-10-09：取代 total 差分，修「今天没获得却显示获得」）──
+
+    fn bmap(pairs: &[(&str, f64)]) -> std::collections::BTreeMap<String, f64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn balance_map_collects_only_numeric_balances() {
+        // 国际版账号积分接口失败时 balance 为 null —— 必须被排除，否则其「恢复」
+        // 会被当成当日获得
+        let items = serde_json::json!([
+            {"user_id": "wb-a", "balance": 120.5},
+            {"user_id": "wb-b", "balance": null},
+            {"user_id": "wb-c"},
+            {"user_id": "", "balance": 9.0},
+        ]);
+        let m = balance_map(items.as_array().unwrap());
+        assert_eq!(m.len(), 1, "仅 wb-a 有数值余额：{m:?}");
+        assert_eq!(m.get("wb-a"), Some(&120.5));
+    }
+
+    #[test]
+    fn positive_delta_sums_only_accounts_present_on_both_sides() {
+        // 正常获得：a +30
+        assert_eq!(
+            positive_balance_delta(
+                &bmap(&[("wb-a", 130.0)]),
+                &bmap(&[("wb-a", 100.0)]),
+            ),
+            (30.0, 1)
+        );
+        // 纯消耗 → 记 0（获得不为负）
+        assert_eq!(
+            positive_balance_delta(
+                &bmap(&[("wb-a", 100.0)]),
+                &bmap(&[("wb-a", 130.0)]),
+            ),
+            (0.0, 1)
+        );
+    }
+
+    #[test]
+    fn positive_delta_ignores_recovered_and_vanished_accounts() {
+        // 回归核心缺陷：上次查询失败（无 wb-b 余额）→ 本次恢复 500，
+        // 不得记为当日获得（旧 total 口径会虚增 500）
+        assert_eq!(
+            positive_balance_delta(
+                &bmap(&[("wb-a", 100.0), ("wb-b", 500.0)]),
+                &bmap(&[("wb-a", 100.0)]),
+            ),
+            (0.0, 1),
+            "恢复的账号不参与差分"
+        );
+        // 反向：本次该账号查询失败（cur 缺 wb-b），同样跳过
+        assert_eq!(
+            positive_balance_delta(
+                &bmap(&[("wb-a", 130.0)]),
+                &bmap(&[("wb-a", 100.0), ("wb-b", 500.0)]),
+            ),
+            (30.0, 1),
+            "本次缺失的账号不参与差分"
+        );
+        // 两侧都无交集 → 无获得、无可比账号
+        assert_eq!(
+            positive_balance_delta(&bmap(&[("wb-x", 1.0)]), &bmap(&[("wb-y", 1.0)])),
+            (0.0, 0)
         );
     }
 }
