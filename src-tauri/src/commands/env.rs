@@ -1,6 +1,8 @@
 use serde::Serialize;
+use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, State};
 
 use crate::state::AppState;
@@ -128,13 +130,24 @@ fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
     }
 }
 
-/// exe 文件版本（ProductVersion 优先，回退 FileVersion）——qoder_env_check 复用
+/// exe 文件版本（ProductVersion 优先，回退 FileVersion）——qoder_env_check 复用。
+/// 原实现每次都 spawn powershell 读 VersionInfo（单次实测 1.2s+），而概览页 / 顶栏 /
+/// 环境页在同一轮界面切换里会对同一个 exe 重复问；现改为三级：
+/// 进程内按 (路径, mtime, 大小) 缓存 → 直读 PE 版本资源（`pe_version` 模块，微秒级）→
+/// 读不到再回退原 powershell 实现（非 PE / 无版本资源 / 权限受限时兜底）。
 pub(crate) fn version_of(path: &str) -> Option<String> {
-    // 优先 ProductVersion（用户认知的产品版本，如 Trae 3.3.100 / Trae Work 0.1.65 /
-    // CodeBuddy 4.12.0），缺失时回退 FileVersion（内部构建号）——实测 Electron 系客户端
-    // 两者差异巨大（TRAE SOLO CN.exe FileVersion=2.3.83557 而 ProductVersion=0.1.65，
-    // CodeBuddy CN.exe FileVersion=1.106.1.0 而 ProductVersion=4.12.0），旧版恒读
-    // FileVersion 导致顶栏版本显示为构建号而非产品版本
+    version_cached(path, || {
+        crate::pe_version::product_or_file_version(path)
+            .or_else(|| powershell_version_of(path))
+            .map(normalize_version)
+    })
+}
+
+/// 原实现（保留作 PE 资源读取失败时的兜底）：ProductVersion 优先，缺失回退 FileVersion。
+/// 实测 Electron 系客户端两者差异巨大（TRAE SOLO CN.exe FileVersion=2.3.83557 而
+/// ProductVersion=0.1.65，CodeBuddy CN.exe FileVersion=1.106.1.0 而 ProductVersion=4.12.0），
+/// 旧版恒读 FileVersion 导致顶栏版本显示为构建号而非产品版本
+fn powershell_version_of(path: &str) -> Option<String> {
     let ps = format!(
         "$v=(Get-Item '{}').VersionInfo; if ($v.ProductVersion) {{ $v.ProductVersion }} else {{ $v.FileVersion }}",
         path.replace('\'', "''")
@@ -146,16 +159,65 @@ pub(crate) fn version_of(path: &str) -> Option<String> {
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if s.is_empty() {
-        return None;
+        None
+    } else {
+        Some(s)
     }
-    // 归一化：4 段式 ProductVersion 去掉末尾冗余 ".0"（WorkBuddy 5.4.7.0 → 5.4.7）；
-    // 3 段式保持原样（CodeBuddy 4.12.0 不能截成 4.12）
-    let s = if s.matches('.').count() == 3 && s.ends_with(".0") {
+}
+
+/// 版本串归一化：4 段式去掉末尾冗余 ".0"（WorkBuddy 5.4.7.0 → 5.4.7）；
+/// 3 段式保持原样（CodeBuddy 4.12.0 不能截成 4.12）
+fn normalize_version(s: String) -> String {
+    if s.matches('.').count() == 3 && s.ends_with(".0") {
         s[..s.len() - 2].to_string()
     } else {
         s
-    };
-    Some(s)
+    }
+}
+
+/// 版本缓存条目：(mtime 毫秒, 文件大小) → 版本串（None 也缓存，避免反复读无版本资源的文件）
+type VersionEntry = (u64, u64, Option<String>);
+
+fn version_cache() -> &'static Mutex<HashMap<String, VersionEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, VersionEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 文件「版本是否变化」指纹（mtime + 大小）；取不到（文件不存在/无权限）时不做缓存
+fn file_stamp(path: &str) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some((mtime, meta.len()))
+}
+
+/// 版本读取的记忆化：指纹（路径 + mtime + 大小）未变则直接返回缓存，否则 `compute` 后写回
+/// （None 同样缓存，避免反复读无版本资源的文件）；文件 stat 不到时不缓存，每次重试。
+fn version_cached(path: &str, compute: impl FnOnce() -> Option<String>) -> Option<String> {
+    let key = path.to_ascii_lowercase();
+    let stamp = file_stamp(path);
+    if let Some(stamp) = stamp {
+        let guard = version_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((mtime, len, v)) = guard.get(&key) {
+            if (*mtime, *len) == stamp {
+                return v.clone();
+            }
+        }
+    }
+    let v = compute();
+    if let Some((mtime, len)) = stamp {
+        let mut guard = version_cache().lock().unwrap_or_else(|e| e.into_inner());
+        // 防御：键集合本应有界（客户端 exe 数量级），异常膨胀时整体清空重来
+        if guard.len() > 256 {
+            guard.clear();
+        }
+        guard.insert(key, (mtime, len, v.clone()));
+    }
+    v
 }
 
 fn is_running_cn() -> bool {

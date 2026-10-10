@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
@@ -2590,8 +2591,37 @@ fn make_upstream_request(
 
 // ==================== Helpers ====================
 
+/// 空 message 兜底（issue #71）：上游错误体可能提取不到 message（如本地代理
+/// 劫持 127.0.0.1 回环流量后返回的空体），透传空串会让客户端只看到
+/// {"message":""}，缺乏诊断价值；统一回填含状态码的提示文案
+pub(crate) fn msg_or_fallback(msg: &str, status: u16) -> Cow<'_, str> {
+    if !msg.trim().is_empty() {
+        return Cow::Borrowed(msg);
+    }
+    Cow::Owned(format!(
+        "上游服务返回 {status} 但未提供错误详情：常见于网络波动、上游服务异常，或本地全局代理（Clash 等）劫持 127.0.0.1 回环流量；请检查网络与代理设置，详见应用运行日志"
+    ))
+}
+
+/// 流式错误 message 兜底（issue #71）：code 可能是 HTTP 状态码也可能是业务码
+/// （如 6004，或缺失时兜底的 0）；非 HTTP 语义时不冒充状态码，文案与
+/// error.code 字段保持一致，避免客户端按 message 误判上游状态
+pub(crate) fn stream_msg_or_fallback(msg: &str, code: i64) -> Cow<'_, str> {
+    if !msg.trim().is_empty() {
+        return Cow::Borrowed(msg);
+    }
+    if (100..=599).contains(&code) {
+        return msg_or_fallback(msg, code as u16);
+    }
+    Cow::Owned(format!(
+        "上游返回错误码 {code} 但未提供错误详情：常见于网络波动、上游服务异常，或本地全局代理（Clash 等）劫持 127.0.0.1 回环流量；请检查网络与代理设置，详见应用运行日志"
+    ))
+}
+
 /// OpenAI 错误响应格式（wb_route 复用）
-pub(crate) fn openai_error(status: StatusCode, code: &str, msg: &str) -> Response {    let body = json!({
+pub(crate) fn openai_error(status: StatusCode, code: &str, msg: &str) -> Response {
+    let msg = msg_or_fallback(msg, status.as_u16());
+    let body = json!({
         "error": {
             "message": msg,
             "type": "api_error",
@@ -2612,6 +2642,7 @@ pub(crate) fn openai_error(status: StatusCode, code: &str, msg: &str) -> Respons
 
 /// Anthropic 错误响应格式：{"type":"error","error":{"type","message"}}（wb_route 复用）
 pub(crate) fn anthropic_error(status: StatusCode, err_type: &str, msg: &str) -> Response {
+    let msg = msg_or_fallback(msg, status.as_u16());
     let body = json!({
         "type": "error",
         "error": {
@@ -2639,6 +2670,7 @@ pub(crate) fn send_stream_error(
     code: i64,
     msg: &str,
 ) {
+    let msg = stream_msg_or_fallback(msg, code);
     match proto {
         Protocol::OpenAi | Protocol::OpenAiText => {
             let body = json!({
@@ -2713,6 +2745,44 @@ fn safe_slice(s: &str, n: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== 空 message 兜底（issue #71） ====================
+
+    #[test]
+    fn msg_or_fallback_keeps_non_empty_message() {
+        assert_eq!(
+            msg_or_fallback("upstream code=6004 msg=限额", 502),
+            "upstream code=6004 msg=限额"
+        );
+        assert_eq!(msg_or_fallback("  x  ", 500), "  x  ");
+    }
+
+    #[test]
+    fn msg_or_fallback_backfills_blank_message_with_status_hint() {
+        for blank in ["", " ", "\n\t"] {
+            let m = msg_or_fallback(blank, 502);
+            assert!(m.contains("502"), "{m}");
+            assert!(m.contains("127.0.0.1"), "{m}");
+        }
+    }
+
+    #[test]
+    fn stream_msg_or_fallback_maps_http_and_business_codes() {
+        // HTTP 语义 code（含边界 100/599）：沿用状态码文案，与 code 字段一致
+        for code in [100_i64, 404, 502, 599] {
+            let m = stream_msg_or_fallback("", code);
+            assert!(m.contains("上游服务返回"), "code={code}: {m}");
+            assert!(m.contains(&code.to_string()), "code={code}: {m}");
+        }
+        // 业务码/缺失（0）/越界（99、600）/负数/超大 i64：按错误码提示，不冒充状态码
+        for code in [0_i64, 99, 600, 6004, -9901, i64::MAX] {
+            let m = stream_msg_or_fallback("", code);
+            assert!(m.contains("错误码"), "code={code}: {m}");
+            assert!(m.contains(&code.to_string()), "code={code}: {m}");
+        }
+        // 非空 msg 一律原样透传（不 trim 保留原文）
+        assert_eq!(stream_msg_or_fallback("  x  ", 6004), "  x  ");
+    }
 
     // ==================== 轮换耗尽收尾文案：指纹拦截 vs 账号池耗尽 ====================
 

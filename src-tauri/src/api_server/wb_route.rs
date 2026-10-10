@@ -35,7 +35,7 @@ use super::wb_sse;
 use super::wb_sticky::SessionKey;
 use super::wb_upstream::{self, WbCreds};
 use super::{classify_error, ApiSharedState, ErrKind, InflightGuard};
-use crate::api_server::routes::{anthropic_error, openai_error, Protocol};
+use crate::api_server::routes::{anthropic_error, openai_error, Protocol, stream_msg_or_fallback};
 
 /// 安全获取 Mutex 锁：若锁被毒化（panic 导致），仍恢复内部数据继续运行
 fn safe_lock<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
@@ -1698,6 +1698,8 @@ fn send_stream_error_wb(
     code: i64,
     msg: &str,
 ) {
+    // 空 message 兜底（issue #71）：与 routes/qoder 的 send_stream_error 同防线
+    let msg = stream_msg_or_fallback(msg, code);
     match proto {
         Protocol::Anthropic => {
             let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
@@ -1772,7 +1774,6 @@ mod tests {
     /// UTC+8 字面量必须命中，按 UTC+8 解释为 Unix 秒）
     #[test]
     fn parse_quota_reset_at_from_limit_message() {
-        use chrono::TimeZone;
         // 未来时刻动态构造（UTC+8 时区格式化），格式与上游文案一致
         let reset = (chrono::Utc::now() + chrono::Duration::hours(3))
             .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());

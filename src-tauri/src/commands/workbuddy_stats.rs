@@ -340,7 +340,9 @@ impl DayTotals {
 /// 增量缓存条目 rev 不匹配时强制重解析，避免旧版本误计数的 parse_errors 滞留展示。
 /// 2 → 3（2026-10-07）：解析路径引入 `"usage"` 快速预筛（不含该字面量的行不再解析，
 /// parse_errors 语义随之收紧），旧缓存条目须强制重解析一次以清除口径差。
-const PARSE_REV: u32 = 3;
+/// 3 → 4（2026-10-08）：CodeBuddy IDE 源新增跨文件按 request id 去重（`FileCacheEntry::ids`），
+/// 旧条目没有 id 列表无法判重，须强制重解析一次。
+const PARSE_REV: u32 = 4;
 
 /// 单文件增量缓存条目
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -356,6 +358,12 @@ struct FileCacheEntry {
     by_model: HashMap<String, HashMap<String, DayTotals>>,
     /// project → date → 聚合
     by_project: HashMap<String, HashMap<String, DayTotals>>,
+    /// 本文件**实际计入**的 request id（仅 CodeBuddy IDE 索引源填充；JSONL 源为空）。
+    /// 用途：同一批请求会被以**新的会话 id** 重新登记到另一个 uid 的目录下（实测同一
+    /// workspace 下 609 个 id 跨 uid 重复，仅靠「文件内去重」会整份多计），聚合层据此
+    /// 做跨文件去重：整份重复 → 整文件跳过；无重复 → 走快路径；部分重复 → 过滤重解析。
+    #[serde(default)]
+    ids: Vec<String>,
     parse_errors: u64,
 }
 
@@ -594,7 +602,18 @@ fn collect_codebuddy_indexes_deep(dir: &Path, depth: usize, output: &mut Vec<Pat
 
 /// 解析 CodeBuddy IDE 会话索引为按日聚合（与 parse_file 同构的增量缓存单元）。
 /// 工作区级 index.json（只有 conversations/current）自然产出空条目，零误计。
-fn parse_codebuddy_index(path: &Path, memo: &mut HashMap<String, Value>) -> FileCacheEntry {
+///
+/// 去重分两层（实测驱动，2026-10-08）：
+/// 1. **文件内**：同一会话内按 request id 去重（原地）；
+/// 2. **跨文件**：由聚合层做（见 `aggregate_files` 的 IDE 分支）——同一批请求会被以
+///    **新的会话 id** 重新登记到另一个 uid 的目录下（实测同一 workspace 下 609 个 id
+///    跨 uid 重复，仅靠文件内去重会整份多计）。此处把「实际计入的 id」记进 `entry.ids`，
+///    `skip` 非空时跳过其中已计的 id（跨文件部分重复时的重算路径）。
+fn parse_codebuddy_index(
+    path: &Path,
+    memo: &mut HashMap<String, Value>,
+    skip: Option<&HashSet<String>>,
+) -> FileCacheEntry {
     let mut entry = FileCacheEntry { rev: PARSE_REV, ..Default::default() };
     let Ok(raw) = std::fs::read(path) else {
         entry.parse_errors = 1;
@@ -613,7 +632,7 @@ fn parse_codebuddy_index(path: &Path, memo: &mut HashMap<String, Value>) -> File
         .and_then(|n| n.to_str())
         .unwrap_or("");
     let workspace_dir = session_dir.and_then(|p| p.parent());
-    // 同会话内按 request id 去重（跨会话副本不去重——本工具不复制该目录）
+    // 同会话内按 request id 去重（跨文件/跨 uid 副本由聚合层判重，见函数注释）
     let mut seen_ids: HashSet<&str> = HashSet::new();
     for request in requests {
         let Some(object) = request.as_object() else { continue };
@@ -630,6 +649,12 @@ fn parse_codebuddy_index(path: &Path, memo: &mut HashMap<String, Value>) -> File
             continue;
         }
         let Some(day) = object.get("startedAt").and_then(ms_date) else { continue };
+        // 实际计入的 id（供聚合层跨文件判重）；skip 命中表示该 id 已在别的文件计过，
+        // 只登记不聚合。聚合结果是文件的纯函数（与 skip 无关时），故仍可进增量缓存
+        entry.ids.push(id.to_string());
+        if skip.is_some_and(|counted| counted.contains(id)) {
+            continue;
+        }
         let req_type = object.get("type").and_then(Value::as_str).unwrap_or("craft");
         let model = match workspace_dir {
             Some(ws) => conversation_model(memo, ws, conv_id, req_type),
@@ -773,6 +798,8 @@ fn aggregate_files(
     let mut hits: u64 = 0;
     let mut parsed: u64 = 0;
     let mut parse_ms: u64 = 0;
+    // 本轮扫描已计入的 request id（仅 CodeBuddy IDE 源使用，见下方跨文件去重）
+    let mut counted_ids: HashSet<String> = HashSet::new();
 
     for path in &paths {
         let key = path.to_string_lossy().to_string();
@@ -792,7 +819,7 @@ fn aggregate_files(
             let t_parse = Instant::now();
             let mut e = match kind {
                 ScanKind::SessionJsonl => parse_file(path, &dir_project_name(root, path)),
-                ScanKind::CodebuddyIndex => parse_codebuddy_index(path, &mut memo),
+                ScanKind::CodebuddyIndex => parse_codebuddy_index(path, &mut memo, None),
             };
             parsed += 1;
             parse_ms = parse_ms.saturating_add(t_parse.elapsed().as_millis() as u64);
@@ -802,6 +829,37 @@ fn aggregate_files(
             }
             cache.insert(key, e.clone());
             e
+        };
+
+        // CodeBuddy IDE 源：跨文件按 request id 全局去重（见 FileCacheEntry::ids）。
+        // 同一批请求会被以**新的会话 id** 重新登记到另一个 uid 的目录下，若只做文件内
+        // 去重会整份多计（实测本机 609/4123 行、约 16.7% 的 IDE 源用量）。
+        let entry = if kind == ScanKind::CodebuddyIndex && !entry.ids.is_empty() {
+            let dup = entry
+                .ids
+                .iter()
+                .filter(|id| counted_ids.contains(id.as_str()))
+                .count();
+            if dup == entry.ids.len() {
+                // 整份重复：整文件跳过（其全部请求都已在别的文件计入）
+                parse_errors = parse_errors.saturating_add(entry.parse_errors);
+                continue;
+            }
+            let mut filtered: Option<FileCacheEntry> = None;
+            if dup > 0 {
+                // 部分重复：按「本文件之前已计 id」过滤后重算。过滤结果依赖扫描顺序，
+                // 故不进增量缓存（缓存只存与顺序无关的全量聚合）
+                let t_reparse = Instant::now();
+                filtered = Some(parse_codebuddy_index(path, &mut memo, Some(&counted_ids)));
+                parsed += 1;
+                parse_ms = parse_ms.saturating_add(t_reparse.elapsed().as_millis() as u64);
+            }
+            for id in &entry.ids {
+                counted_ids.insert(id.clone());
+            }
+            filtered.unwrap_or(entry)
+        } else {
+            entry
         };
 
         parse_errors = parse_errors.saturating_add(entry.parse_errors);
@@ -1248,6 +1306,133 @@ mod tests {
         assert!(ms_date(&json!({})).is_none());
     }
 
+    /// 跨文件/跨 uid 的同一请求只计一次（2026-10-08 实测缺陷回归：同一批请求会以**新的
+    /// 会话 id** 落到另一个 uid 的目录下）——整份重复的文件整份跳过、部分重复只补新 id，
+    /// 且二次扫描（全命中增量缓存）结果一致（去重只作用于聚合层，不污染缓存）。
+    #[test]
+    fn codebuddy_index_cross_file_request_id_dedup() {
+        let root = std::env::temp_dir().join(format!("wb_stats_dedup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ws = "d41d8cd98f00b204e9800998ecf8427e";
+        let stamp = 1_757_000_000_000i64;
+        let req = |id: &str, input: u64| {
+            json!({
+                "id": id, "type": "craft", "state": "complete", "startedAt": stamp,
+                "usage": { "inputTokens": input, "outputTokens": 1 }
+            })
+        };
+        let write_session = |uid: &str, conv: &str, requests: Vec<Value>| {
+            let dir = root
+                .join(uid)
+                .join("CodeBuddyIDE")
+                .join(uid)
+                .join("history")
+                .join(ws)
+                .join(conv);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("index.json"),
+                json!({ "requests": requests }).to_string(),
+            )
+            .unwrap();
+        };
+        // A：r1/r2；B：完全相同的一批（另一 uid、新会话 id）；C：r2 重复 + r3 新增
+        write_session("uA", "conv-a", vec![req("r1", 100), req("r2", 200)]);
+        write_session("uB", "conv-b", vec![req("r1", 100), req("r2", 200)]);
+        write_session("uC", "conv-c", vec![req("r2", 200), req("r3", 400)]);
+
+        let mut paths = Vec::new();
+        collect_codebuddy_indexes(&root, &mut paths);
+        assert_eq!(paths.len(), 3, "三个会话索引都应被收集: {paths:?}");
+
+        let mut cache = HashMap::new();
+        let mut seen = HashSet::new();
+        let view = aggregate_files(
+            ScanKind::CodebuddyIndex,
+            &root,
+            "codebuddy-ide",
+            paths,
+            "1970-01-01",
+            &mut cache,
+            &mut seen,
+        );
+        // 唯一请求 3 条：100 + 200 + 400
+        assert_eq!(view["summary"]["input"], json!(700));
+        assert_eq!(view["summary"]["calls"], json!(3));
+        assert_eq!(view["files_scanned"], json!(3));
+
+        // 二次扫描：三个文件全部命中增量缓存，去重仍须得到同样结果
+        let mut paths2 = Vec::new();
+        collect_codebuddy_indexes(&root, &mut paths2);
+        let mut cache2 = cache.clone();
+        let mut seen2 = HashSet::new();
+        let view2 = aggregate_files(
+            ScanKind::CodebuddyIndex,
+            &root,
+            "codebuddy-ide",
+            paths2,
+            "1970-01-01",
+            &mut cache2,
+            &mut seen2,
+        );
+        assert_eq!(view2["summary"]["input"], json!(700));
+        assert_eq!(view2["summary"]["calls"], json!(3));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 手动诊断（默认忽略）：在**真实** CodeBuddy IDE 目录上对比「跨文件去重前/后」，
+    /// 用于确认重复计入的规模：
+    /// `cargo test probe_codebuddy_ide_dedup -- --ignored --nocapture`
+    #[test]
+    #[ignore = "本机诊断：需真实 CodeBuddy IDE 历史目录"]
+    fn probe_codebuddy_ide_dedup() {
+        let Some(root) = codebuddy_ide_root() else {
+            println!("[probe] 未找到 CodeBuddy IDE 数据目录，跳过");
+            return;
+        };
+        let mut paths = Vec::new();
+        collect_codebuddy_indexes(&root, &mut paths);
+        if paths.is_empty() {
+            println!("[probe] 未收集到会话索引，跳过");
+            return;
+        }
+        let mut cache = HashMap::new();
+        let mut seen = HashSet::new();
+        let t0 = Instant::now();
+        let view = aggregate_files(
+            ScanKind::CodebuddyIndex,
+            &root,
+            "codebuddy-ide",
+            paths.clone(),
+            "1970-01-01",
+            &mut cache,
+            &mut seen,
+        );
+        let elapsed = t0.elapsed().as_millis();
+        let dedup_total = view["summary"]["total"].as_u64().unwrap_or(0);
+        // 对照：不做跨文件去重（各文件全量聚合并列相加，即修复前的口径）
+        let raw_total: u64 = cache
+            .values()
+            .map(|e| {
+                e.days
+                    .values()
+                    .map(|d| d.input.saturating_add(d.output).saturating_add(d.write))
+                    .sum::<u64>()
+            })
+            .sum();
+        let dup = raw_total.saturating_sub(dedup_total);
+        let pct = if raw_total > 0 {
+            dup as f64 / raw_total as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "[probe] 会话索引 {} 个：去重前 total={raw_total}，去重后 total={dedup_total}，\
+             多计 {dup}（{pct:.1}%）；聚合耗时 {elapsed}ms",
+            paths.len()
+        );
+    }
+
     /// 端到端：夹具目录 → 计入 complete/canceled、跳过 running 与全 0、同 id 去重、
     /// 模型取工作区索引 modelMap[type]、项目维度记常量。
     #[test]
@@ -1310,8 +1495,11 @@ mod tests {
         .unwrap();
 
         let mut memo: HashMap<String, Value> = HashMap::new();
-        let entry = parse_codebuddy_index(&session.join("index.json"), &mut memo);
+        let entry = parse_codebuddy_index(&session.join("index.json"), &mut memo, None);
         assert_eq!(entry.parse_errors, 0);
+        // 只登记**实际计入**的 id（r1 会话内重复只算一次、r2 running 与 r3 全 0 跳过）
+        assert_eq!(entry.ids.len(), 2, "应只登记 r1/r4: {:?}", entry.ids);
+        assert!(entry.ids.iter().any(|id| id == "r1") && entry.ids.iter().any(|id| id == "r4"));
         let day = entry.days.get(&expected_day).expect("应有当日聚合");
         assert_eq!(day.calls, 2);
         assert_eq!(day.input, 1007);

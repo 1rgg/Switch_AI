@@ -10,6 +10,7 @@ mod icube_auth;
 mod jwt;
 mod models;
 mod notify;
+mod pe_version;
 mod state;
 mod store;
 mod switcher;

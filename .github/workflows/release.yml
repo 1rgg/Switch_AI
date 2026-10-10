@@ -138,6 +138,58 @@ jobs:
           path: release/windows/*
           if-no-files-found: error
 
+      # 组装 Release 正文：从 CHANGELOG.md 抽取当前版本条目作为「版本说明」，
+      # 再拼接下载说明 / 运行要求。找不到对应条目即失败（避免发出无说明的版本）。
+      - name: Compose release body (CHANGELOG)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('fs').readFileSync('src-tauri/Cargo.toml','utf8').match(/^version\s*=\s*\"([0-9]+\.[0-9]+\.[0-9]+)\"/m)[1]")
+          node -e '
+            const { readFileSync, writeFileSync } = require("node:fs");
+            const ver = process.argv[1];
+            const lines = readFileSync("CHANGELOG.md", "utf8").split(/\r?\n/);
+            const start = lines.findIndex((l) => l.startsWith("## [") && l.includes(ver));
+            if (start < 0) { console.error(`::error::CHANGELOG 中未找到 ${ver} 的版本说明`); process.exit(1); }
+            let end = lines.length;
+            for (let i = start + 1; i < lines.length; i++) {
+              if (lines[i].startsWith("## [")) { end = i; break; }
+            }
+            const notesArr = lines.slice(start, end);
+            // 去掉尾部空行与版本分隔线（---），避免正文末尾拖一条横线
+            while (notesArr.length && (notesArr[notesArr.length - 1].trim() === "" || /^-{3,}$/.test(notesArr[notesArr.length - 1].trim()))) {
+              notesArr.pop();
+            }
+            const notes = notesArr.join("\n").trim();
+            const body = [
+              "## Switch AI · Windows 安装包",
+              "",
+              "基于 [TraeWorkAssistant](https://github.com/smart-open/TraeWorkAssistant)（AI Work 助手）二次开发，",
+              "新增 **WorkBuddy 国际版（workbuddy.ai）** 支持。",
+              "",
+              "### 版本说明",
+              "",
+              notes,
+              "",
+              "### 下载说明",
+              "| 文件 | 说明 |",
+              "| --- | --- |",
+              "| `*_x64-setup.exe` | NSIS 安装包（推荐，支持原地升级） |",
+              "| `*.msi` | MSI 安装包（企业分发；跨产品标识升级需先卸载旧版） |",
+              "| `*_x64_portable.zip` | 便携版（解压即用，无需安装） |",
+              "",
+              "### 运行要求",
+              "- Windows 10/11 x64",
+              "- WebView2 Runtime（Win11 及较新 Win10 通常已内置）",
+              "",
+              "> 首次使用请阅读仓库 README 的「WorkBuddy 国际版」一节了解区域选择与账号录入方式。",
+              "> 本工具与 WorkBuddy / Trae / CodeBuddy 等官方产品均无关联，仅供学习研究。",
+            ].join("\n");
+            writeFileSync("release/RELEASE_BODY.md", body);
+            console.log(`release 正文已生成：含 ${ver} 版本说明（${notes.split("\n").length} 行）`);
+          ' "$VERSION"
+          ls -la release/RELEASE_BODY.md
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -145,23 +197,4 @@ jobs:
           name: ${{ github.event.inputs.tag || github.ref_name }}
           files: release/windows/*
           draft: false
-          generate_release_notes: true
-          body: |
-            ## Switch AI · Windows 安装包
-
-            基于 [TraeWorkAssistant](https://github.com/smart-open/TraeWorkAssistant)（AI Work 助手）二次开发，
-            新增 **WorkBuddy 国际版（workbuddy.ai）** 支持。
-
-            ### 下载说明
-            | 文件 | 说明 |
-            | --- | --- |
-            | `*_x64-setup.exe` | NSIS 安装包（推荐，支持原地升级） |
-            | `*.msi` | MSI 安装包（企业分发；跨产品标识升级需先卸载旧版） |
-            | `*_x64_portable.zip` | 便携版（解压即用，无需安装） |
-
-            ### 运行要求
-            - Windows 10/11 x64
-            - WebView2 Runtime（Win11 及较新 Win10 通常已内置）
-
-            > 首次使用请阅读仓库 README 的「WorkBuddy 国际版」一节了解区域选择与账号录入方式。
-            > 本工具与 WorkBuddy / Trae / CodeBuddy 等官方产品均无关联，仅供学习研究。
+          body_path: release/RELEASE_BODY.md
