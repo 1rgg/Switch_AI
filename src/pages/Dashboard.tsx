@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
 import SetupGuide from '../components/SetupGuide';
+import CertManualGuide, { caCerExists } from '../components/CertManualGuide';
 import { StatCard } from '../components/ui';
 import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
@@ -35,6 +36,10 @@ export default function Dashboard() {
   const isDark = useIsDark();
   // 近 30 天签到结果趋势（堆叠柱状图数据，T8）
   const [trends, setTrends] = useState<CheckinTrendPoint[]>([]);
+  // 证书一键安装失败后展开手动导入指引（issue #12/#79）
+  const [showCertGuide, setShowCertGuide] = useState(false);
+  // F10：刷新防重入 + 按钮 loading 态
+  const [refreshing, setRefreshing] = useState(false);
 
   const loadTrends = async () => {
     try {
@@ -115,22 +120,34 @@ export default function Dashboard() {
   };
 
   const refresh = async () => {
+    // F10：防重入——连点会重复触发逐账号上游积分查询
+    if (refreshing) return;
+    setRefreshing(true);
     toast('info', '刷新中…');
-    const s = useAppStore.getState();
-    await Promise.all([
-      s.refreshEnv(),
-      s.refreshCert(),
-      s.refreshProxy(),
-      s.refreshApiStatus(),
-      s.refreshAccounts(),
-      s.refreshGroups(),
-      s.refreshCreditsHistory(),
-      s.refreshLocalEntitlement(),
-      loadTrends(),
-    ]);
-    // 刷新剩余可用积分（会再次 refreshAccounts 更新 UI）
-    void api.accounts.refreshRemainingCredits().then(() => s.refreshAccounts()).catch(() => {});
-    toast('success', '已刷新');
+    try {
+      const s = useAppStore.getState();
+      await Promise.all([
+        s.refreshEnv(),
+        s.refreshCert(),
+        s.refreshProxy(),
+        s.refreshApiStatus(),
+        s.refreshAccounts(),
+        s.refreshGroups(),
+        s.refreshCreditsHistory(),
+        s.refreshLocalEntitlement(),
+        loadTrends(),
+      ]);
+      // F10：「已刷新」提示移到积分查询完成后——原实现后台运行即提示，语义不准
+      try {
+        await api.accounts.refreshRemainingCredits();
+        await s.refreshAccounts();
+      } catch {
+        /* 积分刷新失败不阻断整体刷新提示 */
+      }
+      toast('success', '已刷新');
+    } finally {
+      setRefreshing(false);
+    }
   };
 
   // 本机套餐徽标：两个 Trae 应用当前登录账号的套餐（storage.json 明文缓存）
@@ -171,8 +188,8 @@ export default function Dashboard() {
         title="Trae · 概览"
         desc="多账号签到与账号管理总览 · 登录账号 / 套餐 / 告警提醒 · 签到趋势与积分榜"
         actions={
-          <button onClick={refresh} className="btn-outline">
-            <RefreshCw size={15} /> 刷新
+          <button onClick={() => void refresh()} disabled={refreshing} className="btn-outline">
+            <RefreshCw size={15} className={refreshing ? 'animate-spin' : ''} /> 刷新
           </button>
         }
       />
@@ -247,12 +264,20 @@ export default function Dashboard() {
                 toast('success', '证书安装成功（可在 certmgr「受信任的根证书颁发机构」中搜索 TraeDeviceProxyCA 验证）');
               } catch (e) {
                 toast('error', `证书安装失败：${String(e)}`);
+                // ca.cer 已生成（安装阶段失败）才弹手动导入指引；ca.cer 未生成
+                // （ensure_ca 失败）时指引无意义，仅保留报错 toast
+                if (await caCerExists()) setShowCertGuide(true);
               }
             }}
             className="btn-primary"
           >
             一键安装证书
           </button>
+        </div>
+      )}
+      {showCertGuide && !certInstalled && (
+        <div className="mt-3 card overflow-hidden">
+          <CertManualGuide onClose={() => setShowCertGuide(false)} />
         </div>
       )}
 

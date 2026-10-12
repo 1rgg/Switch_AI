@@ -153,6 +153,7 @@ fn main() {
             commands::env::codebuddy_env_check,
             commands::cert::cert_status,
             commands::cert::cert_install,
+            commands::cert::cert_open_folder,
             commands::proxy::proxy_start,
             commands::proxy::proxy_stop,
             commands::proxy::proxy_status,
@@ -404,6 +405,17 @@ fn main() {
                 &format!(
                     "应用启动: tray=enabled, launch_minimized={}, auto_start_proxy={}, auto_start_api={}",
                     settings.launch_minimized, settings.auto_start_proxy, settings.auto_start_api
+                ),
+            );
+
+            // P2（审查）：调度按 chrono::Local 触发，生效时区不可观测——TZ 被
+            // 覆盖/清空时签到时刻会静默偏移，启动日志输出生效时区偏移与本地时间
+            fs_utils::app_log(
+                &state.data_dir,
+                &format!(
+                    "生效时区: 偏移{}，本地时间 {}",
+                    chrono::Local::now().format("%:z"),
+                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
                 ),
             );
 
