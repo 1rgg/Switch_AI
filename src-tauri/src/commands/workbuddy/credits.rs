@@ -782,6 +782,73 @@ struct RegionUsageAgg {
     accounts_ok: usize,
 }
 
+/// 版本标注校验结果（Switch AI：积分看板国际版串版守卫）。
+///
+/// 为什么需要：看板按账号**显式 region 字段**分桶，而实际请求域名由
+/// `resolve_region(显式, 凭证)` 决定。二者不一致时（典型：国际版账号被导入通道
+/// 按默认国内版录入、或旧版数据没有 region），该账号的消耗会被归进**国内版桶**
+/// 却被实际发往 workbuddy.ai —— 用户切到「国际版」看到空的、切「国内版」反而
+/// 看到国际版账号的数据。这是「积分统计显示不对」的第二类成因，且**静默**。
+///
+/// 判定只依据凭证里**可验证的 domain 事实**（不猜、不按账号名推断）：
+/// - 凭证 domain 指向国际站，而显式 region 判为国内版 → 标注可疑；
+/// - 凭证 domain 指向国内站，而显式 region 判为国际版 → 同样可疑。
+/// 无 domain 的凭证不判定（凭证本身不携带区域事实，无从校验，避免误报）。
+struct RegionLabelMismatch {
+    account_id: String,
+    /// 池内标注的区域（分桶所用）
+    declared: &'static str,
+    /// 凭证 domain 推断的区域（实际请求所用）
+    actual: &'static str,
+}
+
+/// 校验单个账号的版本标注是否与凭证 domain 一致（纯函数，便于单测）。
+///
+/// 返回 Some 表示「显式标注与凭证域名事实矛盾」；None 表示一致或无从校验
+/// （无显式标注 / 无 domain / 自定义域名 URL 不可归类）。
+fn check_region_label(explicit_region: &str, raw_domain: &str) -> Option<(&'static str, &'static str)> {
+    // 无显式标注：分桶本就按 domain 推断，与 resolve_region 同源，不存在矛盾
+    if explicit_region.trim().is_empty() {
+        return None;
+    }
+    // 无 domain：凭证不携带区域事实，无从校验（不臆测）
+    let d = raw_domain.trim();
+    if d.is_empty() {
+        return None;
+    }
+    // 自定义 URL / 非 WorkBuddy 域名：from_domain 会回落 CN，据此判定会误报，
+    // 仅在域名可明确归类为两站之一时才校验
+    let host = d
+        .rsplit("://")
+        .next()
+        .unwrap_or(d)
+        .split('/')
+        .next()
+        .unwrap_or(d)
+        .split(':')
+        .next()
+        .unwrap_or(d)
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    let known = |h: &str| {
+        h == "workbuddy.ai"
+            || h.ends_with(".workbuddy.ai")
+            || h == "codebuddy.ai"
+            || h.ends_with(".codebuddy.ai")
+            || h == "workbuddy.cn"
+            || h.ends_with(".workbuddy.cn")
+            || h == "codebuddy.cn"
+            || h.ends_with(".codebuddy.cn")
+            || h == "copilot.tencent.com"
+    };
+    if !known(&host) {
+        return None;
+    }
+    let declared = crate::tasks::wb_common::WbRegion::parse(explicit_region);
+    let actual = crate::tasks::wb_common::WbRegion::from_domain(d);
+    (declared != actual).then(|| (declared.as_str(), actual.as_str()))
+}
+
 /// 单账号请求明细保留上限（M6 积分看板「请求用量」分栏，对齐 Switch-API 口径）：
 /// 上游近 31 天可达上万条，明细只用于排查「哪几笔最贵」；合计/趋势/模型排行
 /// 仍走全量聚合（不受本上限影响），故截断不失真。
@@ -1039,8 +1106,10 @@ pub(crate) fn workbuddy_usage_official_all_impl(
             let fetched = cached.get("fetched_at_ms").and_then(Value::as_i64).unwrap_or(0);
             // schema_version 门禁：v2 起才带「按版本（国内/国际）拆分 + 请求用量明细」。
             // 旧结构缓存直接视为未命中重拉——否则看板的版本切换会静默无数据可切。
-            let v2 = cached.get("schema_version").and_then(Value::as_i64) == Some(2);
-            if v2 && chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000 {
+            // v2 = 按版本拆分 + 请求用量明细；v3 = 追加 region_mismatches（版本标注校验）。
+            // 用 >= 而非 ==：后续再升版号时旧缓存不该被误判为「未命中」而每轮重拉。
+            let schema = cached.get("schema_version").and_then(Value::as_i64).unwrap_or(0);
+            if schema >= 2 && chrono::Utc::now().timestamp_millis() - fetched < 10 * 60_000 {
                 return Ok(cached.clone());
             }
             // SWR：转后台刷新并先回旧值（标记 stale，前端已兼容该字段——失败回退同款）
@@ -1146,11 +1215,34 @@ pub(crate) fn workbuddy_usage_official_all_impl(
         std::collections::HashMap::new();
     let mut accounts_out: Vec<serde_json::Value> = Vec::new();
     let mut requests_out: Vec<serde_json::Value> = Vec::new();
+    // 版本标注校验（Switch AI）：显式 region 与凭证 domain 矛盾的账号——
+    // 其消耗会被归到「声明版本」桶，而实际请求打在「凭证域名」区域，导致看板串版
+    let mut region_mismatches: Vec<RegionLabelMismatch> = Vec::new();
     let mut ok = 0usize;
     let mut req_total = 0u64;
     for (id, token, domain) in &list {
         let rkey = region_of(id);
         let aname = name_of(id);
+        // 校验：分桶键 rkey 由 resolve_region(显式, 凭证) 得出，此处独立核对
+        // 「显式标注」与「凭证 domain 事实」是否自相矛盾
+        let explicit = pool
+            .accounts
+            .iter()
+            .find(|a| a.id == *id)
+            .map(|a| a.region.clone())
+            .unwrap_or_default();
+        let raw_domain = tokens
+            .get(id)
+            .and_then(|r| fs_utils::dig(r, &["domain"]))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if let Some((declared, actual)) = check_region_label(&explicit, raw_domain) {
+            region_mismatches.push(RegionLabelMismatch {
+                account_id: id.to_string(),
+                declared,
+                actual,
+            });
+        }
         let agg = region_aggs.entry(rkey.to_string()).or_default();
         agg.accounts_total += 1;
         match usage_official_fetch(id, token, domain) {
@@ -1325,11 +1417,23 @@ pub(crate) fn workbuddy_usage_official_all_impl(
         );
     }
 
+    let mismatches_out: Vec<Value> = region_mismatches
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "account_id": m.account_id,
+                "declared": m.declared,
+                "actual": m.actual,
+            })
+        })
+        .collect();
+
     let payload = serde_json::json!({
         "status": "complete",
         "source": "official_all",
         // v2：新增按版本拆分（daily/models/summary_by_region）+ 账号级 account 列表 + 请求用量明细
-        "schema_version": 2,
+        // v3：新增 region_mismatches（版本标注与凭证域名矛盾的账号，看板据此提示纠偏）
+        "schema_version": 3,
         "accounts_total": list.len(),
         "accounts_ok": ok,
         "range_start": start.format("%Y-%m-%d").to_string(),
@@ -1349,6 +1453,9 @@ pub(crate) fn workbuddy_usage_official_all_impl(
         "daily_by_region": daily_by_region,
         "models_by_region": models_by_region,
         "summary_by_region": summary_by_region,
+        // 版本标注可疑账号（显式 region 与凭证 domain 矛盾）：前端据此提示用户纠偏，
+        // 而不是让「切到国际版看到国内数据 / 切国内版看到国际数据」静默发生
+        "region_mismatches": mismatches_out,
     });
     let _ = crate::store::db(&state.data_dir).kv_set(cache_path, &payload);
     fs_utils::app_log(
@@ -1743,6 +1850,67 @@ mod credits_tests {
         // 不可解析 / 缺字段
         assert_eq!(usage_row_ts(&serde_json::json!({ "requestTime": "nonsense" })), None);
         assert_eq!(usage_row_ts(&serde_json::json!({})), None);
+    }
+
+    // ── check_region_label（Switch AI：版本标注校验守卫）────────────────────
+
+    #[test]
+    fn check_region_label_flags_contradiction_both_directions() {
+        // 声明国内版、凭证域名却是国际站 → 可疑（实际请求发往 workbuddy.ai）
+        assert_eq!(
+            check_region_label("cn", "www.workbuddy.ai"),
+            Some(("cn", "global"))
+        );
+        // 声明国际版、凭证域名却是国内站 → 同样可疑（反向对称）
+        assert_eq!(
+            check_region_label("global", "www.workbuddy.cn"),
+            Some(("global", "cn"))
+        );
+        // 同区兄弟站同样按区域事实判定
+        assert_eq!(
+            check_region_label("cn", "www.codebuddy.ai"),
+            Some(("cn", "global"))
+        );
+    }
+
+    #[test]
+    fn check_region_label_accepts_consistent_pairs() {
+        assert_eq!(check_region_label("cn", "www.workbuddy.cn"), None);
+        assert_eq!(check_region_label("global", "www.workbuddy.ai"), None);
+        assert_eq!(check_region_label("cn", "copilot.tencent.com"), None);
+        assert_eq!(check_region_label("cn", "codebuddy.cn"), None);
+        // 显式标注的各种国际版写法（intl/oversea/…）都归一到 global 语义
+        assert_eq!(check_region_label("intl", "workbuddy.ai"), None);
+        assert_eq!(check_region_label("oversea", "www.workbuddy.ai"), None);
+    }
+
+    #[test]
+    fn check_region_label_skips_unverifiable_cases() {
+        // 无显式标注：分桶按 domain 推断，与 resolve_region 同源，不存在矛盾
+        assert_eq!(check_region_label("", "www.workbuddy.ai"), None);
+        assert_eq!(check_region_label("   ", "www.workbuddy.cn"), None);
+        // 无 domain：凭证不携带区域事实，不臆测
+        assert_eq!(check_region_label("global", ""), None);
+        assert_eq!(check_region_label("cn", "   "), None);
+        // 自定义/未知域名：from_domain 会回落 CN，据此判定会误报 → 不校验
+        assert_eq!(check_region_label("global", "my-proxy.internal"), None);
+        assert_eq!(check_region_label("global", "http://localhost:8080"), None);
+    }
+
+    #[test]
+    fn check_region_label_handles_url_and_case_variants() {
+        // 带协议 / 端口 / 前导点 / 大小写都必须正确识别（否则守卫会漏报或误报）
+        assert_eq!(
+            check_region_label("cn", "https://www.workbuddy.ai/path"),
+            Some(("cn", "global"))
+        );
+        assert_eq!(
+            check_region_label("cn", "WWW.WorkBuddy.AI:443"),
+            Some(("cn", "global"))
+        );
+        assert_eq!(check_region_label("cn", ".workbuddy.ai"), Some(("cn", "global")));
+        // 后缀伪造不得判为国际站（避免把国内账号误报成标注错误）
+        assert_eq!(check_region_label("cn", "workbuddy.ai.evil.com"), None);
     }
 
     // ── earliest_pack_expire（issue #28：Buddy 调度到期派生）────────────────

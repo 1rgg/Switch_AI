@@ -49,18 +49,49 @@ export function traeUsageToPoints(usage: UsageHistoryResult | null): BoardPoint[
 }
 
 /**
+ * 取指定版本的逐日序列。
+ *
+ * 关键修正（积分统计 · 官网源 · 国际版显示串版）：
+ * 旧写法 `r.daily_by_region?.[region] ?? r.daily` 在**该版本桶缺失**时静默回落
+ * **全量**数据。而后端的 `daily_by_region` 只为「实际遍历到的账号所属版本」建桶
+ * ——例如池内只有国内账号（或账号被误标为 CN）时就没有 `global` 键，于是用户切到
+ * 「国际版」看到的其实是国内版的数字，正是「数据不对」的表象。
+ * 版本桶缺失 = 该版本确实没有数据，返回空序列由调用方走空态/口径提示，
+ * 绝不拿另一版本的数据冒充（口径诚实红线）。
+ *
+ * 仍保留一处回落：调用方传入 'all'（合并视图 / 后端为旧结构缓存无分桶）时用全量。
+ */
+function regionDaily(
+  r: WbUsageOfficialAll,
+  region: WbRegionFilter,
+): { date: string; usage: number }[] {
+  if (region === 'all') return r.daily ?? [];
+  // v2 结构存在但该版本桶缺失：如实返回空，不跨版本回落
+  return r.daily_by_region?.[region] ?? [];
+}
+
+/**
  * Buddy 官网用量聚合（workbuddy_usage_official_all，日合计，31 天零填充）。
- * region = 'cn' / 'global' 且后端返回了 `daily_by_region` 时取该版本的序列；
- * 其余（合并视图 / 旧结构缓存）回落全量 `daily`——不静默造数，缺哪个版本就走合并口径。
+ * region = 'cn' / 'global' 时取该版本的序列（缺失即空，不跨版本回落）；
+ * 'all' 或后端为旧结构（无 `daily_by_region`）时用全量 `daily`。
  */
 export function wbOfficialAllToPoints(
   r: WbUsageOfficialAll | null,
   region: WbRegionFilter = 'all',
 ): BoardPoint[] {
   if (!r) return [];
-  const daily =
-    region !== 'all' ? (r.daily_by_region?.[region] ?? r.daily) : r.daily;
-  return daily.map((d) => ({ date: d.date.slice(0, 10), credits: d.usage, models: {} }));
+  return regionDaily(r, region).map((d) => ({
+    date: d.date.slice(0, 10),
+    credits: d.usage,
+    models: {},
+  }));
+}
+
+/** 该版本是否真的存在于后端分桶中（用于空态与口径提示，避免「0」与「无此版本」混淆） */
+export function wbRegionAvailable(r: WbUsageOfficialAll | null, region: WbRegionFilter): boolean {
+  if (!r) return false;
+  if (region === 'all') return true;
+  return Object.prototype.hasOwnProperty.call(r.daily_by_region ?? {}, region);
 }
 
 /** Buddy 积分看板「版本」维度：国内版 / 国际版 / 合并（对齐 Switch-API RegionFilter） */
@@ -73,14 +104,14 @@ export const REGION_LABELS: Record<WbRegionFilter, string> = {
   all: '合并',
 };
 
-/** 指定版本的模型汇总；无该版本分桶时回落全量（调用方据此标注口径） */
+/** 指定版本的模型汇总；该版本桶缺失时返回空（不跨版本回落，理由同 regionDaily） */
 export function wbOfficialModels(
   r: WbUsageOfficialAll | null,
   region: WbRegionFilter,
 ): WbUsageModelPoint[] {
   if (!r) return [];
-  if (region !== 'all') return r.models_by_region?.[region] ?? (r.models ?? []);
-  return r.models ?? [];
+  if (region === 'all') return r.models ?? [];
+  return r.models_by_region?.[region] ?? [];
 }
 
 /**

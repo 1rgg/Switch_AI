@@ -35,6 +35,7 @@ import {
   wbFallbackToPoints,
   wbOfficialAllToPoints,
   wbOfficialModels,
+  wbRegionAvailable,
   wbSnapshotEarnedByDate,
   type WbRegionFilter,
 } from './adapters';
@@ -138,6 +139,9 @@ export default function CreditsTab({
   // 版本维度是否可用：Buddy + 官网源 + 后端返回 v2 结构（含按版本分桶）
   const regionAvailable = buddyActive && source === 'official' && !!wbOfficial?.daily_by_region;
   const effectiveRegion: WbRegionFilter = regionAvailable ? region : 'all';
+  // 所选版本在缓存里是否真的有分桶：无该版本账号时后端不会建桶，
+  // 此时必须如实走空态，而不是回落合并口径把另一版本的数当成它（口径诚实）
+  const regionBucketPresent = wbRegionAvailable(wbOfficial, effectiveRegion);
   // Qoder 网关源 = 积分测量口径（issue #82 T2.4）：网关从上游 usage.credits 提取实测值，
   // 含模型粒度（DayStats.model_credits）；Trae/Buddy 网关仍为请求数口径（api_usage 不记积分扣减）
   const isGatewayCredits = isGateway && qoderActive;
@@ -415,12 +419,48 @@ export default function CreditsTab({
           {regionAvailable ? (
             <span className="text-xs text-slate-400">
               {effectiveRegion === 'all'
-                ? `国内版 ${wbOfficial?.summary_by_region?.cn?.accounts_ok ?? 0} 个账号 · 国际版 ${wbOfficial?.summary_by_region?.global?.accounts_ok ?? 0} 个账号（取数成功）`
-                : `${REGION_LABELS[effectiveRegion]}取数成功 ${wbOfficial?.summary_by_region?.[effectiveRegion]?.accounts_ok ?? 0}/${wbOfficial?.summary_by_region?.[effectiveRegion]?.accounts_total ?? 0} 个账号`}
+                ? // 逐版本如实列出**存在分桶**的版本：只在池内没有该版本账号时该版本才缺席，
+                  // 旧写法硬读 cn/global 两侧并把缺席当 0，纯国际版部署会显示「国内版 0 个账号」
+                  REGION_KEYS.filter((rk) => rk !== 'all' && wbRegionAvailable(wbOfficial, rk))
+                    .map(
+                      (rk) =>
+                        `${REGION_LABELS[rk]} ${wbOfficial?.summary_by_region?.[rk]?.accounts_ok ?? 0} 个账号`,
+                    )
+                    .join(' · ') || '缓存内暂无可归类的账号版本'
+                : !regionBucketPresent
+                  ? `缓存内没有${REGION_LABELS[effectiveRegion]}账号（消耗为空属正常，点「刷新数据」重拉）`
+                  : `${REGION_LABELS[effectiveRegion]}取数成功 ${wbOfficial?.summary_by_region?.[effectiveRegion]?.accounts_ok ?? 0}/${wbOfficial?.summary_by_region?.[effectiveRegion]?.accounts_total ?? 0} 个账号`}
             </span>
           ) : (
             <span className="text-xs text-slate-400">当前为合并口径（缓存未含版本拆分，刷新数据后可按版本查看）</span>
           )}
+        </div>
+      )}
+
+      {/* 版本标注纠偏提示（Switch AI）：账号显式 region 与凭证 domain 指向不同区域时，
+          其消耗会被归进「声明版本」桶而请求实际打在另一区域 —— 这正是「切到某版本
+          看到另一版本数据」的第二类成因，必须显式告知而不是静默串版。 */}
+      {buddyActive && source === 'official' && (wbOfficial?.region_mismatches?.length ?? 0) > 0 && (
+        <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-300">
+          <div className="font-medium">
+            发现 {wbOfficial?.region_mismatches?.length} 个账号的版本标注与凭证域名不一致
+          </div>
+          <div className="mt-1 text-amber-700 dark:text-amber-400/90">
+            这些账号的消耗会算进「标注版本」，但请求实际发往「凭证域名」的区域，可能导致版本口径串位。
+            请在「Buddy → 账号管理」把区域改正确（或重新扫码/导入）后点「刷新数据」：
+            <ul className="mt-1 list-inside list-disc">
+              {wbOfficial?.region_mismatches?.slice(0, 5).map((m) => (
+                <li key={m.account_id}>
+                  <span className="font-mono">{m.account_id}</span>：标注
+                  {REGION_LABELS[m.declared === 'global' ? 'global' : 'cn']}，凭证域名指向
+                  {REGION_LABELS[m.actual === 'global' ? 'global' : 'cn']}
+                </li>
+              ))}
+            </ul>
+            {(wbOfficial?.region_mismatches?.length ?? 0) > 5 && (
+              <span>（仅列出前 5 个）</span>
+            )}
+          </div>
         </div>
       )}
 
@@ -596,7 +636,9 @@ export default function CreditsTab({
                       ? '网关从上游 usage 提取到积分测量值后展示（上游未下发 usage 的请求不计入）。'
                       : qoderActive
                         ? '本地快照出现消耗差分后展示；Qoder 官网无按日明细接口。'
-                        : '点击右上角「刷新数据」拉取消耗明细；Buddy 官网源仅覆盖近 31 天。'
+                        : regionAvailable && !regionBucketPresent
+                          ? `缓存内没有${REGION_LABELS[effectiveRegion]}账号的官方用量——请确认账号版本标注正确，或点「刷新数据」重拉（本视图不会用其他版本的数据顶替）。`
+                          : '点击右上角「刷新数据」拉取消耗明细；Buddy 官网源仅覆盖近 31 天。'
                 }
               />
             ) : (
@@ -664,7 +706,9 @@ export default function CreditsTab({
               emptyHint={
                 source === 'official'
                   ? scope === 'buddy'
-                    ? 'Buddy 官网暂无模型消耗记录（31 天窗口），点「刷新数据」重拉后再试。'
+                    ? regionAvailable && !regionBucketPresent
+                      ? `缓存内没有${REGION_LABELS[effectiveRegion]}账号，故无该版本模型明细（不会用其他版本顶替）。`
+                      : 'Buddy 官网暂无模型消耗记录（31 天窗口），点「刷新数据」重拉后再试。'
                     : '该区间暂无模型粒度消耗记录。'
                   : source === 'local'
                     ? qoderActive

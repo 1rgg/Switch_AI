@@ -1364,6 +1364,21 @@ export interface WbUsageOfficialAll {
   models_by_region?: Record<string, WbUsageModelPoint[]>;
   /** 按版本拆分的汇总；v2 起提供 */
   summary_by_region?: Record<string, WbUsageRegionSummary>;
+  /**
+   * 版本标注与凭证域名矛盾的账号（v3 起提供）：显式标注的 region 与凭证 domain
+   * 所指向的区域不一致。这类账号的消耗会被归进「声明版本」桶，而请求实际打在
+   * 「凭证域名」区域——是「切到某版本看到另一版本数据」的成因，看板据此提示纠偏。
+   */
+  region_mismatches?: WbRegionMismatch[];
+}
+
+/** 版本标注可疑的账号（后端 region_mismatches 元素） */
+export interface WbRegionMismatch {
+  account_id: string;
+  /** 池内标注的区域（分桶所用）：`cn` / `global` */
+  declared: string;
+  /** 凭证 domain 推断的区域（实际请求所用）：`cn` / `global` */
+  actual: string;
 }
 
 /** 活动信息三端点聚合（F-51）：banner（公开）+ 付费类型 + 用量提醒 */
