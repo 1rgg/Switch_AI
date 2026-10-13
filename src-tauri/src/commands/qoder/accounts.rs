@@ -37,9 +37,22 @@ pub struct QoderAccountView {
     pub fingerprint: Option<String>,
     /// 完整设备指纹（§5.10；指纹查看弹框数据源）
     pub device_profile: Option<crate::tasks::qoder_device::QoderDeviceProfile>,
+    /// 共享标签 tag id 列表（account_tags 表联表填充，不改账号持久化结构，D3）
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
-fn view_of(a: &QoderAccount, tokens: &Value) -> QoderAccountView {
+fn account_tags_for(state: &AppState, id: &str) -> Vec<String> {
+    tag_map_cached(state).get(id).cloned().unwrap_or_default()
+}
+
+/// 全量 uid → tag_ids 映射（一次拉取；列表组装须复用此 map，禁止每账号重查——
+/// shared-groups-tags-design.md 风险表明确防 N+1）
+fn tag_map_cached(state: &AppState) -> std::collections::HashMap<String, Vec<String>> {
+    crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir))
+}
+
+fn view_of(a: &QoderAccount, tokens: &Value, tags: Vec<String>) -> QoderAccountView {
     let rec = tokens
         .get("tokens")
         .and_then(|t| t.get(&a.id));
@@ -75,6 +88,7 @@ fn view_of(a: &QoderAccount, tokens: &Value) -> QoderAccountView {
             // I12：按字符截取，防非 ASCII machine_id 触发字节切片 panic
             .map(|p| p.machine_id.chars().take(8).collect::<String>()),
         device_profile: a.device_profile.clone(),
+        tags,
     }
 }
 
@@ -93,7 +107,12 @@ pub async fn qoder_accounts_list(state: State<'_, AppState>) -> Result<Vec<Qoder
         }
         let accounts = load_pool(&st);
         let tokens = qoder_common::load_token_store(&st);
-        Ok(accounts.iter().map(|a| view_of(a, &tokens)).collect())
+        // 标签映射一次拉取复用（防 N+1：account_tags_for 逐账号重查全表为审查发现项）
+        let tag_map = tag_map_cached(&st);
+        Ok(accounts
+            .iter()
+            .map(|a| view_of(a, &tokens, tag_map.get(&a.id).cloned().unwrap_or_default()))
+            .collect())
     })
     .await
     .map_err(|e| format!("账号列表任务失败: {e}"))?
@@ -191,6 +210,11 @@ fn qoder_account_remove_impl(state: &AppState, app: &AppHandle, user_id: String)
     if !removed && !has_token {
         return Err(format!("账号不在池中: {user_id}"));
     }
+    // 共享标签绑定清理（审查修复，同 Trae/WB 删除路径）+ 成员/绑定变化失效 org 展开索引
+    if let Err(e) = crate::store::docs::account_tags_remove_account(&crate::store::db(&state.data_dir), &user_id) {
+        fs_utils::app_log(&state.data_dir, &format!("Qoder 账号 {user_id} 标签绑定清理失败: {e}"));
+    }
+    crate::api_server::org_index::invalidate(&state.data_dir);
     let rt = app.state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
     // I14：清理失败上抛（原先静默吞掉，悬空凭证难排查且用户无感知）
     if let Err(e) = qoder_common::remove_token(state, &user_id) {
@@ -342,7 +366,7 @@ pub async fn qoder_account_import_pat(
         accounts
             .iter()
             .find(|a| a.id == effective_id)
-            .map(|a| view_of(a, &tokens))
+            .map(|a| view_of(a, &tokens, account_tags_for(&st, &a.id)))
             .ok_or_else(|| "导入后读取账号失败".into())
     })
     .await
@@ -379,7 +403,7 @@ pub async fn qoder_account_refresh_token(
                 accounts
                     .iter()
                     .find(|a| a.id == account_id)
-                    .map(|a| view_of(a, &tokens))
+                    .map(|a| view_of(a, &tokens, account_tags_for(&st, &a.id)))
                     .ok_or_else(|| "续期后回读失败".to_string())
             }
             "no_credential" => Err("该账号无可用凭证，请先导入 PAT 或重新登录".into()),

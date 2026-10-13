@@ -65,6 +65,9 @@ pub struct AccountView {
     /// 必为空（earliest_expire 仅统计剩余 > 0 的包），回退分支不会虚增展示，两条路径等价
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub credit_packs: Vec<CreditPackDetail>,
+    /// 共享标签 tag id 列表（从 account_tags 表联表填充，不落账号持久化结构，D3）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -103,7 +106,7 @@ pub struct AccountsFile {
     pub accounts: Vec<RawAccount>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Group {
     pub id: String,
     pub name: String,
@@ -117,6 +120,16 @@ pub struct GroupsFile {
     pub groups: Vec<Group>,
     #[serde(default)]
     pub membership: HashMap<String, String>,
+}
+
+/// 共享标签定义（跨池一张表，与 Group 同构；id 前缀 tag_）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Tag {
+    pub id: String,
+    pub name: String,
+    pub color: String,
+    #[serde(default)]
+    pub order: i32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -207,18 +220,24 @@ pub struct Settings {
     #[serde(default = "default_wb_checkin_hhmm")]
     pub wb_checkin_hhmm: String,
     // ── 看板数据定时同步（积分/Token/模型；调度器 credits/models 两类任务） ──
-    /// Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM，默认）
+    /// Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）| every_hours（每N小时，默认）
     #[serde(default = "default_credits_sync_mode")]
     pub wb_credits_sync_mode: String,
     /// Buddy 积分与 Token 同步触发时刻 HH:MM（daily 模式生效，默认 23:30 对齐原快照时刻）
     #[serde(default = "default_wb_credits_sync_hhmm")]
     pub wb_credits_sync_hhmm: String,
-    /// Trae 积分数据同步模式：off | hourly（默认，issue #61 看板数据保持新鲜）| daily
+    /// Buddy 积分与 Token 同步间隔小时数（every_hours 模式生效，默认 2，合法范围 1..=24）
+    #[serde(default = "default_credits_sync_hours")]
+    pub wb_credits_sync_hours: String,
+    /// Trae 积分数据同步模式：off | hourly | daily | every_hours（每N小时，默认）
     #[serde(default = "default_trae_credits_sync_mode")]
     pub trae_credits_sync_mode: String,
     /// Trae 积分同步触发时刻 HH:MM（daily 模式生效，默认 23:40 对齐原快照时刻）
     #[serde(default = "default_trae_credits_sync_hhmm")]
     pub trae_credits_sync_hhmm: String,
+    /// Trae 积分同步间隔小时数（every_hours 模式生效，默认 2，合法范围 1..=24）
+    #[serde(default = "default_credits_sync_hours")]
+    pub trae_credits_sync_hours: String,
     /// Buddy 上游模型目录每日同步开关（资源调度页，默认开；无账号时调度静默跳过）
     #[serde(default = "default_true")]
     pub wb_catalog_sync_enabled: bool,
@@ -256,6 +275,9 @@ pub struct Settings {
     /// Server酱 SendKey（空 = 关闭）
     #[serde(default)]
     pub notify_serverchan_sendkey: Option<String>,
+    /// 会话明细概述显示开关（issue #82 T6.1，默认开；关闭仅隐藏 UI 展示，不删存量缓存）
+    #[serde(default = "default_true")]
+    pub sessions_preview_enabled: bool,
     /// WorkBuddy 桌面版 exe 手动路径（切换桥 workbuddy 档案 settings_key；环境配置页持久化）
     #[serde(default)]
     pub workbuddy_path: Option<String>,
@@ -371,12 +393,16 @@ fn default_qoder_checkin_hhmm() -> String {
 fn default_qoder_credits_sync_hhmm() -> String {
     "23:40".into()
 }
+/// 看板同步默认每 2 小时（会话明细需随账号定时落盘；issue #82）
 fn default_credits_sync_mode() -> String {
-    "daily".into()
+    "every_hours".into()
 }
-/// Trae 看板数据同步默认每小时（issue #61：积分快照 + 消耗明细随调度保持新鲜）
 fn default_trae_credits_sync_mode() -> String {
-    "hourly".into()
+    "every_hours".into()
+}
+/// every_hours 模式默认间隔（小时）
+fn default_credits_sync_hours() -> String {
+    "2".into()
 }
 fn default_wb_credits_sync_hhmm() -> String {
     "23:30".into()
@@ -493,6 +519,11 @@ pub struct CreditsDailySnapshot {
     pub total: f64,
     pub earned: f64,
     pub consumed: f64,
+    /// 逐账号 earned 维度（uid → 当日获得积分；issue #82 问题4-1：
+    /// 看板「区间总获得」按分组/账号筛选时用此维度求和）。
+    /// 空 map = 老快照行无账号明细（前端筛选时该日不计入过滤后合计并如实标注）。
+    #[serde(default)]
+    pub accounts: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -621,9 +652,17 @@ pub struct ApiPoolFile {
     /// Qoder 池入池白名单（qd- 前缀账号 id）；空 = fail-open 全部含凭证账号入池
     #[serde(default)]
     pub qoder_enabled_uids: Vec<String>,
-    /// Qoder 池分组筛选（Qoder 账号 group_id，qoder_groups 分组体系）；空 = 不限分组
+    /// Qoder 池分组筛选（Qoder 账号 group_id，共享分组体系）；空 = 不限分组
     #[serde(default)]
     pub qoder_group_ids: Vec<String>,
+    /// 各池标签筛选（共享标签 tag id；空 = 不限）。与分组筛选取交集（D5：
+    /// 均空 = 不限；仅一方非空 = 该维度成员集）
+    #[serde(default)]
+    pub trae_tag_ids: Vec<String>,
+    #[serde(default)]
+    pub wb_tag_ids: Vec<String>,
+    #[serde(default)]
+    pub qoder_tag_ids: Vec<String>,
     /// WorkBuddy 上游开关（T2.1）：开启后 WB 目录模型路由到 WB 账号池
     #[serde(default)]
     pub wb_enabled: bool,
@@ -769,6 +808,9 @@ impl Default for ApiPoolFile {
             qoder_strategy: String::new(),
             qoder_enabled_uids: Vec::new(),
             qoder_group_ids: Vec::new(),
+            trae_tag_ids: Vec::new(),
+            wb_tag_ids: Vec::new(),
+            qoder_tag_ids: Vec::new(),
         }
     }
 }

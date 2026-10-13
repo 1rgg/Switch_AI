@@ -43,6 +43,7 @@ function mergeCounters(a: UsageCounterView[], b: UsageCounterView[]): UsageCount
       e.requests += c.requests;
       e.ok += c.ok;
       e.errors += c.errors;
+      e.credits += c.credits;
     } else {
       map.set(c.name, { ...c });
     }
@@ -85,6 +86,8 @@ function mergeDay(a: UsageDayView, b: UsageDayView): UsageDayView {
     stream_requests: a.stream_requests + b.stream_requests,
     prompt_tokens: a.prompt_tokens + b.prompt_tokens,
     completion_tokens: a.completion_tokens + b.completion_tokens,
+    credits: a.credits + b.credits,
+    original_credits: a.original_credits + b.original_credits,
     avg_duration_ms:
       total > 0
         ? Math.round(

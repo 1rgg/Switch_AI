@@ -65,6 +65,13 @@ pub struct ResolvedKey {
     pub dedicated_account: String,
     /// 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder"
     pub bind_pool: String,
+    /// 共享分组 id 白名单（未展开；鉴权时经 org_index 展开并入 allowed_accounts）
+    pub allowed_groups: Vec<String>,
+    /// 共享标签 id 白名单（未展开；同上）
+    pub allowed_tags: Vec<String>,
+    /// 组/标签维度已配置（展开后即使空集也视为受约束——空展开 = 该池无可取号
+    /// 账号，走既有 no_healthy_account 路径，而非「不限」）
+    pub org_constrained: bool,
 }
 
 /// 解析池前缀标记（issue #30）：`"trae:x"` → (Some("trae"), "x")；裸 uid → (None, 原串)。
@@ -90,15 +97,45 @@ pub struct PoolConstraint {
 }
 
 impl ResolvedKey {
+    /// 从条目构造约束快照（verify_and_consume / constraints_for 共用字段拷贝）
+    fn from_entry(e: &ApiKeyEntry) -> Self {
+        Self {
+            id: e.id.clone(),
+            allowed_accounts: e.allowed_accounts.clone(),
+            schedule_mode: e.schedule_mode().to_string(),
+            dedicated_account: e.dedicated_account.clone(),
+            bind_pool: e.bind_pool.clone(),
+            allowed_groups: e.allowed_groups.clone(),
+            allowed_tags: e.allowed_tags.clone(),
+            org_constrained: false,
+        }
+    }
+
+    /// D4/D5 组/标签约束展开：allowed_groups/allowed_tags 经 org_index 实时展开为
+    /// 带池前缀的 uid 并入 allowed_accounts（精确白名单 ∪ 组∩标签），并标记
+    /// org_constrained。展开缓存于 org_index（config_cache，TTL 5s + 写路径失效）。
+    pub fn apply_org_expansion(&mut self, idx: &super::org_index::OrgIndex) {
+        if self.allowed_groups.is_empty() && self.allowed_tags.is_empty() {
+            return;
+        }
+        self.org_constrained = true;
+        let extra = super::org_index::expand(&self.allowed_groups, &self.allowed_tags, idx);
+        self.allowed_accounts.extend(extra);
+    }
+
     /// 返回绑定的池标识（归一化后 Some("trae")/Some("buddy")；空或非法 = None）
     pub fn bind_pool(&self) -> Option<&'static str> {
         parse_bind_pool(&self.bind_pool)
     }
 
     /// 混合白名单判定（issue #30）：allowed_accounts 中任一条目带池前缀。
-    /// 新前端在 bind="" 下保存的列表必带前缀；旧数据全裸 uid = 旧语义
+    /// 新前端在 bind="" 下保存的列表必带前缀；旧数据全裸 uid = 旧语义。
+    /// 组/标签维度已配置（org_constrained）时恒为 true：展开条目必带池前缀；
+    /// 展开为空集时各池按前缀作用域得空集 → 该池被排除（空展开 = 无可取号账号，
+    /// 非「不限」——D5 风险表的运行时语义）
     pub fn is_mixed_whitelist(&self) -> bool {
-        self.allowed_accounts.iter().any(|u| split_pool_tagged(u).0.is_some())
+        self.org_constrained
+            || self.allowed_accounts.iter().any(|u| split_pool_tagged(u).0.is_some())
     }
 
     /// 该 Key 的 F-35 约束（allowed_accounts 白名单 + dedicated）是否作用于指定池。
@@ -131,7 +168,8 @@ impl ResolvedKey {
     ///   其中白名单可空（空白名单 + 专一 = 不限账号但锁定专一，F-35 原语义）
     pub fn pool_constraints(&self, pool: &str) -> Option<PoolConstraint> {
         use std::collections::HashSet;
-        if self.allowed_accounts.is_empty() && self.dedicated_account.is_empty() {
+        // 组/标签维度已配置时不得提前返回 None（空展开 = 该池排除，非「不限」）
+        if self.allowed_accounts.is_empty() && self.dedicated_account.is_empty() && !self.org_constrained {
             return None;
         }
         // 专一模式生效的专一账号（空 → allowed 首个），解析归属池与裸 uid
@@ -243,6 +281,14 @@ pub struct ApiKeyEntry {
     /// 按日请求统计（升序，保留最近 90 天）
     #[serde(default)]
     pub daily_stats: Vec<KeyDailyStat>,
+    // ── 共享分组/标签绑定（shared-groups-tags-design.md P2，D4/D5；serde default 兼容）──
+    /// 共享分组 id 白名单（shg_ 前缀）；空 = 不通过该维度限制。运行时实时展开为
+    /// 带池前缀的 uid 并入白名单（D4），与 allowed_tags 同时勾选时取交集（D5）
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+    /// 共享标签 id 白名单（tag_ 前缀）；空 = 不通过该维度限制。语义同上
+    #[serde(default)]
+    pub allowed_tags: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -332,13 +378,7 @@ impl ApiKeysFile {
         }
         e.used_today += 1;
         bump_daily_stats(e, today);
-        KeyCheck::Ok(ResolvedKey {
-            id: e.id.clone(),
-            allowed_accounts: e.allowed_accounts.clone(),
-            schedule_mode: e.schedule_mode().to_string(),
-            dedicated_account: e.dedicated_account.clone(),
-            bind_pool: e.bind_pool.clone(),
-        })
+        KeyCheck::Ok(ResolvedKey::from_entry(e))
     }
 
     /// 是否存在启用的子 Key（用于判断是否需要鉴权）
@@ -348,21 +388,24 @@ impl ApiKeysFile {
 }
 
 /// 按 Key 条目 id 解析约束快照（WB 路由层每流程调用一次；Key 不存在返回 None）。
-/// 锁内直查内存权威副本，仅克隆命中的约束字段（避免整表 clone 的锁持有与内存开销）
+/// 锁内直查内存权威副本，仅克隆命中的约束字段（避免整表 clone 的锁持有与内存开销）；
+/// 组/标签维度在**锁外**经 org_index 展开（D4）：缓存 miss 的 SQLite 读不得持有
+/// KEYS_STATE 全局锁执行（否则阻塞所有并发鉴权与记账）
 pub fn constraints_for(data_dir: &Path, key_id: &str) -> Option<ResolvedKey> {
-    let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    entry_or_load(&mut reg, data_dir)
-        .file
-        .keys
-        .iter()
-        .find(|k| k.id == key_id)
-        .map(|e| ResolvedKey {
-            id: e.id.clone(),
-            allowed_accounts: e.allowed_accounts.clone(),
-            schedule_mode: e.schedule_mode().to_string(),
-            dedicated_account: e.dedicated_account.clone(),
-            bind_pool: e.bind_pool.clone(),
-        })
+    let mut rk = {
+        let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        entry_or_load(&mut reg, data_dir)
+            .file
+            .keys
+            .iter()
+            .find(|k| k.id == key_id)
+            .map(ResolvedKey::from_entry)
+    }?;
+    if !rk.allowed_groups.is_empty() || !rk.allowed_tags.is_empty() {
+        let idx = super::org_index::get(data_dir);
+        rk.apply_org_expansion(&idx);
+    }
+    Some(rk)
 }
 
 /// 按 Key 条目 id 取展示名（请求日志用）：走同一内存权威副本，零磁盘 IO；
@@ -380,26 +423,24 @@ pub fn key_name_for(data_dir: &Path, key_id: &str) -> String {
 
 /// 按 Key 条目 id 一次性取（展示名, 约束快照）：单锁单遍历合并查询，
 /// 供诊断路径（no_healthy_detail）替代 constraints_for + key_name_for 的两次加锁；
-/// Key 不存在返回 None（匿名/未知 Key 由调用方兜底仅报池健康数）
+/// Key 不存在返回 None（匿名/未知 Key 由调用方兜底仅报池健康数）。
+/// 组/标签维度经 org_index 展开（D4）：诊断文案展示的是展开后的生效白名单，
+/// 否则组/标签 Key 的 no_healthy 详情会失真为「未约束」状态
 pub fn key_snapshot_for(data_dir: &Path, key_id: &str) -> Option<(String, ResolvedKey)> {
-    let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    entry_or_load(&mut reg, data_dir)
-        .file
-        .keys
-        .iter()
-        .find(|k| k.id == key_id)
-        .map(|e| {
-            (
-                e.name.clone(),
-                ResolvedKey {
-                    id: e.id.clone(),
-                    allowed_accounts: e.allowed_accounts.clone(),
-                    schedule_mode: e.schedule_mode().to_string(),
-                    dedicated_account: e.dedicated_account.clone(),
-                    bind_pool: e.bind_pool.clone(),
-                },
-            )
-        })
+    let (name, mut rk) = {
+        let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        entry_or_load(&mut reg, data_dir)
+            .file
+            .keys
+            .iter()
+            .find(|k| k.id == key_id)
+            .map(|e| (e.name.clone(), ResolvedKey::from_entry(e)))
+    }?;
+    if !rk.allowed_groups.is_empty() || !rk.allowed_tags.is_empty() {
+        let idx = super::org_index::get(data_dir);
+        rk.apply_org_expansion(&idx);
+    }
+    Some((name, rk))
 }
 
 /// 进程级状态锁 + 内存权威副本（批次 E）：api_keys 的「读-改-写」（verify 记账 +
@@ -492,16 +533,55 @@ pub fn save(data_dir: &Path, f: &ApiKeysFile) {
     }
 }
 
+/// 原子修改（命令层引用清理路径用）：全程持 KEYS_STATE 锁，对内存权威副本执行
+/// f（返回是否变更），变更则标脏并锁外落盘。替代「load → 改 → save」的
+/// 读-改-写窗口——save 合并仅保护计数字段，约束字段（allowed_groups/
+/// allowed_tags 等）与并发 UI 编辑互为 last-writer-wins；本方法与 UI save /
+/// 鉴权记账在同一把锁内串行化，无互覆。返回是否发生了变更。
+pub fn modify<F: FnOnce(&mut ApiKeysFile) -> bool>(data_dir: &Path, f: F) -> bool {
+    let snapshot = {
+        let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = entry_or_load(&mut reg, data_dir);
+        if !f(&mut entry.file) {
+            return false;
+        }
+        entry.dirty = true;
+        entry.file.clone()
+    };
+    if let Err(e) = registry_save(data_dir, &snapshot) {
+        eprintln!("[api_keys] modify 入 vault 失败（内存已生效，flusher 将重试）: {e}");
+    }
+    true
+}
+
 /// 鉴权记账原子操作：锁内 verify_and_consume（内存副本），命中即标脏；
 /// SQLite 落盘由 flusher（2s）/ stop 时 flush_dirty 统一执行。
 /// auth 中间件每请求调用本函数，禁止绕开 KEYS_STATE 直接 load+save。
+/// 组/标签展开在**锁外**进行：org_index 缓存 miss 的 SQLite 读不占 KEYS_STATE 锁
+/// （锁内展开会阻塞所有并发鉴权；锁外对 OrgIndex 快照展开与锁内语义一致——
+/// 展开源是同一份缓存快照，不存在锁保护的状态）。
 pub fn verify_and_consume_locked(data_dir: &Path, presented: &str, today: &str) -> KeyCheck {
-    let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = entry_or_load(&mut reg, data_dir);
-    let r = entry.file.verify_and_consume(presented, today);
-    // 仅记账命中（Ok）产生持久化需求；Invalid / QuotaExceeded（提前返回不改计数）无写盘
-    if matches!(r, KeyCheck::Ok(_)) {
-        entry.dirty = true;
+    let (mut r, needs_expand) = {
+        let mut reg = KEYS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = entry_or_load(&mut reg, data_dir);
+        let r = entry.file.verify_and_consume(presented, today);
+        let needs_expand = match &r {
+            KeyCheck::Ok(rk) => !rk.allowed_groups.is_empty() || !rk.allowed_tags.is_empty(),
+            _ => false,
+        };
+        // 仅记账命中（Ok）产生持久化需求；Invalid / QuotaExceeded（提前返回不改计数）无写盘
+        if matches!(r, KeyCheck::Ok(_)) {
+            entry.dirty = true;
+        }
+        (r, needs_expand)
+    };
+    // 组/标签维度实时展开（D4）：org_index 缓存读（TTL 5s + 写路径失效），
+    // 展开并入 ResolvedKey 后随请求扩展下发，下游 pool_constraints 无感知
+    if needs_expand {
+        if let KeyCheck::Ok(ref mut rk) = r {
+            let idx = super::org_index::get(data_dir);
+            rk.apply_org_expansion(&idx);
+        }
     }
     r
 }
@@ -592,6 +672,8 @@ mod tests {
             dedicated_account: String::new(),
             bind_pool: String::new(),
             daily_stats: vec![],
+            allowed_groups: vec![],
+            allowed_tags: vec![],
         }
     }
 
@@ -700,13 +782,7 @@ mod tests {
 
     /// 从条目构造约束快照（模拟 verify_and_consume / constraints_for 的字段拷贝）
     fn constraints_of(e: &ApiKeyEntry) -> ResolvedKey {
-        ResolvedKey {
-            id: e.id.clone(),
-            allowed_accounts: e.allowed_accounts.clone(),
-            schedule_mode: e.schedule_mode().to_string(),
-            dedicated_account: e.dedicated_account.clone(),
-            bind_pool: e.bind_pool.clone(),
-        }
+        ResolvedKey::from_entry(e)
     }
 
     #[test]
@@ -869,6 +945,55 @@ mod tests {
         let rk = constraints_of(&e);
         assert!(rk.pool_constraints("trae").is_none());
         assert!(rk.pool_constraints("buddy").is_none());
+    }
+
+    /// D4/D5 验收：组/标签展开并入白名单——交集语义、池前缀作用域、
+    /// 空展开 = 排除该池（非「不限」）
+    #[test]
+    fn pool_constraints_org_expansion_intersection_and_empty_excludes() {
+        use super::super::org_index::OrgIndex;
+        let mut e = entry("k1", "ck-a", true, 0);
+        e.allowed_groups = vec!["shg_a".into()];
+        e.allowed_tags = vec!["tag_1".into()];
+
+        let idx = OrgIndex {
+            group_members: [(
+                "shg_a".to_string(),
+                vec!["u1".to_string(), "wb-2".to_string()],
+            )]
+            .into_iter()
+            .collect(),
+            account_tags: [("u1".to_string(), vec!["tag_1".to_string()])]
+                .into_iter()
+                .collect(),
+        };
+        let mut rk = constraints_of(&e);
+        rk.apply_org_expansion(&idx);
+        // 交集：仅 u1 同时满足（trae: 前缀）
+        let trae = rk.pool_constraints("trae").unwrap();
+        let allowed = trae.allowed.unwrap();
+        assert!(allowed.contains("u1"), "交集命中: {allowed:?}");
+        // wb-2 无标签 → 交集排除 → buddy 池空集（排除而非不限）
+        let buddy = rk.pool_constraints("buddy").unwrap();
+        assert!(buddy.allowed.unwrap().is_empty(), "无交集成员的池应被排除");
+
+        // 空展开（组内无人带标签）：仍受约束 → 全池空集，走 no_healthy_account
+        let idx_empty = OrgIndex {
+            group_members: [("shg_a".to_string(), vec!["u9".to_string()])]
+                .into_iter()
+                .collect(),
+            account_tags: Default::default(),
+        };
+        let mut rk2 = constraints_of(&e);
+        rk2.apply_org_expansion(&idx_empty);
+        let c2 = rk2.pool_constraints("trae").unwrap();
+        assert!(c2.allowed.unwrap().is_empty(), "空展开 = 排除，非不限");
+
+        // 无组/标签配置：org 维度不参与约束（回归既有语义）
+        let mut e3 = entry("k3", "ck-c", true, 0);
+        e3.allowed_accounts = vec!["b1".into()];
+        let rk3 = constraints_of(&e3);
+        assert!(rk3.pool_constraints("trae").is_none());
     }
 
     #[test]

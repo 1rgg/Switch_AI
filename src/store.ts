@@ -188,6 +188,8 @@ function defaultSettings(): Settings {
     theme: 'system',
     launch_minimized: false,
     silent_checkin: false,
+    /** issue #82 T6.1：会话明细概述显示开关（默认开） */
+    sessions_preview_enabled: true,
     auto_start_proxy: true,
     auto_start_api: false,
     tray: true,
@@ -227,11 +229,14 @@ function defaultSettings(): Settings {
     wb_growth_hhmm: '09:00',
     // WorkBuddy 每日签到调度时刻（任务配置页可改，默认 09:10）
     wb_checkin_hhmm: '09:10',
-    // 积分/Token 同步与官网模型定时同步：Buddy 默认每日 23:30；Trae 默认每小时（issue #61）+每日时刻 23:40（daily 模式生效）；模型同步默认开（05:45 / 05:40）
-    wb_credits_sync_mode: 'daily',
+    // 积分/Token 同步：Buddy 与 Trae 默认每 2 小时（issue #82 会话明细定时落盘），
+    // 间隔可在环境配置页手工设置；daily 模式时刻 23:30 / 23:40；模型同步默认开（05:45 / 05:40）
+    wb_credits_sync_mode: 'every_hours',
     wb_credits_sync_hhmm: '23:30',
-    trae_credits_sync_mode: 'hourly',
+    wb_credits_sync_hours: '2',
+    trae_credits_sync_mode: 'every_hours',
     trae_credits_sync_hhmm: '23:40',
+    trae_credits_sync_hours: '2',
     wb_catalog_sync_enabled: true,
     wb_catalog_sync_hhmm: '05:45',
     qoder_catalog_sync_enabled: true,
@@ -461,6 +466,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       } catch {
         /* 静默失败：状态栏保持未启动，用户可手动启动 */
       }
+    }
+    // 待取启动通知（一次性）：后端启动期消息（如分组统一迁移结果）toast 告知用户，
+    // 拉取即清不会重复弹出；失败静默（通知不阻塞启动）
+    try {
+      const notice = await api.misc.startupNoticeTake();
+      if (notice) get().pushToast('info', notice);
+    } catch {
+      /* 静默失败 */
     }
   },
 
@@ -897,6 +910,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     try {
       await api.groups.update(id, patch);
       await get().refreshGroups();
+      // 写操作可见反馈（对齐 createGroup/removeGroup）
+      get().pushToast(
+        'success',
+        patch.name ? `分组已重命名为「${patch.name}」` : '分组颜色已更新',
+      );
     } catch (err) {
       get().pushToast('error', `更新分组失败：${String(err)}`);
       throw err;

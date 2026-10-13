@@ -10,6 +10,7 @@ import type {
   ApiServiceStatus,
   ApiPoolFile,
   PoolStatus,
+  TagView,
   UsageDayView,
   WbModelInfo,
   WorkBuddyAccountView,
@@ -133,6 +134,9 @@ export default function BuddyApiService() {
   // Buddy 池分组筛选（对齐 Trae T10）：所选分组 id 集合，空 = 不限（全部参与）
   const [wbPoolGroups, setWbPoolGroups] = useState<Set<string>>(new Set());
   const [wbGroups, setWbGroups] = useState<GroupView[]>([]);
+  // 共享标签筛选（P2 需求④）：与分组筛选取交集（D5），空 = 不限标签
+  const [wbPoolTags, setWbPoolTags] = useState<Set<string>>(new Set());
+  const [tagDefs, setTagDefs] = useState<TagView[]>([]);
   const [accounts, setAccounts] = useState<WorkBuddyAccountView[]>([]);
   const [catalog, setCatalog] = useState<WbModelInfo[]>([]);
   // 厂商列数据源（§6.2）：WbModelInfo 无 vendor 字段，经统一目录聚合按模型 id
@@ -153,7 +157,7 @@ export default function BuddyApiService() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [st, pf, accs, cat, wbp, wbg, unified] = await Promise.all([
+      const [st, pf, accs, cat, wbp, wbg, unified, tags] = await Promise.all([
         api.apiServer.status().catch(() => null),
         api.apiServer.poolList().catch(() => null),
         api.workbuddy.accountsList().catch(() => [] as WorkBuddyAccountView[]),
@@ -161,8 +165,10 @@ export default function BuddyApiService() {
         api.apiServer.wbPoolStatus().catch(() => [] as PoolStatus[]),
         api.workbuddy.groups.list().catch(() => [] as GroupView[]),
         api.apiServer.unifiedModels().catch(() => []),
+        api.tags.list().catch(() => [] as TagView[]),
       ]);
       setStatus(st);
+      setTagDefs(tags);
       setPool(pf);
       setAccounts(accs);
       setCatalog(cat);
@@ -188,6 +194,8 @@ export default function BuddyApiService() {
         setWbUids(pf.wb_enabled_uids?.length ? pf.wb_enabled_uids : null);
         // 分组筛选：空 = 不限（fail-open，全部参与）
         setWbPoolGroups(new Set(pf.wb_group_ids ?? []));
+        // 标签筛选：空 = 不限（与分组合取交集，D5）
+        setWbPoolTags(new Set(pf.wb_tag_ids ?? []));
       }
     } catch (err) {
       pushToast('error', `读取资源状态失败：${String(err)}`);
@@ -262,6 +270,7 @@ export default function BuddyApiService() {
           ...wbFlags,
           wbUids,
           wbGroupIds: [...wbPoolGroups],
+          wbTagIds: [...wbPoolTags],
           wbHedgeThresholdMs: wbParams.wbHedgeThresholdMs,
           wbAccountConcurrencyLimit: wbParams.wbAccountConcurrencyLimit,
           wbPoolStickyTtlSecs: wbParams.wbPoolStickyTtlSecs,
@@ -309,16 +318,24 @@ export default function BuddyApiService() {
     () => wbGroups.map((g) => ({ id: g.id, uids: new Set(g.uids ?? []) })),
     [wbGroups],
   );
+  // P2 补齐：标签筛选与分组合取交集（D5），预览与灰显同后端装配语义一致
+  const tagUidSets = useMemo(
+    () => tagDefs.map((t) => ({ id: t.id, uids: new Set(t.uids ?? []) })),
+    [tagDefs],
+  );
   const inWbPoolFilter = (id: string) =>
-    wbPoolGroups.size === 0 ||
-    wbGroupUidSets.some((g) => wbPoolGroups.has(g.id) && g.uids.has(id));
+    (wbPoolGroups.size === 0 ||
+      wbGroupUidSets.some((g) => wbPoolGroups.has(g.id) && g.uids.has(id))) &&
+    (wbPoolTags.size === 0 || tagUidSets.some((t) => wbPoolTags.has(t.id) && t.uids.has(id)));
   const wbPoolPreview = (() => {
-    if (wbPoolGroups.size === 0) return { inPool: wbSelected.length, excluded: 0 };
+    // 生效池 = (分组 ∩ 标签筛选) ∩ 白名单勾选（与后端 apply_pool_snapshot 装配语义
+    // 一致，对齐 Qoder 页口径）；excluded 仅统计筛选外账号（未勾选由 checkbox
+    // 状态表达，不计入 excluded）
     let inPool = 0;
     let excluded = 0;
     for (const a of credAccounts) {
-      if (inWbPoolFilter(a.id)) inPool += 1;
-      else excluded += 1;
+      if (!inWbPoolFilter(a.id)) excluded += 1;
+      else if (wbSelected.includes(a.id)) inPool += 1;
     }
     return { inPool, excluded };
   })();
@@ -459,18 +476,62 @@ export default function BuddyApiService() {
                         </button>
                       );
                     })}
-                    {wbPoolGroups.size > 0 && (
-                      <span className="pt-0.5 text-xs text-slate-400">
-                        将纳入 {wbPoolPreview.inPool} 个账号
-                        {wbPoolPreview.excluded > 0 &&
-                          `，${wbPoolPreview.excluded} 个分组外账号不参与调度`}
-                      </span>
+                    {(wbPoolGroups.size > 0 || wbPoolTags.size > 0) && (
+                      <>
+                        <span className="pt-0.5 text-xs text-slate-400">
+                          将纳入 {wbPoolPreview.inPool} 个账号
+                          {wbPoolPreview.excluded > 0 &&
+                            `，${wbPoolPreview.excluded} 个筛选外账号不参与调度`}
+                        </span>
+                        {wbPoolPreview.inPool === 0 && (
+                          <span className="pt-0.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+                            当前分组/标签组合展开为空集：保存后该池将无可取号账号
+                          </span>
+                        )}
+                      </>
                     )}
                   </div>
                 </div>
                 <p className="text-xs text-slate-400 dark:text-zinc-500">
                   分组筛选作用于 WB 池取号范围，保存后即时生效；不选分组 = 全部参与（分组在「账号管理 → 分组管理」维护）。
                 </p>
+                {/* 标签筛选（P2 需求④）：与分组合取交集（D5）；标签在「账号管理 → 标签管理」维护 */}
+                {(tagDefs.length > 0 || wbPoolTags.size > 0) && (
+                  <div className="flex items-start gap-2">
+                    <label className="shrink-0 pt-1 text-xs text-slate-500 dark:text-zinc-400">标签筛选</label>
+                    <div className="flex flex-1 flex-wrap gap-1">
+                      {tagDefs.map((t) => {
+                        const active = wbPoolTags.has(t.id);
+                        return (
+                          <button
+                            key={t.id}
+                            type="button"
+                            className={`rounded-full border px-2 py-0.5 text-xs transition ${
+                              active
+                                ? 'border-teal-400 bg-teal-50 text-teal-700 dark:border-teal-500 dark:bg-teal-500/15 dark:text-teal-300'
+                                : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-600'
+                            }`}
+                            onClick={() =>
+                              setWbPoolTags((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(t.id)) next.delete(t.id);
+                                else next.add(t.id);
+                                return next;
+                              })
+                            }
+                          >
+                            {t.name}
+                          </button>
+                        );
+                      })}
+                      {wbPoolTags.size > 0 && (
+                        <span className="pt-0.5 text-xs text-slate-400">
+                          与分组筛选取交集（同时满足分组与标签的账号才参与调度）
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
             {credAccounts.length === 0 ? (
@@ -498,7 +559,7 @@ export default function BuddyApiService() {
                         onChange={() => toggleWbUid(a.id)}
                       />
                       <div className="min-w-0 flex-1 truncate font-medium">{a.nickname || a.id}</div>
-                      {filteredOut && <Badge tone="slate">分组外</Badge>}
+                      {filteredOut && <Badge tone="slate">筛选外</Badge>}
                       {a.is_current && <Badge tone="green">在线</Badge>}
                       {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}
                       {/* 运行时健康徽标：禁用/积分耗尽/冷却原因/零积分/在途·就绪（三池共用） */}

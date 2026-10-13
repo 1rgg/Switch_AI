@@ -107,6 +107,10 @@ pub fn start(app: AppHandle) {
 
 /// 失败重试冷却基数：失败后按连续失败次数指数退避（30 分钟起步 ×2 封顶 120 分钟）
 const RETRY_COOLDOWN_MS: i64 = 30 * 60_000;
+/// 单轮 tick 内多个到期任务（典型为启动补跑积压）之间的错峰间隔（issue #84 C1）：
+/// 重任务（快照/用量同步）背靠背连跑会形成分钟级 CPU 爆发（实测 103s），任务间
+/// 睡眠错开峰值，给系统留出处理其他负载的余量。
+const TICK_STAGGER_SECS: u64 = 30;
 /// hourly 模式节流：距上次成功执行 ≥1h 才再跑（失败走退避冷却，不受此门限制）
 const HOURLY_INTERVAL_MS: i64 = 60 * 60_000;
 /// qoder-refresh 档位：每 6 小时兜底刷新一次凭证（设计 v1.3 §M4；
@@ -123,18 +127,28 @@ enum SchedPlan {
     EveryHours(i64),
 }
 
-/// credits 类任务的同步模式（空/未知值按各平台默认处理——Buddy daily / Trae hourly（issue #61），
-/// state::settings 已归一空值，此处兜底未知值）
+/// credits 类任务的同步模式（空/未知值按各平台默认处理——every_hours 每2小时
+/// （issue #82 会话明细定时落盘），state::settings 已归一空值，此处兜底未知值）
 fn credits_sync_mode(st: &AppState, key: &str) -> String {
     let s = st.settings();
-    let (raw, fallback) = match key {
-        "wb-credits-snapshot" => (s.wb_credits_sync_mode.as_str(), "daily"),
-        _ => (s.trae_credits_sync_mode.as_str(), "hourly"),
+    let raw = match key {
+        "wb-credits-snapshot" => s.wb_credits_sync_mode.as_str(),
+        _ => s.trae_credits_sync_mode.as_str(),
     };
     match raw.trim() {
-        "off" | "hourly" | "daily" => raw.trim().to_string(),
-        _ => fallback.to_string(),
+        "off" | "hourly" | "daily" | "every_hours" => raw.trim().to_string(),
+        _ => "every_hours".to_string(),
     }
+}
+
+/// credits 类任务 every_hours 模式的间隔小时数：非法/越界回退 2（1..=24）
+fn credits_sync_hours(st: &AppState, key: &str) -> i64 {
+    let s = st.settings();
+    let raw = match key {
+        "wb-credits-snapshot" => s.wb_credits_sync_hours.as_str(),
+        _ => s.trae_credits_sync_hours.as_str(),
+    };
+    raw.trim().parse::<i64>().unwrap_or(2).clamp(1, 24)
 }
 
 /// 单任务调度计划：合并启用判定与模式/时刻解析（tick 与 scheduler_status 共用）
@@ -143,8 +157,13 @@ fn sched_plan(st: &AppState, t: &SchedTask) -> SchedPlan {
         return SchedPlan::Skip;
     }
     match t.kind {
-        // 看板数据同步：hourly 按小时节流，daily（含非法值回退）按每日时刻
-        "credits" if credits_sync_mode(st, t.key) == "hourly" => SchedPlan::Hourly,
+        // 看板数据同步：按模式分档——hourly 每小时节流 / every_hours 每 N 小时节流
+        // （N 可手工设置，默认 2）/ daily（含非法值）按每日时刻
+        "credits" => match credits_sync_mode(st, t.key).as_str() {
+            "hourly" => SchedPlan::Hourly,
+            "every_hours" => SchedPlan::EveryHours(credits_sync_hours(st, t.key)),
+            _ => SchedPlan::Daily(effective_hhmm(st, t)),
+        },
         // Qoder 凭证兜底刷新：固定每 6 小时（hhmm 不参与判定；开关 settings.qoder_token_renew_enabled）
         "refresh" => SchedPlan::EveryHours(REFRESH_INTERVAL_HOURS),
         _ => SchedPlan::Daily(effective_hhmm(st, t)),
@@ -173,6 +192,7 @@ fn tick(app: &AppHandle, st: &AppState) {
     // 网关运行态句柄（main.rs manage；积分类任务运行中回写池快照用，issue #67）
     let api_runtime = app
         .state::<std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>();
+    let mut ran_this_tick: usize = 0;
     for t in TASKS {
         // 触发判定（trigger 用于日志展示：「每日 HH:MM」/「每小时」/「每N小时」）
         let trigger = match sched_plan(st, t) {
@@ -210,6 +230,14 @@ fn tick(app: &AppHandle, st: &AppState) {
                 continue;
             }
         }
+        // 错峰（issue #84 C1）：本轮此前已有任务执行（典型为启动补跑积压的多个到期
+        // 任务单 tick 连跑，实测 103s CPU 爆发），先隔一个间隔再跑下一个。睡眠只
+        // 发生在后台调度线程自身；触发判定用的 now_hm 取自 tick 起点，「已过 HH:MM」
+        // 语义不受影响，仅执行时刻顺延。
+        if ran_this_tick > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(TICK_STAGGER_SECS));
+        }
+        ran_this_tick += 1;
         let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_task(t.key, st, Some(api_runtime.inner()))
         })) {
@@ -811,7 +839,8 @@ mod tests {
         assert!(!enabled(&st, "trae-renew"));
     }
 
-    /// 看板同步/模型同步的调度计划：默认 daily+内置时刻；hourly 生效；off 关闭；
+    /// 看板同步/模型同步的调度计划：默认 every_hours 每2小时（issue #82）；
+    /// hourly/daily 生效；off 关闭；非法值回退 every_hours；间隔小时数可手工设置并 clamp；
     /// 模型同步默认开、时刻可改、关闭后 Skip
     #[test]
     fn sched_plan_credits_and_models() {
@@ -819,34 +848,51 @@ mod tests {
         let wb_credits = || TASKS.iter().find(|t| t.key == "wb-credits-snapshot").unwrap();
         let trae_models = || TASKS.iter().find(|t| t.key == "trae-models-sync").unwrap();
         let set = |v: Value| crate::store::db(&st.data_dir).kv_set("app_settings", &v).unwrap();
-        // 默认（无 kv）：daily + 内置时刻
-        assert!(matches!(sched_plan(&st, wb_credits()), SchedPlan::Daily(h) if h == "23:30"));
+        // 默认（无 kv）：every_hours 每 2 小时；模型同步仍 daily + 内置时刻
+        assert!(matches!(sched_plan(&st, wb_credits()), SchedPlan::EveryHours(2)), "Buddy 默认每2小时");
         assert!(matches!(sched_plan(&st, trae_models()), SchedPlan::Daily(h) if h == "05:40"));
         // hourly 生效
         set(json!({ "wb_credits_sync_mode": "hourly" }));
         assert!(matches!(sched_plan(&st, wb_credits()), SchedPlan::Hourly));
+        // every_hours 显式 + 手工间隔
+        set(json!({ "wb_credits_sync_mode": "every_hours", "wb_credits_sync_hours": "6" }));
+        assert!(matches!(sched_plan(&st, wb_credits()), SchedPlan::EveryHours(6)));
+        // 间隔非法回退 2；越界经 state clamp 到 24
+        set(json!({ "wb_credits_sync_mode": "every_hours", "wb_credits_sync_hours": "abc" }));
+        assert!(matches!(sched_plan(&st, wb_credits()), SchedPlan::EveryHours(2)));
+        set(json!({ "wb_credits_sync_mode": "every_hours", "wb_credits_sync_hours": "99" }));
+        assert!(matches!(sched_plan(&st, wb_credits()), SchedPlan::EveryHours(24)));
+        // daily 模式走配置时刻
+        set(json!({ "wb_credits_sync_mode": "daily" }));
+        assert!(matches!(sched_plan(&st, wb_credits()), SchedPlan::Daily(h) if h == "23:30"));
         // off 关闭（enabled=false → Skip）
         set(json!({ "wb_credits_sync_mode": "off" }));
         assert!(matches!(sched_plan(&st, wb_credits()), SchedPlan::Skip));
-        // 非法模式回退 daily（credits_sync_mode 兜底）
+        // 非法模式回退 every_hours（credits_sync_mode 兜底）
         set(json!({ "wb_credits_sync_mode": "weekly" }));
-        assert!(matches!(sched_plan(&st, wb_credits()), SchedPlan::Daily(_)));
-        // Trae 看板同步（issue #61）：默认 hourly——积分快照与消耗明细（trae-usage-sync）均每小时
+        assert!(matches!(sched_plan(&st, wb_credits()), SchedPlan::EveryHours(2)));
+        // Trae 看板同步（issue #82）：默认 every_hours——积分快照与消耗明细（trae-usage-sync）均每2小时
         let trae_credits = || TASKS.iter().find(|t| t.key == "trae-credits-snapshot").unwrap();
         let trae_usage = || TASKS.iter().find(|t| t.key == "trae-usage-sync").unwrap();
-        assert!(matches!(sched_plan(&st, trae_credits()), SchedPlan::Hourly), "Trae 默认 hourly");
-        assert!(matches!(sched_plan(&st, trae_usage()), SchedPlan::Hourly), "消耗明细跟随 hourly");
+        assert!(matches!(sched_plan(&st, trae_credits()), SchedPlan::EveryHours(2)), "Trae 默认每2小时");
+        assert!(
+            matches!(sched_plan(&st, trae_usage()), SchedPlan::EveryHours(2)),
+            "消耗明细跟随 every_hours"
+        );
         // daily 模式：积分快照走配置时刻（23:40），消耗明细内置 23:50 错峰
         set(json!({ "trae_credits_sync_mode": "daily" }));
         assert!(matches!(sched_plan(&st, trae_credits()), SchedPlan::Daily(h) if h == "23:40"));
         assert!(matches!(sched_plan(&st, trae_usage()), SchedPlan::Daily(h) if h == "23:50"));
+        // Trae 手工间隔
+        set(json!({ "trae_credits_sync_mode": "every_hours", "trae_credits_sync_hours": "3" }));
+        assert!(matches!(sched_plan(&st, trae_usage()), SchedPlan::EveryHours(3)));
         // off 同时关闭积分快照与消耗明细
         set(json!({ "trae_credits_sync_mode": "off" }));
         assert!(matches!(sched_plan(&st, trae_credits()), SchedPlan::Skip));
         assert!(matches!(sched_plan(&st, trae_usage()), SchedPlan::Skip));
-        // 非法模式回退 Trae 默认 hourly
+        // 非法模式回退 Trae 默认 every_hours
         set(json!({ "trae_credits_sync_mode": "weekly" }));
-        assert!(matches!(sched_plan(&st, trae_usage()), SchedPlan::Hourly));
+        assert!(matches!(sched_plan(&st, trae_usage()), SchedPlan::EveryHours(2)));
         // 模型同步时刻覆盖 + 显式关闭
         set(json!({ "trae_models_sync_hhmm": "06:10" }));
         assert!(matches!(sched_plan(&st, trae_models()), SchedPlan::Daily(h) if h == "06:10"));

@@ -1019,6 +1019,8 @@ mod tests {
                 dedicated_account: dedicated.into(),
                 bind_pool: bind_pool.into(),
                 daily_stats: vec![],
+                allowed_groups: vec![],
+                allowed_tags: vec![],
             });
             crate::store::docs::api_keys_save(&crate::store::db(&self.dir), &file).unwrap();
         }

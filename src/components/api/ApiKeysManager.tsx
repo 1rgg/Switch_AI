@@ -12,7 +12,7 @@ import { api } from '../../lib/tauri';
 import { copyText } from '../../lib/clipboard';
 import { useAppStore } from '../../store';
 import { maskApiKey, fmtTokens } from '../../lib/format';
-import type { ApiKeyEntry, PoolStatus, UsageDayView } from '../../types';
+import type { ApiKeyEntry, GroupView, PoolStatus, TagView, UsageDayView } from '../../types';
 
 /** issue #30 混合白名单：候选账号平台标记 */
 type CandidatePool = 'trae' | 'buddy' | 'qoder';
@@ -49,6 +49,15 @@ export default function ApiKeysManager({
   const [editAllowed, setEditAllowed] = useState<Set<string>>(new Set());
   const [editMode, setEditMode] = useState('expire_first');
   const [editDedicated, setEditDedicated] = useState('');
+  // 共享分组/标签绑定（P2 需求④，D4/D5）：运行时实时展开 + 组∩标签交集
+  const [editGroups, setEditGroups] = useState<Set<string>>(new Set());
+  const [editTags, setEditTags] = useState<Set<string>>(new Set());
+  const [sharedGroups, setSharedGroups] = useState<GroupView[]>([]);
+  const [sharedTags, setSharedTags] = useState<TagView[]>([]);
+  // 覆盖账号数预览（实时展开计算；total=0 强提示）
+  const [orgPreview, setOrgPreview] = useState<Record<string, number> | null>(null);
+  // key 列表行的覆盖账号数批量预览（仅对配置了组/标签的 key 计算）
+  const [listOrgPreview, setListOrgPreview] = useState<Record<string, Record<string, number>>>({});
   // issue #25 资源池绑定："" = 跟随全局调度 | "trae" | "buddy" | "qoder"
   const [editBindPool, setEditBindPool] = useState('');
   // issue #30：打开弹框时的原始白名单/专一值（未归一）。保存时若用户未改动勾选
@@ -152,6 +161,8 @@ export default function ApiKeysManager({
       schedule_mode: 'expire_first',
       dedicated_account: '',
       bind_pool: newBindPool,
+      allowed_groups: [],
+      allowed_tags: [],
       daily_stats: [],
     };
     void saveKeys([...apiKeys, entry], `Key「${name}」已添加`);
@@ -188,6 +199,11 @@ export default function ApiKeysManager({
     setEditMode(k.schedule_mode || 'expire_first');
     setEditDedicated(norm(k.dedicated_account || ''));
     setEditBindPool(k.bind_pool || '');
+    setEditGroups(new Set(k.allowed_groups ?? []));
+    setEditTags(new Set(k.allowed_tags ?? []));
+    // 共享分组/标签候选（全局一份；含各池成员计数）
+    api.groups.sharedList().then(setSharedGroups).catch(() => {});
+    api.tags.list().then(setSharedTags).catch(() => {});
     // 服务可能刚启动，三池候选列表即时刷新
     api.apiServer
       .poolStatus()
@@ -230,12 +246,65 @@ export default function ApiKeysManager({
             dedicated_account:
               editMode === 'dedicated' ? (dedicatedChanged ? editDedicated : editOrigRef.current.dedicated) : '',
             bind_pool: editBindPool,
+            allowed_groups: [...editGroups],
+            allowed_tags: [...editTags],
           }
         : k,
     );
     void saveKeys(next, `Key「${editKey.name}」调度配置已更新`);
     setEditKey(null);
   };
+
+  // 覆盖账号数实时预览（D4/D5）：effective = 精确白名单 ∪ (组 ∩ 标签)；组/标签
+  // 均未勾选时不显示。后端 org_index 实时展开，成员变化即时生效
+  // 列表行批量预览：仅对配置了组/标签的 key 调用（一次批量，避免 N 次 invoke）
+  useEffect(() => {
+    const bound = apiKeys.filter((k) => (k.allowed_groups?.length ?? 0) > 0 || (k.allowed_tags?.length ?? 0) > 0);
+    if (bound.length === 0) {
+      setListOrgPreview({});
+      return;
+    }
+    let cancelled = false;
+    api.apiServer
+      .keysOrgPreview(bound)
+      .then((r) => {
+        if (!cancelled) setListOrgPreview(r);
+      })
+      .catch(() => {
+        if (!cancelled) setListOrgPreview({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiKeys]);
+  useEffect(() => {
+    if (!editKey) {
+      setOrgPreview(null);
+      return;
+    }
+    if (editGroups.size === 0 && editTags.size === 0) {
+      setOrgPreview(null);
+      return;
+    }
+    const entry: ApiKeyEntry = {
+      ...editKey,
+      allowed_accounts: [...editAllowed],
+      allowed_groups: [...editGroups],
+      allowed_tags: [...editTags],
+    };
+    let cancelled = false;
+    api.apiServer
+      .keysOrgPreview([entry])
+      .then((r) => {
+        if (!cancelled) setOrgPreview(r[entry.id] ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setOrgPreview(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [editKey, editGroups, editTags, editAllowed]);
 
   const updateKeyLimit = (id: string, limit: number) => {
     const v = Math.max(0, Math.floor(limit) || 0);
@@ -537,6 +606,16 @@ export default function ApiKeysManager({
                           限{k.allowed_accounts.length}账号
                         </span>
                       )}
+                      {/* P2 文档补齐：key 列表展示组/标签覆盖账号数预览（实时展开计算） */}
+                      {((k.allowed_groups?.length ?? 0) > 0 || (k.allowed_tags?.length ?? 0) > 0) && (
+                        <span
+                          className={`ml-1 text-xs ${listOrgPreview[k.id]?.total === 0 ? 'font-medium text-rose-500' : 'text-slate-400'}`}
+                          title={`组/标签实时展开覆盖 ${listOrgPreview[k.id]?.total ?? '…'} 个账号（组 ∩ 标签，D5）`}
+                        >
+                          覆盖{listOrgPreview[k.id]?.total ?? '…'}账号
+                          {listOrgPreview[k.id]?.total === 0 && ' ⚠ 空集'}
+                        </span>
+                      )}
                     </td>
                     <td className="py-2 pr-4">
                       {k.enabled ? <Badge tone="green">启用中</Badge> : <Badge tone="slate">已禁用</Badge>}
@@ -709,6 +788,86 @@ export default function ApiKeysManager({
               )}
             </div>
           </div>
+          {/* 共享分组/标签绑定（P2 需求④，D5 交集语义）：绑定组织维度而非具体账号，
+              分组成员变化无需改 Key 即时生效；与上方精确白名单取并集 */}
+          <p className="text-xs text-slate-400">
+            精确白名单与分组/标签为「或」关系：账号只要命中其一即可被调度
+            （生效范围 = 精确白名单 ∪ 组∩标签展开）。不勾选分组/标签 = 不启用该维度。
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-slate-500">
+                分组
+                <span className="ml-1 font-normal text-slate-400">（不勾选 = 不限）</span>
+              </div>
+              <div className="max-h-32 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2 dark:border-zinc-700">
+                {sharedGroups.length === 0 ? (
+                  <div className="py-1 text-center text-xs text-slate-400">暂无共享分组</div>
+                ) : (
+                  sharedGroups.map((g) => (
+                    <label key={g.id} className="flex items-center gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={editGroups.has(g.id)}
+                        onChange={() => {
+                          const next = new Set(editGroups);
+                          if (next.has(g.id)) next.delete(g.id);
+                          else next.add(g.id);
+                          setEditGroups(next);
+                        }}
+                      />
+                      <span className="inline-block h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: g.color }} />
+                      <span className="truncate">{g.name}</span>
+                      <span className="ml-auto text-slate-400">{g.count}</span>
+                    </label>
+                  ))
+                )}
+              </div>
+            </div>
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-slate-500">
+                标签
+                <span className="ml-1 font-normal text-slate-400">（不勾选 = 不限）</span>
+              </div>
+              <div className="max-h-32 space-y-1 overflow-y-auto rounded-lg border border-slate-200 p-2 dark:border-zinc-700">
+                {sharedTags.length === 0 ? (
+                  <div className="py-1 text-center text-xs text-slate-400">暂无共享标签</div>
+                ) : (
+                  sharedTags.map((t) => (
+                    <label key={t.id} className="flex items-center gap-2 text-xs">
+                      <input
+                        type="checkbox"
+                        checked={editTags.has(t.id)}
+                        onChange={() => {
+                          const next = new Set(editTags);
+                          if (next.has(t.id)) next.delete(t.id);
+                          else next.add(t.id);
+                          setEditTags(next);
+                        }}
+                      />
+                      <span className="inline-block h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: t.color }} />
+                      <span className="truncate">{t.name}</span>
+                      <span className="ml-auto text-slate-400">{t.count}</span>
+                    </label>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+          {editGroups.size > 0 && editTags.size > 0 && (
+            <p className="text-xs text-sky-500">
+              分组与标签同时勾选时，取「既属于所选分组、又带有所选标签」的账号（交集）。
+            </p>
+          )}
+          {orgPreview && (
+            <p className={`text-xs ${orgPreview.total === 0 ? 'font-medium text-rose-500' : 'text-slate-400'}`}>
+              覆盖账号数（实时展开）：{orgPreview.total}
+              {orgPreview.trae ? ` · Trae ${orgPreview.trae}` : ''}
+              {orgPreview.buddy ? ` · Buddy ${orgPreview.buddy}` : ''}
+              {orgPreview.qoder ? ` · Qoder ${orgPreview.qoder}` : ''}
+              {orgPreview.total === 0 && ' ⚠ 展开为空集：该 Key 将无任何可取号账号，请调整分组/标签组合'}
+            </p>
+          )}
           {editKey && (editKey.daily_stats?.length ?? 0) > 0 && (
             <div>
               <div className="mb-1.5 text-xs font-medium text-slate-500">近 7 日请求统计</div>

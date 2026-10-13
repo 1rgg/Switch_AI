@@ -11,10 +11,15 @@ import KpiRow, { type PlatformKpi, type PlatformScope } from './KpiRow';
 import ExpiryTab from './ExpiryTab';
 import CreditsTab from './CreditsTab';
 import TokensTab, { type GatewayDays } from './TokensTab';
+import SessionsTab from './SessionsTab';
 import type {
+  AccountView,
+  GroupView,
   QoderCheckinRecord,
   QoderCreditsResult,
   QoderCreditsSnapshot,
+  TraeExpiredEntsResult,
+  UnifiedModel,
   UsageDayView,
   UsageHistoryResult,
   WbCheckinRecord,
@@ -25,6 +30,105 @@ import type {
   WbUsageOfficialAll,
 } from '../../types';
 
+/** 多选下拉（chips 触发 + 面板勾选；看板顶部分组/账号筛选控件） */
+function MultiSelectDropdown({
+  label,
+  options,
+  selected,
+  onChange,
+  onOpen,
+  width = 'w-56',
+}: {
+  label: string;
+  options: { id: string; name: string; color?: string }[];
+  selected: string[];
+  onChange: (ids: string[]) => void;
+  /** 打开面板时回调（分组下拉重拉成员数据用） */
+  onOpen?: () => void;
+  width?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+  const toggle = (id: string) =>
+    onChange(selected.includes(id) ? selected.filter((x) => x !== id) : [...selected, id]);
+  // 全量搜索（文档需求②：账号多选可直接全量搜账号）；打开时重置
+  const kw = search.trim().toLowerCase();
+  const visible = kw ? options.filter((o) => o.name.toLowerCase().includes(kw) || o.id.toLowerCase().includes(kw)) : options;
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        className={`btn-outline !py-1.5 !text-xs ${selected.length ? '!border-sky-400 text-sky-600 dark:text-sky-400' : ''}`}
+        onClick={() => {
+          setOpen((v) => !v);
+          setSearch('');
+          if (!open) onOpen?.();
+        }}
+      >
+        {label}
+        {selected.length > 0 && (
+          <span className="ml-1 rounded-full bg-sky-500 px-1.5 text-[10px] font-medium text-white">
+            {selected.length}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className={`absolute right-0 z-30 mt-1 max-h-72 ${width} overflow-auto rounded-lg border border-slate-200 bg-white p-2 shadow-lg dark:border-zinc-700 dark:bg-zinc-900`}>
+          {options.length > 5 && (
+            <input
+              autoFocus
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={`搜索${label}…`}
+              className="input mb-1 !py-1 !text-xs"
+            />
+          )}
+          {visible.length === 0 && (
+            <div className="px-2 py-1 text-xs text-slate-400">
+              {options.length === 0 ? '暂无可选项' : '无匹配项'}
+            </div>
+          )}
+          {visible.map((o) => (
+            <label
+              key={o.id}
+              className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-xs hover:bg-slate-50 dark:hover:bg-zinc-800"
+            >
+              <input
+                type="checkbox"
+                checked={selected.includes(o.id)}
+                onChange={() => toggle(o.id)}
+                className="h-3.5 w-3.5"
+              />
+              {o.color && (
+                <span className="inline-block h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: o.color }} />
+              )}
+              <span className="truncate">{o.name}</span>
+            </label>
+          ))}
+          {selected.length > 0 && (
+            <button
+              type="button"
+              onClick={() => onChange([])}
+              className="mt-1 w-full rounded px-2 py-1 text-left text-xs text-slate-400 hover:bg-slate-50 dark:hover:bg-zinc-800"
+            >
+              清空筛选（全部）
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /**
  * 积分看板（credits-dashboard-plan.md；平台拆分调整）：
  * 同一套看板组件按 platform 参数分别渲染 Trae / Buddy / Qoder 三个独立页面——
@@ -33,19 +137,20 @@ import type {
  * 布局：PageHeader（标题+概述）→ KPI 7 卡 → Tab 工具行（Tab 切换 + 刷新）→ Tab 内容。
  */
 
-type BoardTab = 'credits' | 'tokens' | 'expiry';
+type BoardTab = 'credits' | 'tokens' | 'expiry' | 'sessions';
 
 const TABS: { key: BoardTab; label: string }[] = [
   { key: 'credits', label: '积分统计' },
   { key: 'tokens', label: 'Token 统计' },
   { key: 'expiry', label: '积分到期' },
+  { key: 'sessions', label: '会话明细' },
 ];
 
-/** 页面标题/概述（三页同一结构：积分余额 · 积分明细 · Token 统计 · 到期日历） */
+/** 页面标题/概述（三页同一结构：积分余额 · 积分明细 · Token 统计 · 到期日历 · 会话明细） */
 const PAGE_META: Record<'trae' | 'buddy' | 'qoder', { title: string; desc: string }> = {
-  trae: { title: 'Trae · 积分看板', desc: '积分余额 · 积分明细 · Token 统计 · 到期日历' },
-  buddy: { title: 'Buddy · 积分看板', desc: '积分余额 · 积分明细 · Token 统计 · 到期日历' },
-  qoder: { title: 'Qoder · 积分看板', desc: '积分余额 · 积分明细 · Token 统计 · 到期日历' },
+  trae: { title: 'Trae · 积分看板', desc: '积分余额 · 积分明细 · Token 统计 · 到期日历 · 会话明细' },
+  buddy: { title: 'Buddy · 积分看板', desc: '积分余额 · 积分明细 · Token 统计 · 到期日历 · 会话明细' },
+  qoder: { title: 'Qoder · 积分看板', desc: '积分余额 · 积分明细 · Token 统计 · 到期日历 · 会话明细' },
 };
 
 function localDate(d: Date): string {
@@ -69,6 +174,8 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
 
   // Trae 侧数据（官网源消耗明细 + store 快照/签到历史；Buddy/Qoder 页不加载）
   const [usage, setUsage] = useState<UsageHistoryResult | null>(null);
+  // Trae 逐包到期（issue #82 T5.1：expired_ents 实时查询，含已过期包——credit_packs 缓存只含未过期可用包）
+  const [expiredEnts, setExpiredEnts] = useState<TraeExpiredEntsResult | null>(null);
   // Buddy 侧数据（Trae/Qoder 页不加载）
   const [wbCredits, setWbCredits] = useState<WbCreditsResult | null>(null);
   // 签到日志取 90 天窗口：KPI 今日新增 + 积分统计 Tab「区间总获得」共用
@@ -81,9 +188,107 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   const [qoderCredits, setQoderCredits] = useState<QoderCreditsResult | null>(null);
   const [qoderSnapshots, setQoderSnapshots] = useState<QoderCreditsSnapshot[]>([]);
   const [qoderCheckin, setQoderCheckin] = useState<QoderCheckinRecord[]>([]);
-  // 各统计 Tab 独立数据源状态（§3.4）；默认源按平台选择（Trae/Buddy 官网优先；Qoder 官网无消耗明细 → 本地快照）
+  // 各统计 Tab 独立数据源状态（§3.4）；默认源按平台选择（Trae/Buddy 官网优先；Qoder 官网无消耗明细 → 本地快照；
+  // Qoder Token 仅网关源有实测数据 → 默认网关）
   const [creditsSource, setCreditsSource] = useState<BoardSource>(platform === 'qoder' ? 'local' : 'official');
-  const [tokensSource, setTokensSource] = useState<BoardSource>(platform === 'trae' ? 'official' : 'local');
+  const [tokensSource, setTokensSource] = useState<BoardSource>(
+    platform === 'trae' ? 'official' : platform === 'qoder' ? 'gateway' : 'local',
+  );
+  // 会话明细 Tab 联动刷新键（refresh 完成后 +1 触发重查缓存，issue #82）
+  const [sessionsRefreshKey, setSessionsRefreshKey] = useState(0);
+
+  // ---- 顶部分组/账号筛选（P1 需求②）：平台视图内全局生效（KPI/积分/到期/Token 联动）----
+  // 分组下拉数据源 = 本池 groups_list().GroupView{id,name,uids}（共享分组生效后自动
+  // 包含其他应用创建的分组）；账号候选随分组筛选联动。筛选状态内存态（P1 不做持久化）。
+  const [poolGroups, setPoolGroups] = useState<GroupView[]>([]);
+  const [groupFilter, setGroupFilter] = useState<string[]>([]);
+  const [accountFilter, setAccountFilter] = useState<string[]>([]);
+  // 分组成员可能在他处（账号页/其他池）变更，下拉打开时重拉（失败保留旧值）
+  const reloadPoolGroups = useCallback(() => {
+    const loader =
+      platform === 'trae'
+        ? api.groups.list()
+        : platform === 'buddy'
+          ? api.workbuddy.groups.list()
+          : api.qoder.groups.list();
+    loader.then(setPoolGroups).catch(() => {});
+  }, [platform]);
+  useEffect(() => {
+    reloadPoolGroups();
+    // 平台切换时重置筛选（三实例共享组件，状态按平台语义独立）
+    setGroupFilter([]);
+    setAccountFilter([]);
+  }, [platform, reloadPoolGroups]);
+  // 生效 uid 集 = 组筛选成员集 ∩ 账号筛选集（均空 = 不限，null）
+  const visibleUids = useMemo<Set<string> | null>(() => {
+    let set: Set<string> | null = null;
+    if (groupFilter.length > 0) {
+      set = new Set();
+      for (const g of poolGroups) {
+        if (groupFilter.includes(g.id)) g.uids.forEach((u) => set!.add(u));
+      }
+    }
+    if (accountFilter.length > 0) {
+      const f = new Set(accountFilter);
+      set = set ? new Set([...set].filter((u) => f.has(u))) : f;
+    }
+    return set;
+  }, [poolGroups, groupFilter, accountFilter]);
+  // 有筛选时可见账号 uid 集合（空集 = 筛选结果为空，各面板如实展示零数据）
+  const filterByUid = useCallback(
+    <T extends { user_id: string }>(arr: T[]): T[] =>
+      visibleUids ? arr.filter((x) => visibleUids.has(x.user_id)) : arr,
+    [visibleUids],
+  );
+  const visibleAccounts = useMemo<AccountView[]>(() => filterByUid(accounts), [accounts, filterByUid]);
+  const visibleWbCredits = useMemo<WbCreditsResult | null>(
+    () => (wbCredits ? { ...wbCredits, accounts: filterByUid(wbCredits.accounts) } : wbCredits),
+    [wbCredits, filterByUid],
+  );
+  const visibleQoderCredits = useMemo<QoderCreditsResult | null>(
+    () => (qoderCredits ? { ...qoderCredits, accounts: filterByUid(qoderCredits.accounts) } : qoderCredits),
+    [qoderCredits, filterByUid],
+  );
+  // 消耗明细/Token 明细的账号级过滤（按明细携带的 user_id 过滤；无 uid 维度的
+  // 数据源不静默截断，工具行显示「不支持账号级筛选」徽标）
+  const visibleUsage = useMemo<UsageHistoryResult | null>(
+    () => (usage ? { ...usage, accounts: filterByUid(usage.accounts) } : usage),
+    [usage, filterByUid],
+  );
+  // 分组筛选生效 uid 集（仅分组，不含账号筛选；issue #82 问题4-2）
+  const groupUids = useMemo<Set<string> | null>(() => {
+    if (groupFilter.length === 0) return null;
+    const set = new Set<string>();
+    for (const g of poolGroups) {
+      if (groupFilter.includes(g.id)) g.uids.forEach((u) => set.add(u));
+    }
+    return set;
+  }, [poolGroups, groupFilter]);
+  // 账号多选候选（随分组筛选联动：勾选分组后仅列组内账号）。
+  // 审查修复（issue #82 问题4-2）：候选集必须只随分组收窄，不能取已按 accountFilter
+  // 过滤后的 visible* 集合——否则勾选任一账号后其余候选立即从下拉消失，多选无法叠加。
+  const accountCandidates = useMemo<{ id: string; name: string }[]>(() => {
+    const base =
+      platform === 'trae'
+        ? accounts.map((a) => ({ id: a.user_id, name: a.name }))
+        : platform === 'buddy'
+          ? (wbCredits?.accounts ?? []).map((a) => ({ id: a.user_id, name: a.name }))
+          : (qoderCredits?.accounts ?? []).map((a) => ({ id: a.user_id, name: a.name }));
+    return base.filter((a) => a.id && (!groupUids || groupUids.has(a.id)));
+  }, [platform, accounts, wbCredits, qoderCredits, groupUids]);
+  // 会话明细账号下拉按平台切换（Trae=vault 账号；Buddy/Qoder=积分接口账号清单；
+  // Qoder 数据源=网关请求级本地流水，issue #82 问题5）。
+  // 跟随顶部分组/账号筛选（shared-groups-tags 合并集成：平台视图内全局生效契约）。
+  const sessionAccountOptions = useMemo(
+    () =>
+      platform === 'buddy'
+        ? filterByUid(wbCredits?.accounts ?? []).map((a) => ({ user_id: a.user_id, name: a.name }))
+        : platform === 'qoder'
+          ? filterByUid(qoderCredits?.accounts ?? []).map((a) => ({ user_id: a.user_id, name: a.name }))
+          : filterByUid(accounts).map((a) => ({ user_id: a.user_id, name: a.name })),
+    [platform, wbCredits, qoderCredits, accounts, filterByUid],
+  );
+  const filtersActive = groupFilter.length > 0 || accountFilter.length > 0;
 
   // Token 统计 Tab 数据（懒加载：首次切到 Token Tab 才拉取，§3.4 lazy 触发）
   const [tokenStats, setTokenStats] = useState<WbTokenStats | null>(null);
@@ -93,6 +298,9 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   const tokensLoadedRef = useRef(false);
   // 网关数据触发点有两个：Token 统计 Tab 与 积分统计 Tab 的网关源（审查修复）
   const gatewayLoadedRef = useRef(false);
+  // Qoder 网关就绪标记（issue #82 T3.1）：统一目录含 enabled 的 qoder 源才点亮网关数据源，
+  // 否则 sourceDisabled 提示未接入（静态文案的动态化）
+  const [qoderGatewayReady, setQoderGatewayReady] = useState(false);
 
   const loadUsage = useCallback(
     async (fresh: boolean) => {
@@ -104,6 +312,16 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
     },
     [pushToast],
   );
+
+  // Trae 逐包到期（issue #82 T5.1）：expired_ents 实时轻请求；失败保留旧数据展示 + toast
+  // （stale-on-error 惯例，不置 null 清空既有到期条目）
+  const loadExpiredEnts = useCallback(async () => {
+    try {
+      setExpiredEnts(await api.accounts.traeExpiredEnts());
+    } catch (err) {
+      pushToast('error', `Trae 逐包到期查询失败：${String(err)}`);
+    }
+  }, [pushToast]);
 
   const loadBuddy = useCallback(
     async (fresh: boolean) => {
@@ -236,12 +454,26 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
           isTrae ? refreshCreditsDaily() : Promise.resolve(),
           isTrae ? refreshCreditsHistory() : Promise.resolve(),
           isTrae ? loadUsage(fresh) : Promise.resolve(),
+          // 逐包到期实时查询（issue #82 T5.1）：仅「刷新数据」联动重拉；
+          // 进入页面由独立 effect 拉取、调度器静默同步不触发（避免后台静默网络请求）
+          isTrae && fresh ? loadExpiredEnts() : Promise.resolve(),
           isTrae || isQoder ? Promise.resolve() : loadBuddy(fresh),
           isQoder ? loadQoder(fresh) : Promise.resolve(),
+          // Qoder 网关就绪探测（issue #82 T3.1）：统一目录含 enabled 的 qoder 源 → 点亮网关数据源
+          isQoder
+            ? api.apiServer
+                .unifiedModels()
+                .then((list: UnifiedModel[]) =>
+                  setQoderGatewayReady(list.some((m) => m.sources.some((s) => s.pool === 'qoder' && s.enabled))),
+                )
+                .catch(() => setQoderGatewayReady(false))
+            : Promise.resolve(),
           // 已加载过的源随全局刷新联动（fresh=true 本地重扫 + 网关直查）
           tokensLoadedRef.current && fresh ? loadTokens(true) : Promise.resolve(),
           gatewayLoadedRef.current && fresh ? loadGateway() : Promise.resolve(),
         ]);
+        // 会话明细 Tab 纯读缓存：随看板刷新联动重查（含调度器静默同步）
+        setSessionsRefreshKey((k) => k + 1);
       };
       try {
         if (silent) await work();
@@ -253,7 +485,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
         if (!silent) setLoading(false);
       }
     },
-    [isTrae, isQoder, refreshRemainingCredits, refreshCreditsDaily, refreshCreditsHistory, loadUsage, loadBuddy, loadQoder, loadTokens, loadGateway, pushToast],
+    [isTrae, isQoder, refreshRemainingCredits, refreshCreditsDaily, refreshCreditsHistory, loadUsage, loadExpiredEnts, loadBuddy, loadQoder, loadTokens, loadGateway, pushToast],
   );
 
   // refresh 引用最新闭包（依赖链深，listen effect 只随 platform 注册一次，
@@ -267,6 +499,12 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
     void refresh(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Trae 逐包到期（issue #82 T5.1）：进入页面实时查询一次；「刷新数据」经 refresh(fresh=true)
+  // 联动重拉，调度器静默同步不触发（实时轻请求，避免后台静默网络请求）
+  useEffect(() => {
+    if (isTrae) void loadExpiredEnts();
+  }, [isTrae, loadExpiredEnts]);
 
   // 调度器看板数据同步成功后联动重读缓存（issue #61：页面常驻时数据不再滞后）；
   // payload.platform 与本视图平台匹配才刷新，静默走 refresh(false, true)（纯读缓存、零网络、无 loading 闪烁）
@@ -294,7 +532,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
     let totalCredits = 0;
     let packages = 0;
     let expiring = 0;
-    for (const a of accounts) {
+    for (const a of visibleAccounts) {
       totalCredits += a.remaining_credits ?? 0;
       // 积分包总数 + 7 天内到期：有包明细 → 包级口径（逐包过滤 + 累计，
       // 与 Buddy buddyKpi 循环同构）；无明细（老缓存）→ 回退账号级汇总（原实现）
@@ -322,39 +560,42 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       .filter((r) => r.date === today)
       .reduce((s, r) => s + (r.delta || 0), 0);
     const todayEarned = snap && snap.earned > 0 ? snap.earned : Math.max(0, histDelta);
-    // 今日消耗：官网接口明细优先（credits_float 实际口径），回退快照 consumed
+    // 今日消耗：官网接口明细优先（credits_float 实际口径），回退快照 consumed。
+    // 审查修复：按当前筛选口径取数（visibleUsage），与「筛选作用于 KPI」语义一致
     const usageVal =
-      usage?.accounts.reduce(
+      visibleUsage?.accounts.reduce(
         (s, a) => s + (a.daily.find((d) => d.date === today)?.credits ?? 0),
         0,
       ) ?? 0;
-    const todayConsumed = usage != null && usageVal > 0 ? usageVal : (snap?.consumed ?? 0);
+    // 审查 No.10：筛选明细口径可用时完全信任其值（含 0——筛掉全部有消耗账号后应显示
+    // 0，而非静默混入未过滤的全局快照口径）；仅明细缺失（fetch 失败/未加载）时回退快照
+    const todayConsumed = visibleUsage != null ? usageVal : (snap?.consumed ?? 0);
     return {
-      accounts: accounts.length,
+      accounts: visibleAccounts.length,
       totalCredits,
       packages,
       todayEarned,
       todayConsumed,
       expiring7d: expiring,
     };
-  }, [accounts, creditsDaily, creditsHistory, usage, today]);
+  }, [visibleAccounts, creditsDaily, creditsHistory, visibleUsage, today]);
 
   // Trae「可用积分总数」卡细分（对齐原积分看板 totalHint）；账号无通用/Work 字段时回退通用文案
   const traeTotalHint = useMemo(() => {
     if (!isTrae) return undefined;
-    if (!accounts.some((a) => a.general_credits != null || a.work_credits != null)) {
+    if (!visibleAccounts.some((a) => a.general_credits != null || a.work_credits != null)) {
       return '总剩余可用积分';
     }
-    const generalTotal = accounts.reduce((s, a) => s + (a.general_credits ?? 0), 0);
-    const workTotal = accounts.reduce((s, a) => s + (a.work_credits ?? 0), 0);
+    const generalTotal = visibleAccounts.reduce((s, a) => s + (a.general_credits ?? 0), 0);
+    const workTotal = visibleAccounts.reduce((s, a) => s + (a.work_credits ?? 0), 0);
     return `通用 ${fmtCredits(generalTotal)} 积分 · Work ${fmtCredits(workTotal)} 积分`;
-  }, [isTrae, accounts]);
+  }, [isTrae, visibleAccounts]);
 
   // ---- Buddy KPI（§2.1/§2.2）----
   const buddyKpi = useMemo<PlatformKpi>(() => {
     const nowSec = Date.now() / 1000;
     const horizon = nowSec + 7 * 86400;
-    const accs = wbCredits?.accounts ?? [];
+    const accs = visibleWbCredits?.accounts ?? [];
     let totalCredits = 0;
     let packages = 0;
     let expiring = 0;
@@ -386,13 +627,13 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       todayConsumed,
       expiring7d: expiring,
     };
-  }, [wbCredits, wbCheckin, wbSnapshots, wbOfficial, wbFallback, today]);
+  }, [visibleWbCredits, wbCheckin, wbSnapshots, wbOfficial, wbFallback, today]);
 
   // ---- Qoder KPI（官网积分查询 + 本地快照差分）----
   const qoderKpi = useMemo<PlatformKpi>(() => {
     const nowSec = Date.now() / 1000;
     const horizon = nowSec + 7 * 86400;
-    const accs = qoderCredits?.accounts ?? [];
+    const accs = visibleQoderCredits?.accounts ?? [];
     let totalCredits = 0;
     let packages = 0;
     let expiring = 0;
@@ -434,7 +675,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       todayConsumed: todaySnap?.consumed ?? null,
       expiring7d: expiring,
     };
-  }, [qoderCredits, qoderSnapshots, qoderCheckin, today]);
+  }, [visibleQoderCredits, qoderSnapshots, qoderCheckin, today]);
 
   const kpi = isTrae ? traeKpi : isQoder ? qoderKpi : buddyKpi;
 
@@ -486,14 +727,18 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
   const scope: PlatformScope = platform;
 
   // ---- 第二层分类：数据源切换（业务面板外，页面工具行承载）----
+  // gateway 禁用文案动态化（issue #82 T3.1）：Qoder 网关就绪（统一目录含 enabled qoder 源）
+  // 时不禁用网关源，未就绪时给接入引导
   const activeSource = tab === 'credits' ? creditsSource : tokensSource;
   const sourceDisabled: Partial<Record<BoardSource, string>> =
     tab === 'tokens'
       ? isQoder
         ? {
             local: 'Qoder 本地日志 token 字段恒为 0（官方模型计费在服务端，实测无可用值）',
-            gateway: 'Qoder 上游未接入（网关用量管道已铺，接入后点亮）',
             official: 'Qoder 官网未提供 token 用量接口',
+            ...(qoderGatewayReady
+              ? {}
+              : { gateway: 'Qoder 网关未启用（在 API 服务页启用 Qoder 池并将客户端指向本地网关后点亮）' }),
           }
         : platform === 'trae'
           ? { local: '本地 Token 统计 = WorkBuddy 桌面端 + CodeBuddy IDE 会话，Trae 无本地源' }
@@ -501,7 +746,9 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       : isQoder
         ? {
             official: 'Qoder 官网未提供按日消耗明细接口',
-            gateway: 'Qoder 上游未接入（网关用量管道已铺，接入后点亮）',
+            ...(qoderGatewayReady
+              ? {}
+              : { gateway: 'Qoder 网关未启用（在 API 服务页启用 Qoder 池并将客户端指向本地网关后点亮）' }),
           }
         : platform === 'trae'
           ? { local: '本地源 = WB 客户端会话快照差分，Trae 无本地源' }
@@ -545,13 +792,44 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
             </button>
           ))}
         </div>
-        <button className="btn-outline" onClick={() => void refresh(true)} disabled={loading}>
-          <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新数据
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          {/* 顶部分组/账号筛选（P1 需求②）：平台视图内全局生效 */}
+          <MultiSelectDropdown
+            label="分组"
+            onOpen={reloadPoolGroups}
+            options={poolGroups.map((g) => ({ id: g.id, name: `${g.name} (${g.count})`, color: g.color }))}
+            selected={groupFilter}
+            onChange={(ids) => {
+              setGroupFilter(ids);
+              // 分组变化后账号候选联动收窄；已选账号若不在新候选内则清空账号筛选
+              setAccountFilter((prev) => prev.filter((id) => {
+                if (ids.length === 0) return true;
+                return poolGroups.some((g) => ids.includes(g.id) && g.uids.includes(id));
+              }));
+            }}
+          />
+          <MultiSelectDropdown
+            label="账号"
+            options={accountCandidates}
+            selected={accountFilter}
+            onChange={setAccountFilter}
+          />
+          {filtersActive && tab !== 'expiry' && tab !== 'sessions' && !(platform === 'trae' && activeSource === 'official') && (
+            <span
+              className="inline-flex items-center rounded-full bg-amber-100 px-2.5 py-0.5 text-[11px] font-medium text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+              title="当前数据源为聚合口径（无账号维度），筛选仅作用于 KPI 与到期日历；消耗/Token 明细不做静默截断"
+            >
+              该数据源不支持账号级筛选
+            </span>
+          )}
+          <button className="btn-outline" onClick={() => void refresh(true)} disabled={loading}>
+            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新数据
+          </button>
+        </div>
       </div>
 
-      {/* 第二层分类：数据源切换（积分统计 / Token 统计 Tab；到期 Tab 无数据源维度） */}
-      {tab !== 'expiry' && (
+      {/* 第二层分类：数据源切换（积分统计 / Token 统计 Tab；到期/会话明细 Tab 无数据源维度） */}
+      {tab !== 'expiry' && tab !== 'sessions' && (
         <div className="mb-4 flex flex-wrap items-center gap-2">
           <span className="text-xs font-medium text-slate-500 dark:text-zinc-400">数据源</span>
           <div className="flex rounded-lg bg-slate-100 p-1 dark:bg-zinc-900">
@@ -581,25 +859,29 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
       )}
 
       {tab === 'expiry' ? (
-        <ExpiryTab scope={scope} accounts={accounts} wbCredits={wbCredits} qoderCredits={qoderCredits} />
+        <ExpiryTab scope={scope} accounts={visibleAccounts} wbCredits={visibleWbCredits} qoderCredits={visibleQoderCredits} expiredEnts={expiredEnts} />
+      ) : tab === 'sessions' ? (
+        <SessionsTab scope={scope} accountOptions={sessionAccountOptions} refreshKey={sessionsRefreshKey} />
       ) : tab === 'credits' ? (
         <CreditsTab
           scope={scope}
           source={activeSource}
-          usage={usage}
+          usage={visibleUsage}
           creditsDaily={creditsDaily}
           wbOfficial={wbOfficial}
           wbFallback={wbFallback}
           wbSnapshots={wbSnapshots}
           wbCheckin={wbCheckin}
           qoderSnapshots={qoderSnapshots}
+          qoderCheckin={qoderCheckin}
           gateway={gateway}
+          uidSet={visibleUids}
         />
       ) : (
         <TokensTab
           scope={scope}
           source={activeSource}
-          usage={usage}
+          usage={visibleUsage}
           tokenStats={tokenStats}
           gateway={gateway}
         />

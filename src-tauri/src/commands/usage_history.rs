@@ -20,7 +20,7 @@
 use chrono::TimeZone;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use tauri::State;
 
 use crate::state::AppState;
@@ -37,6 +37,9 @@ const PAGE_SIZE: u32 = 20;
 const USAGE_TYPE: i64 = 7;
 
 const USAGE_URL: &str = "https://api.trae.cn/trae/api/v1/pay/query_user_usage_group_by_session";
+/// 已过期/临期权益包查询（issue #82 T5.1：TraeTools GetExpiredEntsAsync 同接口）。
+/// 返回含已过期包——credit_packs 缓存只含「剩余>0 且未过期」的包，本接口补齐到期日历的已过期展示
+const EXPIRED_ENTS_URL: &str = "https://api.trae.cn/trae/api/v2/pay/expired_ents";
 
 /// 单日聚合（date → 消耗合计 / 会话数 / 模型分布 / token 明细）
 #[derive(Serialize, serde::Deserialize, Clone, Default)]
@@ -48,6 +51,28 @@ pub struct UsageDayStat {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+}
+
+/// 会话级行明细（按本地日落盘 date → rows，供「会话明细」Tab 查询；issue #82）。
+/// 与 UsageDayStat 同源采集（fetch_chunk 内一次遍历同时产出聚合与行明细）。
+#[derive(Serialize, serde::Deserialize, Clone, Default)]
+pub struct UsageSessionRow {
+    pub session_id: String,
+    /// usage_time（Unix 秒）
+    pub ts: i64,
+    pub model: String,
+    /// 会话模式（agent/chat 等；上游缺失为空串）
+    pub mode: String,
+    /// 消耗积分（credits_float，兜底 amount_float）
+    pub credits: f64,
+    /// 消耗金额（cost_money_float；上游缺失为 0）
+    pub cost_money: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    /// 会话说明（user_input_preview，截断 200 字符）
+    pub preview: String,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -69,12 +94,42 @@ pub struct UsageHistoryResult {
     pub accounts: Vec<UsageHistoryAccount>,
 }
 
+/// 已过期/临期权益包（issue #82 T5.1：/trae/api/v2/pay/expired_ents 实时查询）
+#[derive(Serialize, Clone, Default)]
+pub struct TraeExpiredEnt {
+    /// 包名（与 credit_packs[].source 同源口径，前端按「包名+到期时间」去重）
+    pub name: String,
+    /// 包总额度（credits_limit）
+    pub credits_limit: f64,
+    /// 过期时间（Unix 毫秒，上游原值；前端转秒展示）
+    pub expire_time_ms: i64,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct TraeExpiredEntsAccount {
+    pub user_id: String,
+    pub name: String,
+    pub ok: bool,
+    /// 单账号查询失败原因（其余账号不受影响）
+    pub error: Option<String>,
+    pub expired: Vec<TraeExpiredEnt>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct TraeExpiredEntsResult {
+    pub fetched_at: i64,
+    pub accounts: Vec<TraeExpiredEntsAccount>,
+}
+
 #[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
 struct CachedAccount {
     name: String,
     /// 上次拉取的 end_time（Unix 秒）——增量起点 = 该时刻所在本地日的 00:00
     last_fetch_end_ts: Option<i64>,
     daily: BTreeMap<String, UsageDayStat>,
+    /// 会话级行明细（date → 行列表；serde default 兼容旧缓存文件）
+    #[serde(default)]
+    sessions: BTreeMap<String, Vec<UsageSessionRow>>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Default)]
@@ -124,14 +179,20 @@ fn local_midnight_ts(date: &str) -> Option<i64> {
 /// 浏览器 UA + origin/referer www.trae.cn + sec-fetch cors/same-site，
 /// **不带** IDE 客户端指纹头（x-market-*/x-device-id 等；该接口按 Web 路由校验，
 /// 客户端头 + 大分页/大区间组合返回 400 code=9004 参数错误）。
-fn web_usage_post(agent: &ureq::Agent, jwt: &str, body: serde_json::Value) -> Result<Value, String> {
+/// T5.1 起泛化 url 参数：usage 拉取与 expired_ents 逐包到期共用同一头部惯例。
+fn web_usage_post(
+    agent: &ureq::Agent,
+    jwt: &str,
+    url: &str,
+    body: serde_json::Value,
+) -> Result<Value, String> {
     let auth = if jwt.starts_with("Cloud-IDE-JWT ") {
         jwt.to_string()
     } else {
         format!("Cloud-IDE-JWT {}", jwt.trim())
     };
     let resp = agent
-        .post(USAGE_URL)
+        .post(url)
         .set("accept", "application/json, text/plain, */*")
         .set("accept-language", "zh-CN,zh;q=0.9")
         .set("authorization", &auth)
@@ -161,29 +222,51 @@ fn fetch_account_usage(
     jwt: &str,
     start_ts: i64,
     end_ts: i64,
-) -> Result<BTreeMap<String, UsageDayStat>, String> {
+) -> Result<
+    (
+        BTreeMap<String, UsageDayStat>,
+        BTreeMap<String, Vec<UsageSessionRow>>,
+    ),
+    String,
+> {
     let agent = crate::commands::accounts::pay_status_agent();
 
     let mut agg: BTreeMap<String, UsageDayStat> = BTreeMap::new();
+    let mut sessions: BTreeMap<String, Vec<UsageSessionRow>> = BTreeMap::new();
     let mut chunk_end = end_ts;
     loop {
         let chunk_start = (chunk_end - CHUNK_DAYS * 86400 + 1).max(start_ts);
-        fetch_chunk(&agent, jwt, chunk_start, chunk_end, &mut agg)?;
+        fetch_chunk(&agent, jwt, chunk_start, chunk_end, &mut agg, &mut sessions)?;
         if chunk_start <= start_ts {
             break;
         }
         chunk_end = chunk_start - 1;
     }
-    Ok(agg)
+    Ok((agg, sessions))
 }
 
-/// 单分块（≤30 天）分页拉取并聚合进 agg
+/// 会话说明截断（200 字符，防异常长文本撑爆缓存与表格）
+fn truncate_preview(s: &str) -> String {
+    s.chars().take(200).collect()
+}
+
+/// 会话积分提取（T1.5 回归口径）：credits_float 优先，旧版字段 amount_float 兜底；
+/// 均缺失或非数值时为 0.0（不伪造积分）
+fn extract_session_credits(s: &Value) -> f64 {
+    s.get("credits_float")
+        .and_then(Value::as_f64)
+        .or_else(|| s.get("amount_float").and_then(Value::as_f64))
+        .unwrap_or(0.0)
+}
+
+/// 单分块（≤30 天）分页拉取并聚合进 agg，同时产出会话级行明细（issue #82）
 fn fetch_chunk(
     agent: &ureq::Agent,
     jwt: &str,
     start_ts: i64,
     end_ts: i64,
     agg: &mut BTreeMap<String, UsageDayStat>,
+    sessions: &mut BTreeMap<String, Vec<UsageSessionRow>>,
 ) -> Result<(), String> {
     let mut page: u32 = 1;
     let mut got: usize = 0;
@@ -197,7 +280,7 @@ fn fetch_chunk(
             "page_num": page,
             "usage_type": [USAGE_TYPE],
         });
-        let resp = web_usage_post(agent, jwt, body)?;
+        let resp = web_usage_post(agent, jwt, USAGE_URL, body)?;
         if total.is_none() {
             total = Some(resp.get("total").and_then(Value::as_u64).unwrap_or(0) as usize);
         }
@@ -218,11 +301,7 @@ fn fetch_chunk(
             let Some(date) = local_date_of(ts) else {
                 continue;
             };
-            let credits = s
-                .get("credits_float")
-                .and_then(Value::as_f64)
-                .or_else(|| s.get("amount_float").and_then(Value::as_f64))
-                .unwrap_or(0.0);
+            let credits = extract_session_credits(s);
             let model = s
                 .get("model_name")
                 .and_then(Value::as_str)
@@ -230,8 +309,44 @@ fn fetch_chunk(
                 .filter(|m| !m.is_empty())
                 .unwrap_or("未知模型")
                 .to_string();
+            // 会话级行明细（issue #82）：与聚合同源同次遍历产出；字段缺失用安全默认值
+            let extra = s.get("extra_info");
+            let tok = |k: &str| -> u64 {
+                extra
+                    .and_then(|e| e.get(k))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            };
+            let row = UsageSessionRow {
+                session_id: s
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                ts,
+                model: model.clone(),
+                mode: s
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                credits,
+                cost_money: s
+                    .get("cost_money_float")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0),
+                input_tokens: tok("input_token"),
+                output_tokens: tok("output_token"),
+                cache_read_tokens: tok("cache_read_token"),
+                cache_write_tokens: tok("cache_write_token"),
+                preview: s
+                    .get("user_input_preview")
+                    .and_then(Value::as_str)
+                    .map(truncate_preview)
+                    .unwrap_or_default(),
+            };
             let e = agg.entry(date.clone()).or_default();
-            e.date = date;
+            e.date = date.clone();
             e.credits += credits;
             e.sessions += 1;
             *e.models.entry(model).or_insert(0.0) += credits;
@@ -243,6 +358,7 @@ fn fetch_chunk(
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
             }
+            sessions.entry(date).or_default().push(row);
         }
         got += arr.len();
         let total_n = total.unwrap_or(0);
@@ -267,22 +383,108 @@ pub fn usage_history_fetch(
     usage_history_fetch_impl(&state, fresh.unwrap_or(false))
 }
 
+/// Trae 逐包精确到期（issue #82 T5.1）：`POST /trae/api/v2/pay/expired_ents` 实时查询，
+/// 返回含已过期包——credit_packs 缓存只含「剩余>0 且未过期」的包，本接口补齐到期日历的
+/// 已过期展示（前端按「包名+到期时间」去重后并入）。头部复用 web_usage_post 的 Web 路由
+/// 形态（浏览器 UA + origin/referer，不带 IDE 指纹头）；JWT 仅进请求头（凭证红线）。
+/// 无分页无缓存、轻请求：随看板进入/手动刷新触发，调度器静默同步不触发。
+/// 单账号失败行内注明（对齐部分失败惯例）；无 JWT 占位账号行内注明原因、不发请求。
+#[tauri::command(async)]
+pub fn trae_expired_ents(state: State<AppState>) -> Result<TraeExpiredEntsResult, String> {
+    let now_ms = chrono::Local::now().timestamp_millis();
+    let agent = crate::commands::accounts::pay_status_agent();
+    let accounts = crate::vault::load_accounts(&state);
+    let mut out: Vec<TraeExpiredEntsAccount> = Vec::new();
+    for a in &accounts.accounts {
+        let Some(uid) = a.user_id.clone().filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        let name = a.name.clone();
+        // 占位账号（无 JWT）：不发请求，行内注明原因（原先静默跳过，前端无从感知，审查 P5）
+        if a.jwt.trim().is_empty() {
+            out.push(TraeExpiredEntsAccount {
+                user_id: uid,
+                name,
+                ok: false,
+                error: Some("无有效凭证（未登录），已跳过".to_string()),
+                expired: Vec::new(),
+            });
+            continue;
+        }
+        // 接口无分页参数（实测响应 expired_ent_list 一次性返回），空 JSON 请求体
+        let expired = match web_usage_post(&agent, &a.jwt, EXPIRED_ENTS_URL, json!({})) {
+            Ok(resp) => resp
+                .get("expired_ent_list")
+                .and_then(Value::as_array)
+                .map(|list| {
+                    list.iter()
+                        .map(|e| TraeExpiredEnt {
+                            name: e
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            credits_limit: e
+                                .get("credits_limit")
+                                .and_then(Value::as_f64)
+                                .unwrap_or(0.0),
+                            expire_time_ms: e
+                                .get("expire_time_ms")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(e) => {
+                out.push(TraeExpiredEntsAccount {
+                    user_id: uid,
+                    name,
+                    ok: false,
+                    error: Some(e),
+                    expired: Vec::new(),
+                });
+                continue;
+            }
+        };
+        out.push(TraeExpiredEntsAccount {
+            user_id: uid,
+            name,
+            ok: true,
+            error: None,
+            expired,
+        });
+    }
+    Ok(TraeExpiredEntsResult {
+        fetched_at: now_ms,
+        accounts: out,
+    })
+}
+
 /// 实现（本命令与调度器 `trae-usage-sync` / CLI `--task-run trae-usage-sync` 共用，issue #61）。
 /// 失败分流（对齐 qoder_credits::run_snapshot_task 惯例）：全部有凭证账号拉取失败 → Err
 /// （不覆盖 fetched_at，调度器 30 分钟冷却重试）；部分失败 → Ok（保留旧缓存逐账号注明错误）。
+/// 消耗明细表级读改写互斥（审查 P2-3）：调度器定时任务（scheduler.rs）、GUI 手动刷新、
+/// CLI `--task-run trae-usage-sync`（tasks/mod.rs）三路共用本实现，并发 fresh 拉取时
+/// 整表 load→save 互相覆盖丢增量（CHANGELOG 曾声称修复，但此前仅 Buddy 侧落实）。
+/// 持锁覆盖 fresh 路径 load→网络→save 全程；只读缓存路径不持锁，不被网络往返阻塞。
+/// 叶子锁：持锁期间不得再获取其他锁。跨进程并发由 SQLite 事务保证单次落库原子性，
+/// 极端场景最坏丢一次增量，下轮拉取按 last_fetch_end_ts 区间覆盖自愈。
+static USAGE_HISTORY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn usage_history_fetch_impl(
     state: &AppState,
     fresh: bool,
 ) -> Result<UsageHistoryResult, String> {
     let now_ts = chrono::Local::now().timestamp();
     let accounts = crate::vault::load_accounts(state);
-    let mut cache: CacheFile = serde_json::from_value(
-        crate::store::docs::usage_history_load(&crate::store::db(&state.data_dir)),
-    )
-    .unwrap_or_default();
 
-    // 纯缓存读取（零网络；尚未拉取过的账号如实提示）
+    // 纯缓存读取（零网络；尚未拉取过的账号如实提示）——不持锁
     if !fresh {
+        let cache: CacheFile = serde_json::from_value(
+            crate::store::docs::usage_history_load(&crate::store::db(&state.data_dir)),
+        )
+        .unwrap_or_default();
         let mut out = Vec::new();
         for a in &accounts.accounts {
             let Some(uid) = a.user_id.clone().filter(|u| !u.is_empty()) else {
@@ -306,6 +508,13 @@ pub fn usage_history_fetch_impl(
         });
     }
 
+    // fresh 拉取：全程持表级互斥（load→网络→save；并发拉取串行化防丢增量）
+    let _guard = USAGE_HISTORY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cache: CacheFile = serde_json::from_value(
+        crate::store::docs::usage_history_load(&crate::store::db(&state.data_dir)),
+    )
+    .unwrap_or_default();
+
     // 增量拉取：无缓存账号全量近一年；已有账号从上次拉取日 00:00 重拉并替换该日及之后
     let full_start = now_ts - FULL_PULL_DAYS * 86400;
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
@@ -320,33 +529,31 @@ pub fn usage_history_fetch_impl(
             continue;
         }
         attempted += 1;
+        // 旧缓存回填（issue #82）：会话级明细上线前的缓存只有 daily、sessions 为空
+        // （serde(default)），增量路径只重拉最近一天，历史会话行永不回填，前端
+        // 「会话明细」永远空白。检测「daily 有值但 sessions 无行」→ 该账号一次性
+        // 走全量重拉（refetch_from 置空整体替换），拉成功后 sessions 非空自然恢复增量。
+        let legacy_no_sessions = cache
+            .accounts
+            .get(&uid)
+            .map(|c| !c.daily.is_empty() && c.sessions.values().all(|v| v.is_empty()))
+            .unwrap_or(false);
         let (start_ts, refetch_from) =
             match cache.accounts.get(&uid).and_then(|c| c.last_fetch_end_ts) {
-                Some(last_end) => {
+                Some(last_end) if !legacy_no_sessions => {
                     let from_date = local_date_of(last_end)
                         .or_else(|| local_date_of(now_ts))
                         .unwrap_or_default();
                     let midnight = local_midnight_ts(&from_date).unwrap_or(now_ts - 86400);
                     (midnight, from_date)
                 }
-                None => (full_start, String::new()),
+                _ => (full_start, String::new()),
             };
         match fetch_account_usage(&a.jwt, start_ts, now_ts) {
-            Ok(new_agg) => {
+            Ok((new_agg, new_sessions)) => {
                 let entry = cache.accounts.entry(uid.clone()).or_default();
                 entry.name = name;
-                if refetch_from.is_empty() {
-                    // 全量：整体替换
-                    entry.daily = new_agg;
-                } else {
-                    // 增量：替换 refetch_from 及之后的日聚合（当天多次拉取不叠加）
-                    entry
-                        .daily
-                        .retain(|d, _| d.as_str() < refetch_from.as_str());
-                    for (d, v) in new_agg {
-                        entry.daily.insert(d, v);
-                    }
-                }
+                apply_fetch_result(entry, new_agg, new_sessions, &refetch_from);
                 entry.last_fetch_end_ts = Some(now_ts);
             }
             Err(e) => {
@@ -402,6 +609,160 @@ pub fn usage_history_fetch_impl(
     })
 }
 
+/// 拉取结果落库（全量整体替换 / 增量替换 refetch_from 及之后的本地日）。
+/// daily 与 sessions 同语义：同日重拉不叠加（issue #61 增量语义对会话行同样适用）。
+fn apply_fetch_result(
+    entry: &mut CachedAccount,
+    mut new_agg: BTreeMap<String, UsageDayStat>,
+    new_sessions: BTreeMap<String, Vec<UsageSessionRow>>,
+    refetch_from: &str,
+) {
+    // date 从映射键回填（防上游遗漏导致 daily.date 为空、前端区间匹配失败）
+    for (d, v) in new_agg.iter_mut() {
+        if v.date.is_empty() {
+            v.date = d.clone();
+        }
+    }
+    if refetch_from.is_empty() {
+        // 全量：整体替换
+        entry.daily = new_agg;
+        entry.sessions = new_sessions;
+    } else {
+        // 增量：替换 refetch_from 及之后的日聚合/会话行（当天多次拉取不叠加）
+        entry.daily.retain(|d, _| d.as_str() < refetch_from);
+        for (d, v) in new_agg {
+            entry.daily.insert(d, v);
+        }
+        entry.sessions.retain(|d, _| d.as_str() < refetch_from);
+        for (d, v) in new_sessions {
+            entry.sessions.insert(d, v);
+        }
+    }
+}
+
+/// 会话明细视图行（缓存行 + 账号信息拼装）
+#[derive(Serialize, Clone, Default)]
+pub struct UsageSessionView {
+    pub user_id: String,
+    pub account_name: String,
+    pub session_id: String,
+    /// usage_time（Unix 秒）
+    pub ts: i64,
+    /// 本地自然日（YYYY-MM-DD）
+    pub date: String,
+    pub model: String,
+    pub mode: String,
+    pub credits: f64,
+    pub cost_money: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub preview: String,
+}
+
+#[derive(Serialize, Clone, Default)]
+pub struct UsageSessionsResult {
+    pub fetched_at: i64,
+    /// 过滤后总行数（分页前）
+    pub total: u64,
+    /// 过滤后区间总积分（分页前）
+    pub credits_total: f64,
+    pub page: u32,
+    pub page_size: u32,
+    pub rows: Vec<UsageSessionView>,
+    /// 区间内出现过的模型清单（筛选下拉用，不受 model 过滤影响）
+    pub models: Vec<String>,
+}
+
+/// 会话明细查询（纯缓存零网络；issue #82 会话明细 Tab）。
+/// 区间 [start, end] 按本地日字符串（YYYY-MM-DD 字典序即时间序）比较；
+/// model/user_id 可选过滤；按会话时间倒序分页返回。
+#[tauri::command(async)]
+pub fn usage_sessions_query(
+    state: State<AppState>,
+    start: String,
+    end: String,
+    model: Option<String>,
+    user_id: Option<String>,
+    page: Option<u32>,
+    page_size: Option<u32>,
+) -> Result<UsageSessionsResult, String> {
+    let cache: CacheFile = serde_json::from_value(
+        crate::store::docs::usage_history_load(&crate::store::db(&state.data_dir)),
+    )
+    .unwrap_or_default();
+
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.unwrap_or(50).clamp(1, 200);
+    let model_filter = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
+    let uid_filter = user_id.as_deref().map(str::trim).filter(|u| !u.is_empty());
+
+    // 账号清单以 vault 为准（与聚合视图口径一致：已删除账号的缓存行不展示）
+    let accounts = crate::vault::load_accounts(&state);
+    let mut rows: Vec<UsageSessionView> = Vec::new();
+    let mut models: BTreeSet<String> = BTreeSet::new();
+    for a in &accounts.accounts {
+        let Some(uid) = a.user_id.clone().filter(|u| !u.is_empty()) else {
+            continue;
+        };
+        if uid_filter.is_some_and(|f| uid != f) {
+            continue;
+        }
+        let Some(c) = cache.accounts.get(&uid) else {
+            continue;
+        };
+        for (date, list) in &c.sessions {
+            if date.as_str() < start.as_str() || date.as_str() > end.as_str() {
+                continue;
+            }
+            for r in list {
+                models.insert(r.model.clone());
+                if model_filter.is_some_and(|m| r.model != m) {
+                    continue;
+                }
+                rows.push(UsageSessionView {
+                    user_id: uid.clone(),
+                    account_name: c.name.clone(),
+                    session_id: r.session_id.clone(),
+                    ts: r.ts,
+                    date: date.clone(),
+                    model: r.model.clone(),
+                    mode: r.mode.clone(),
+                    credits: r.credits,
+                    cost_money: r.cost_money,
+                    input_tokens: r.input_tokens,
+                    output_tokens: r.output_tokens,
+                    cache_read_tokens: r.cache_read_tokens,
+                    cache_write_tokens: r.cache_write_tokens,
+                    preview: r.preview.clone(),
+                });
+            }
+        }
+    }
+
+    // 新会话在前（同 ts 按 session_id 稳定排序）
+    rows.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.session_id.cmp(&a.session_id)));
+    let total = rows.len() as u64;
+    let credits_total = rows.iter().map(|r| r.credits).sum();
+    let begin = ((page - 1) * page_size) as usize;
+    let rows: Vec<UsageSessionView> = rows
+        .into_iter()
+        .skip(begin)
+        .take(page_size as usize)
+        .collect();
+
+    Ok(UsageSessionsResult {
+        fetched_at: cache.fetched_at.unwrap_or(0),
+        total,
+        credits_total,
+        page,
+        page_size,
+        rows,
+        models: models.into_iter().collect(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,5 +787,120 @@ mod tests {
         assert_eq!(acc.daily.len(), 1);
         assert_eq!(acc.daily[0].date, "2026-09-11");
         assert_eq!(agg[&date].date, date);
+    }
+
+    /// 回归（issue #82）：增量重拉当日时 sessions 行必须被替换而非叠加（与 daily 同语义）
+    #[test]
+    fn sessions_refetch_replaces_same_day_without_duplication() {
+        let mut entry = CachedAccount::default();
+        let mut old: BTreeMap<String, Vec<UsageSessionRow>> = BTreeMap::new();
+        old.insert(
+            "2026-09-09".into(),
+            vec![UsageSessionRow {
+                ts: 1,
+                ..Default::default()
+            }],
+        );
+        old.insert(
+            "2026-09-10".into(),
+            vec![
+                UsageSessionRow {
+                    ts: 2,
+                    model: "m".into(),
+                    ..Default::default()
+                },
+                UsageSessionRow {
+                    ts: 3,
+                    model: "m".into(),
+                    ..Default::default()
+                },
+            ],
+        );
+        entry.sessions = old;
+
+        let mut new_agg = BTreeMap::new();
+        new_agg.insert("2026-09-10".into(), UsageDayStat::default());
+        let mut new_sessions: BTreeMap<String, Vec<UsageSessionRow>> = BTreeMap::new();
+        new_sessions.insert(
+            "2026-09-10".into(),
+            vec![UsageSessionRow {
+                ts: 4,
+                ..Default::default()
+            }],
+        );
+
+        apply_fetch_result(&mut entry, new_agg, new_sessions, "2026-09-10");
+        // 当日重拉：旧行被替换，不叠加
+        assert_eq!(entry.sessions["2026-09-10"].len(), 1);
+        assert_eq!(entry.sessions["2026-09-10"][0].ts, 4);
+        // 更早日期保持不动
+        assert_eq!(entry.sessions["2026-09-09"].len(), 1);
+        assert_eq!(entry.daily["2026-09-10"].date, "2026-09-10");
+    }
+
+    /// 回归：会话说明截断 200 字符（防异常长文本撑爆缓存与表格）
+    #[test]
+    fn session_preview_truncated_to_200_chars() {
+        let long = "x".repeat(500);
+        assert_eq!(truncate_preview(&long).chars().count(), 200);
+        assert_eq!(truncate_preview("短文本"), "短文本");
+        assert_eq!(truncate_preview(""), "");
+    }
+
+    /// 回归（T1.5）：会话积分字段映射——credits_float 优先、旧版 amount_float 兜底、
+    /// 双缺/非数值为 0（不伪造积分）
+    #[test]
+    fn session_credits_prefers_credits_float_with_amount_fallback() {
+        let credits_first = json!({ "credits_float": 1.25, "amount_float": 9.0 });
+        assert!((extract_session_credits(&credits_first) - 1.25).abs() < 1e-9);
+        let amount_only = json!({ "amount_float": 0.5 });
+        assert!((extract_session_credits(&amount_only) - 0.5).abs() < 1e-9);
+        let neither = json!({ "model_name": "m" });
+        assert_eq!(extract_session_credits(&neither), 0.0);
+        let empty = json!({});
+        assert_eq!(extract_session_credits(&empty), 0.0);
+        // 非数值类型（字符串/null）不参与兜底链
+        let bad_type = json!({ "credits_float": null, "amount_float": "3" });
+        assert_eq!(extract_session_credits(&bad_type), 0.0);
+    }
+
+    /// 回归（T1.5）：会话行字段映射——上游 JSON → UsageSessionRow 安全默认值
+    /// （session_id/mode/preview 缺省空串、token 缺省 0、model 缺省「未知模型」语义由调用方兜底）
+    #[test]
+    fn session_row_defaults_from_sparse_upstream_payload() {
+        let s = json!({
+            "usage_time": 1_789_009_361i64,
+            "credits_float": 2.0,
+            "extra_info": { "input_token": 10, "output_token": 5 }
+        });
+        let tok = |k: &str| -> u64 {
+            s.get("extra_info")
+                .and_then(|e| e.get(k))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        let row = UsageSessionRow {
+            session_id: s.get("session_id").and_then(Value::as_str).unwrap_or_default().to_string(),
+            ts: s.get("usage_time").and_then(Value::as_i64).unwrap_or(0),
+            model: String::new(),
+            mode: s.get("mode").and_then(Value::as_str).unwrap_or_default().to_string(),
+            credits: extract_session_credits(&s),
+            cost_money: s.get("cost_money_float").and_then(Value::as_f64).unwrap_or(0.0),
+            input_tokens: tok("input_token"),
+            output_tokens: tok("output_token"),
+            cache_read_tokens: tok("cache_read_token"),
+            cache_write_tokens: tok("cache_write_token"),
+            preview: s.get("user_input_preview").and_then(Value::as_str).map(truncate_preview).unwrap_or_default(),
+        };
+        assert_eq!(row.ts, 1_789_009_361);
+        assert!((row.credits - 2.0).abs() < 1e-9);
+        assert_eq!(row.input_tokens, 10);
+        assert_eq!(row.output_tokens, 5);
+        assert_eq!(row.cache_read_tokens, 0);
+        assert_eq!(row.cache_write_tokens, 0);
+        assert!(row.session_id.is_empty());
+        assert!(row.mode.is_empty());
+        assert!(row.preview.is_empty());
+        assert_eq!(row.cost_money, 0.0);
     }
 }

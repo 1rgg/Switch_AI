@@ -294,13 +294,19 @@ impl AppState {
             s.trae_models_sync_enabled = true;
             s.trae_models_sync_hhmm = "05:40".into();
         }
-        // 看板数据同步模式零值归一：空值视为各平台默认（Buddy daily / Trae hourly，
-        // issue #61），时刻由调度器回退内置默认；显式 "off"/"hourly"/"daily" 原样生效
+        // 看板数据同步模式零值归一：空值视为各平台默认（every_hours 每2小时，
+        // issue #82 会话明细定时落盘），时刻由调度器回退内置默认；
+        // 显式 "off"/"hourly"/"daily"/"every_hours" 原样生效；
+        // 间隔小时数：非法解析回退 2，越界 clamp 到 1..=24
         if s.wb_credits_sync_mode.trim().is_empty() {
-            s.wb_credits_sync_mode = "daily".into();
+            s.wb_credits_sync_mode = "every_hours".into();
         }
         if s.trae_credits_sync_mode.trim().is_empty() {
-            s.trae_credits_sync_mode = "hourly".into();
+            s.trae_credits_sync_mode = "every_hours".into();
+        }
+        for field in [&mut s.wb_credits_sync_hours, &mut s.trae_credits_sync_hours] {
+            let v = field.trim().parse::<i64>().map(|h| h.clamp(1, 24)).unwrap_or(2);
+            *field = v.to_string();
         }
         // 侧边栏应用显示：固定应用零值回填（kv 全缺失走 Settings::default() 时 String=""）
         if s.pinned_app.trim().is_empty() {

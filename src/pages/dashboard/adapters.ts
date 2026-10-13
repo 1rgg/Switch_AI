@@ -1,5 +1,6 @@
 import type {
   CreditsDailySnapshot,
+  QoderCheckinRecord,
   QoderCreditsSnapshot,
   UsageHistoryResult,
   WbCheckinRecord,
@@ -119,6 +120,30 @@ export function traeEarnedByDate(snaps: CreditsDailySnapshot[]): Map<string, num
   return m;
 }
 
+/**
+ * Trae 区间「获得积分」按账号筛选（issue #82 问题4-1）：用快照 accounts 维度
+ * （uid → 当日获得）对 uid 集求和。老快照行无 accounts 明细 → 该日跳过并计数
+ * （skippedDates），调用方在 KPI 口径标注中如实说明，不静默混入全局 earned。
+ */
+export function traeEarnedByDateFiltered(
+  snaps: CreditsDailySnapshot[],
+  uids: Set<string>,
+): { byDate: Map<string, number>; skippedDates: number } {
+  const byDate = new Map<string, number>();
+  let skippedDates = 0;
+  for (const s of snaps) {
+    const acc = s.accounts;
+    if (!acc || Object.keys(acc).length === 0) {
+      if (s.earned > 0) skippedDates++;
+      continue;
+    }
+    let sum = 0;
+    for (const uid of uids) sum += acc[uid] ?? 0;
+    if (sum > 0) byDate.set(s.date, (byDate.get(s.date) ?? 0) + sum);
+  }
+  return { byDate, skippedDates };
+}
+
 /** Buddy 区间「获得积分」：签到日志 reward 聚合（§2.2 方案 A 口径，仅含签到新增） */
 export function wbCheckinEarnedByDate(recs: WbCheckinRecord[]): Map<string, number> {
   const m = new Map<string, number>();
@@ -149,5 +174,70 @@ export function mergeEarned(
   const m = new Map<string, number>();
   for (const [d, v] of fallback) m.set(d, v);
   for (const [d, v] of preferred) m.set(d, v);
+  return m;
+}
+
+/**
+ * Buddy 区间「获得积分」按账号筛选（issue #82 问题4-1）：
+ * 快照全局 earned 无账号维度不可拆，改为前端逐账号推导——
+ * 相邻快照对 uid 集取 balance 正向差分（沿用后端「uid 集在两侧快照不完整/余额缺失
+ * 不采信差分」守卫语义），可比日取 max(差分, uid 集签到 reward 合计)（同后端归并），
+ * 不可比日回退 uid 集签到口径。
+ */
+export function wbEarnedByDateFiltered(
+  snaps: WbCreditsSnapshot[],
+  recs: WbCheckinRecord[],
+  uids: Set<string>,
+): Map<string, number> {
+  const checkinByDate = wbCheckinEarnedByDate(recs.filter((r) => uids.has(r.user_id)));
+  const sorted = [...snaps].sort((a, b) => a.date.localeCompare(b.date));
+  const balanceOf = (s: WbCreditsSnapshot, uid: string): number | null | undefined => {
+    const hit = s.accounts.find((a) => a.user_id === uid);
+    return hit ? hit.balance : undefined;
+  };
+  const m = new Map<string, number>();
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = sorted[i - 1];
+    const cur = sorted[i];
+    let diff = 0;
+    let comparable = true;
+    for (const uid of uids) {
+      const p = balanceOf(prev, uid);
+      const c = balanceOf(cur, uid);
+      if (p == null || c == null) {
+        comparable = false;
+        break;
+      }
+      diff += c - p;
+    }
+    if (!comparable) continue;
+    const day = cur.date.slice(0, 10);
+    const chk = checkinByDate.get(day) ?? 0;
+    const earned = Math.max(diff > 0 ? diff : 0, chk);
+    if (earned > 0) m.set(day, (m.get(day) ?? 0) + earned);
+  }
+  // 首日/无前置快照的日期：差分不可得，回退签到口径
+  for (const [d, v] of checkinByDate) {
+    if (!m.has(d)) m.set(d, v);
+  }
+  return m;
+}
+
+/**
+ * Qoder 区间「获得积分」按账号筛选（issue #82 问题4-1）：
+ * 快照 earned 全账号合并不可拆，但其源头 = 逐账号签到 reward 合计
+ * （tasks/qoder_credits.rs checkin_recharge_today 按 reward 求和）→
+ * 直接过滤 qoderCheckin 的 uid 集求 reward，与全局快照同源口径。
+ */
+export function qoderEarnedByDateFiltered(
+  recs: QoderCheckinRecord[],
+  uids: Set<string>,
+): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const r of recs) {
+    if (!uids.has(r.user_id)) continue;
+    const reward = r.reward ?? 0;
+    if (reward > 0) m.set(r.date, (m.get(r.date) ?? 0) + reward);
+  }
   return m;
 }

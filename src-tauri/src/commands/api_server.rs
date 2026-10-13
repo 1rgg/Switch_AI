@@ -623,8 +623,21 @@ fn apply_pool_snapshot(
         .iter()
         .map(|(uid, c)| (uid.clone(), credits_file.general.get(uid).copied().unwrap_or(*c)))
         .collect();
+    // 共享标签筛选（P2 需求④）：tag_uid_set 非空时仅纳入带任一所选标签的账号，
+    // 与分组筛选取交集（D5 池语义：组 ∩ 标签，均空 = 不限）
+    let tag_map = crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir));
+    let trae_tag_filter = crate::api_server::org_index::tag_uid_set(&pool_file.trae_tag_ids, &tag_map);
+    let trae_accounts: Vec<_> = match &trae_tag_filter {
+        Some(set) => accounts
+            .accounts
+            .iter()
+            .filter(|a| a.user_id.as_deref().map(|u| set.contains(u)).unwrap_or(false))
+            .cloned()
+            .collect(),
+        None => accounts.accounts.clone(),
+    };
     pool.sync_from_accounts(
-        &accounts.accounts,
+        &trae_accounts,
         &pool_file.enabled_uids,
         &pool_file.group_ids,
         &groups_file.membership,
@@ -636,18 +649,24 @@ fn apply_pool_snapshot(
     let wb_accounts_all = crate::commands::workbuddy::wb_upstream_accounts(state);
     // Buddy 池分组筛选（对齐 Trae 池 T10 语义）：wb_group_ids 非空时仅纳入所选
     // 分组的 WB 账号，未分组账号不参与；空 = 不限分组。筛选在装配层先行完成，
-    // sync_from_wb 白名单交集语义不变。
+    // sync_from_wb 白名单交集语义不变。标签筛选与分组合取（D5 交集）。
     let wb_group_filter: Option<std::collections::HashSet<&str>> = if pool_file.wb_group_ids.is_empty() {
         None
     } else {
         Some(pool_file.wb_group_ids.iter().map(|s| s.as_str()).collect())
     };
-    let wb_accounts: Vec<_> = match &wb_group_filter {
-        Some(f) => wb_accounts_all
+    let wb_tag_filter = crate::api_server::org_index::tag_uid_set(&pool_file.wb_tag_ids, &tag_map);
+    let wb_accounts: Vec<_> = match (&wb_group_filter, &wb_tag_filter) {
+        (Some(f), Some(t)) => wb_accounts_all
+            .into_iter()
+            .filter(|a| f.contains(a.group_id.as_str()) && t.contains(&a.uid))
+            .collect(),
+        (Some(f), None) => wb_accounts_all
             .into_iter()
             .filter(|a| f.contains(a.group_id.as_str()))
             .collect(),
-        None => wb_accounts_all,
+        (None, Some(t)) => wb_accounts_all.into_iter().filter(|a| t.contains(&a.uid)).collect(),
+        (None, None) => wb_accounts_all,
     };
     let wb_uids = effective_wb_uids(&pool_file, &wb_accounts);
     wb_pool.sync_from_wb(&wb_accounts, &wb_uids);
@@ -665,12 +684,16 @@ fn apply_pool_snapshot(
         } else {
             Some(pool_file.qoder_group_ids.iter().map(|s| s.as_str()).collect())
         };
+    // Qoder 池标签筛选（与分组合取交集，D5）
+    let qoder_tag_filter = crate::api_server::org_index::tag_uid_set(&pool_file.qoder_tag_ids, &tag_map);
     let qoder_sync: Vec<crate::api_server::pool::QoderSyncAccount> = qoder_accounts_raw
         .iter()
         .filter(|a| {
-            qoder_group_filter
+            let group_ok = qoder_group_filter
                 .as_ref()
-                .map_or(true, |f| f.contains(a.group_id.as_str()))
+                .map_or(true, |f| f.contains(a.group_id.as_str()));
+            let tag_ok = qoder_tag_filter.as_ref().map_or(true, |t| t.contains(&a.id));
+            group_ok && tag_ok
         })
         .map(|a| crate::api_server::pool::QoderSyncAccount {
             uid: a.id.clone(),
@@ -779,7 +802,7 @@ fn merge_pool_set(
     // Qoder 池入池白名单（qd- 前缀账号 id）；None = 保留原值，
     // Some(list) = 覆盖（Qoder 页账号池勾选保存；空数组 = fail-open 全量入池）
     qoder_uids: Option<Vec<String>>,
-    // Qoder 池分组筛选（qoder_groups 分组 id）；None = 保留原值
+    // Qoder 池分组筛选（共享分组 shg_ 前缀 id）；None = 保留原值
     qoder_group_ids: Option<Vec<String>>,
     // Qoder 池内调度策略；空串 = 跟随 Trae 池（同 wb_strategy 语义）；None = 保留原值
     qoder_strategy: Option<String>,
@@ -843,6 +866,10 @@ fn merge_pool_set(
         qoder_enabled_uids: qoder_uids.unwrap_or_else(|| existing.qoder_enabled_uids.clone()),
         qoder_group_ids: qoder_group_ids.unwrap_or_else(|| existing.qoder_group_ids.clone()),
         qoder_strategy: qoder_strategy.unwrap_or_else(|| existing.qoder_strategy.clone()),
+        // 标签筛选不参与 merge_pool_set（pool_set 命令在 merge 后追加应用），原样保留
+        trae_tag_ids: existing.trae_tag_ids.clone(),
+        wb_tag_ids: existing.wb_tag_ids.clone(),
+        qoder_tag_ids: existing.qoder_tag_ids.clone(),
     }
 }
 
@@ -896,9 +923,14 @@ pub fn pool_set(
     qoder_strategy: Option<String>,
     // Trae 池参与调度开关（默认开）；None = 保留原值
     trae_enabled: Option<bool>,
+    // 各池共享标签筛选（tag_ 前缀 id）；None = 保留原值，Some(list) = 覆盖
+    // （与分组筛选取交集，D5 池语义）
+    trae_tag_ids: Option<Vec<String>>,
+    wb_tag_ids: Option<Vec<String>>,
+    qoder_tag_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
     let existing: ApiPoolFile = load_pool_file(&state.data_dir);
-    let pool_file = merge_pool_set(
+    let mut pool_file = merge_pool_set(
         &existing,
         uids,
         strategy,
@@ -930,6 +962,17 @@ pub fn pool_set(
         qoder_strategy,
         trae_enabled,
     );
+    // 标签筛选在 merge 后追加应用（merge_pool_set 纯函数签名不动，存量单测零改动）：
+    // 显式空数组 = 清空标签筛选，None = 保留
+    if let Some(v) = trae_tag_ids {
+        pool_file.trae_tag_ids = v;
+    }
+    if let Some(v) = wb_tag_ids {
+        pool_file.wb_tag_ids = v;
+    }
+    if let Some(v) = qoder_tag_ids {
+        pool_file.qoder_tag_ids = v;
+    }
     crate::store::db(&state.data_dir).kv_set("api_pool", &pool_file)?;
     // 热应用：运行中即改内存池策略（Buddy 池空值沿用 Trae 池策略，与启动逻辑一致）
     if let Some(rt) = safe_lock(&runtime).as_ref() {
@@ -1327,6 +1370,45 @@ pub fn api_keys_save(
     Ok(())
 }
 
+/// Key 组/标签约束覆盖预览（D4/D5）：对传入条目按 org_index 实时展开计算
+/// 各池覆盖账号数（前端「覆盖账号数 = 0」强提示用；只读不落盘）。
+/// 返回 {key_id: {trae: n, buddy: n, qoder: n, total: n}}。
+#[tauri::command]
+pub fn api_keys_org_preview(
+    state: State<'_, AppState>,
+    keys: Vec<crate::api_server::api_keys::ApiKeyEntry>,
+) -> std::collections::HashMap<String, std::collections::HashMap<String, usize>> {
+    use crate::api_server::api_keys::split_pool_tagged;
+    use std::collections::HashMap;
+    let idx = crate::api_server::org_index::get(&state.data_dir);
+    let mut out: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    for k in keys {
+        // effective_allowed = allowed_accounts（精确白名单）∪ 组∩标签展开（D5）
+        let mut allowed: std::collections::HashSet<String> =
+            k.allowed_accounts.iter().cloned().collect();
+        if !k.allowed_groups.is_empty() || !k.allowed_tags.is_empty() {
+            allowed.extend(crate::api_server::org_index::expand(
+                &k.allowed_groups,
+                &k.allowed_tags,
+                &idx,
+            ));
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for u in &allowed {
+            let pool = match split_pool_tagged(u) {
+                (Some(p), _) => p,
+                // 裸条目防御性归属 buddy（与 pool_constraints 白名单分池语义一致）
+                (None, _) => "buddy",
+            };
+            *counts.entry(pool.to_string()).or_default() += 1;
+        }
+        let total: usize = allowed.len();
+        counts.insert("total".into(), total);
+        out.insert(k.id, counts);
+    }
+    out
+}
+
 // ==================== 统一网关命令（Phase 1 §8.1） ====================
 
 /// 统一模型目录聚合视图（实时派生，不落盘）。
@@ -1682,6 +1764,9 @@ mod pool_merge_tests {
             qoder_strategy: "p2c".into(),
             qoder_enabled_uids: vec!["qd-1".into()],
             qoder_group_ids: Vec::new(),
+            trae_tag_ids: Vec::new(),
+            wb_tag_ids: Vec::new(),
+            qoder_tag_ids: Vec::new(),
         }
     }
 

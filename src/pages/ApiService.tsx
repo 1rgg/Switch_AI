@@ -11,6 +11,7 @@ import type {
   ApiServiceStatus,
   ApiPoolFile,
   PoolStatus,
+  TagView,
   TraeModelMeta,
   UnifiedModel,
   UsageDayView,
@@ -47,6 +48,9 @@ export default function ApiService() {
   const [poolStatus, setPoolStatus] = useState<PoolStatus[]>([]);
   const [enabledUids, setEnabledUids] = useState<Set<string>>(new Set());
   const [poolGroups, setPoolGroups] = useState<Set<string>>(new Set());
+  // 共享标签筛选（P2 需求④）：与分组筛选取交集（D5），空 = 不限标签
+  const [poolTags, setPoolTags] = useState<Set<string>>(new Set());
+  const [tagDefs, setTagDefs] = useState<TagView[]>([]);
   // Trae 池参与调度开关（每池自管开关；默认开 = 历史恒可用行为）
   const [traeEnabled, setTraeEnabled] = useState(true);
   // per-pool 调度参数（Trae 池专属，与 Buddy/Qoder 互不共享）：并发 0 = 不限、池粘性 0 = 关
@@ -60,6 +64,10 @@ export default function ApiService() {
   const [groups, setGroups] = useState<GroupView[]>([]);
   const [savingPool, setSavingPool] = useState(false);
   const [clearingCooldowns, setClearingCooldowns] = useState(false);
+  // 清除冷却二次确认（重置类操作需确认弹框，禁 window.confirm）
+  const [cooldownConfirm, setCooldownConfirm] = useState(false);
+  // 清除模型人工元数据二次确认（删除 L1 覆盖不可撤销）
+  const [metaClearConfirm, setMetaClearConfirm] = useState(false);
   const [refreshingPool, setRefreshingPool] = useState(false);
   // 当日活跃账号数据源（今日用量桶的账号维度计数）
   const [usage, setUsage] = useState<UsageDayView[]>([]);
@@ -201,6 +209,7 @@ export default function ApiService() {
       setPoolFile(pool);
       setEnabledUids(new Set(pool.enabled_uids));
       setPoolGroups(new Set(pool.group_ids ?? []));
+      setPoolTags(new Set(pool.trae_tag_ids ?? []));
       setTraeEnabled(pool.trae_enabled ?? true);
       // per-pool 调度参数回显（缺省对齐后端 serde default：并发 1 / 池粘性 300s /
       // 会话粘性 1800s / 对冲 8s）
@@ -216,34 +225,48 @@ export default function ApiService() {
     }
   };
 
-  // 分组列表（供账号池分组筛选使用）
+  // 分组列表（供账号池分组筛选使用）+ 共享标签定义（标签筛选 chips）
   const loadGroups = async () => {
     try {
       setGroups(await api.groups.list());
     } catch {
       /* 保留空列表 */
     }
+    try {
+      setTagDefs(await api.tags.list());
+    } catch {
+      /* 保留空列表 */
+    }
   };
 
   // 分组筛选实时预览（T10）：按当前勾选 + 所选分组即时计算将纳入池中的账号，
-  // 让「点选分组」有立即可见的过滤反馈（保存后热重载即时生效，无需重启 API 服务）
+  // 让「点选分组」有立即可见的过滤反馈（保存后热重载即时生效，无需重启 API 服务）。
+  // P2 补齐：标签筛选与分组合取交集（D5），预览与灰显同后端装配语义一致
   const groupUidSets = useMemo(
     () => groups.map((g) => ({ id: g.id, uids: new Set(g.uids ?? []) })),
     [groups],
   );
+  const tagUidSets = useMemo(
+    () => tagDefs.map((t) => ({ id: t.id, uids: new Set(t.uids ?? []) })),
+    [tagDefs],
+  );
+  // 判断账号在当前分组∩标签筛选下是否参与调度（D5：组空=不限组，标签空=不限标签）
+  const inPoolFilter = (uid: string) =>
+    (poolGroups.size === 0 || groupUidSets.some((g) => poolGroups.has(g.id) && g.uids.has(uid))) &&
+    (poolTags.size === 0 || tagUidSets.some((t) => poolTags.has(t.id) && t.uids.has(uid)));
   const poolPreview = useMemo(() => {
-    if (poolGroups.size === 0) return { inPool: enabledUids.size, excluded: 0 };
+    if (poolGroups.size === 0 && poolTags.size === 0) {
+      return { inPool: enabledUids.size, excluded: 0 };
+    }
     let inPool = 0;
     let excluded = 0;
     for (const uid of enabledUids) {
-      if (groupUidSets.some((g) => poolGroups.has(g.id) && g.uids.has(uid))) inPool += 1;
+      if (inPoolFilter(uid)) inPool += 1;
       else excluded += 1;
     }
     return { inPool, excluded };
-  }, [enabledUids, poolGroups, groupUidSets]);
-  // 判断账号在当前分组筛选下是否参与调度（账号列表标记用）
-  const inPoolFilter = (uid: string) =>
-    poolGroups.size === 0 || groupUidSets.some((g) => poolGroups.has(g.id) && g.uids.has(uid));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabledUids, poolGroups, groupUidSets, poolTags, tagUidSets]);
 
   const clearAllCooldowns = async () => {
     setClearingCooldowns(true);
@@ -272,6 +295,13 @@ export default function ApiService() {
   };
 
   const savePool = async () => {
+    // 池配置未加载时禁止保存：enabledUids/poolGroups/poolTags 依赖 poolList 快照，
+    // poolFile=null（加载失败）时 state 保持空集，保存会把 Trae 池成员与
+    // 分组/标签筛选全部清空（与 Buddy/Qoder 页同款防护）
+    if (!poolFile) {
+      toast('error', '池配置未加载，无法保存（请先刷新重试）');
+      return;
+    }
     setSavingPool(true);
     try {
       // 调度策略已收口至全局 API 管理「调度策略中心」，本页只保存成员/分组/本池开关
@@ -279,6 +309,7 @@ export default function ApiService() {
       await withMinDelay(
         api.apiServer.poolSet([...enabledUids], undefined, [...poolGroups], {
           traeEnabled,
+          traeTagIds: [...poolTags],
           traeAccountConcurrencyLimit: traeAccountConcurrencyLimit,
           traePoolStickyTtlSecs: traePoolStickyTtlSecs,
           traeStickyTtlSecs,
@@ -454,7 +485,7 @@ export default function ApiService() {
               {running && (
                 <button
                   className="btn-ghost flex items-center gap-1 text-xs"
-                  onClick={() => void clearAllCooldowns()}
+                  onClick={() => setCooldownConfirm(true)}
                   disabled={clearingCooldowns}
                   title="清除所有账号的冷却状态"
                 >
@@ -523,12 +554,19 @@ export default function ApiService() {
                           </button>
                         );
                       })}
-                      {poolGroups.size > 0 && (
-                        <span className="pt-0.5 text-xs text-slate-400">
-                          将纳入 {poolPreview.inPool} 个账号
-                          {poolPreview.excluded > 0 &&
-                            `，${poolPreview.excluded} 个分组外账号不参与调度`}
-                        </span>
+                      {(poolGroups.size > 0 || poolTags.size > 0) && (
+                        <>
+                          <span className="pt-0.5 text-xs text-slate-400">
+                            将纳入 {poolPreview.inPool} 个账号
+                            {poolPreview.excluded > 0 &&
+                              `，${poolPreview.excluded} 个筛选外账号不参与调度`}
+                          </span>
+                          {poolPreview.inPool === 0 && (
+                            <span className="pt-0.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+                              当前分组/标签组合展开为空集：保存后该池将无可取号账号
+                            </span>
+                          )}
+                        </>
                       )}
                     </div>
                   </div>
@@ -537,6 +575,43 @@ export default function ApiService() {
                   分组筛选作用于网关取号范围，保存后即时生效；不选分组 = 全部参与。
                   调度策略（池间 / 池内）请在全局 API 管理「资源总览 → 调度策略中心」配置。
                 </p>
+                {/* 标签筛选（P2 需求④）：与分组合取交集（D5）；标签在「账号管理 → 标签管理」维护 */}
+                {(tagDefs.length > 0 || poolTags.size > 0) && (
+                  <div className="flex items-start gap-2">
+                    <label className="shrink-0 pt-1 text-xs text-slate-500 dark:text-zinc-400">标签筛选</label>
+                    <div className="flex flex-1 flex-wrap gap-1">
+                      {tagDefs.map((t) => {
+                        const active = poolTags.has(t.id);
+                        return (
+                          <button
+                            key={t.id}
+                            type="button"
+                            className={`rounded-full border px-2 py-0.5 text-xs transition ${
+                              active
+                                ? 'border-teal-400 bg-teal-50 text-teal-700 dark:border-teal-500 dark:bg-teal-500/15 dark:text-teal-300'
+                                : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-600'
+                            }`}
+                            onClick={() =>
+                              setPoolTags((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(t.id)) next.delete(t.id);
+                                else next.add(t.id);
+                                return next;
+                              })
+                            }
+                          >
+                            {t.name}
+                          </button>
+                        );
+                      })}
+                      {poolTags.size > 0 && (
+                        <span className="pt-0.5 text-xs text-slate-400">
+                          与分组筛选取交集（同时满足分组与标签的账号才参与调度）
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="mb-3 flex items-center gap-2">
@@ -590,7 +665,7 @@ export default function ApiService() {
                         </div>
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
-                        {filteredOut && <Badge tone="slate">分组外</Badge>}
+                        {filteredOut && <Badge tone="slate">筛选外</Badge>}
                         {(a.general_credits ?? 0) > 0 && (
                           <span className="text-xs tabular-nums text-slate-500 dark:text-zinc-400">
                             {(a.general_credits ?? 0).toFixed(0)} 通用积分
@@ -934,7 +1009,7 @@ export default function ApiService() {
             {editing?.manual && (
               <button
                 className="btn-outline mr-auto flex items-center gap-1"
-                onClick={() => void clearMeta()}
+                onClick={() => setMetaClearConfirm(true)}
                 disabled={clearingMeta || savingMeta}
                 title="清除 L1 人工覆盖，恢复自动来源链（官网同步 > 内置参考 > 名称推断）"
               >
@@ -1041,6 +1116,68 @@ export default function ApiService() {
               <option value="true">支持</option>
               <option value="false">不支持</option>
             </select>
+          </div>
+        </div>
+      </Modal>
+
+      {/* 清除冷却确认弹框（重置类操作，禁 window.confirm） */}
+      <Modal
+        open={cooldownConfirm}
+        onClose={() => setCooldownConfirm(false)}
+        title="清除全部账号冷却"
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setCooldownConfirm(false)}>
+              取消
+            </button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              onClick={() => {
+                setCooldownConfirm(false);
+                void clearAllCooldowns();
+              }}
+              disabled={clearingCooldowns}
+            >
+              {clearingCooldowns ? '清除中…' : '确认清除'}
+            </button>
+          </>
+        }
+      >
+        <div className="text-sm">
+          确认清除所有账号的冷却状态？
+          <div className="mt-1 text-xs text-slate-400">
+            清除后冷却中的账号将立即重新参与调度（若故障未恢复可能再次失败冷却）。
+          </div>
+        </div>
+      </Modal>
+
+      {/* 清除模型人工元数据确认弹框（删除 L1 覆盖不可撤销） */}
+      <Modal
+        open={metaClearConfirm}
+        onClose={() => setMetaClearConfirm(false)}
+        title={`清除人工元数据 · ${editing?.id ?? ''}`}
+        footer={
+          <>
+            <button className="btn-outline" onClick={() => setMetaClearConfirm(false)}>
+              取消
+            </button>
+            <button
+              className="btn-primary !bg-rose-600 hover:!bg-rose-500"
+              onClick={() => {
+                setMetaClearConfirm(false);
+                void clearMeta();
+              }}
+              disabled={clearingMeta}
+            >
+              {clearingMeta ? '清除中…' : '确认清除'}
+            </button>
+          </>
+        }
+      >
+        <div className="text-sm">
+          确认清除模型「{editing?.id}」的 L1 人工覆盖？
+          <div className="mt-1 text-xs text-slate-400">
+            清除后恢复自动来源链（官网同步 &gt; 内置参考 &gt; 名称推断），人工值不可恢复。
           </div>
         </div>
       </Modal>

@@ -9,12 +9,14 @@
 
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// 行文档表白名单（rows_* 原语允许操作的表，防表名拼接注入）
 pub const ROW_TABLES: &[&str] = &[
     "device_map",
     "groups",
+    "tags",
+    "account_tags",
     "remaining_credits",
     "account_cooldowns",
     "pay_status",
@@ -120,6 +122,17 @@ const DDL: &[&str] = &[
         group_id   TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
     )",
+    // 共享标签：定义行（Tag JSON）+ 账号绑定（pk = 跨池 uid，data = [tag_id, ...] 多对多）
+    "CREATE TABLE IF NOT EXISTS tags (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
+    "CREATE TABLE IF NOT EXISTS account_tags (
+        pk         TEXT PRIMARY KEY,
+        data       TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+    )",
     // API 用量：(bucket, day) 行文档，data = DayStats 全量 JSON（含 latency 样本）
     "CREATE TABLE IF NOT EXISTS api_usage (
         bucket     TEXT NOT NULL,
@@ -140,7 +153,8 @@ const DDL: &[&str] = &[
         date     TEXT PRIMARY KEY,
         total    REAL NOT NULL DEFAULT 0,
         earned   REAL NOT NULL DEFAULT 0,
-        consumed REAL NOT NULL DEFAULT 0
+        consumed REAL NOT NULL DEFAULT 0,
+        accounts TEXT NOT NULL DEFAULT '{}'
     )",
     "CREATE TABLE IF NOT EXISTS checkin_results (
         day        TEXT NOT NULL,
@@ -188,6 +202,35 @@ const DDL: &[&str] = &[
         PRIMARY KEY (uid, date)
     )",
     "CREATE INDEX IF NOT EXISTS idx_usage_history_days_date ON usage_history_days(date)",
+    // P6 流水迁出：消耗明细会话行（issue #82 会话明细 Tab；data = Vec<UsageSessionRow> JSON，
+    // 一行 = uid×date 整日会话列表，与 usage_history_days 同构）
+    "CREATE TABLE IF NOT EXISTS usage_history_sessions (
+        uid  TEXT NOT NULL,
+        date TEXT NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (uid, date)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_usage_history_sessions_date ON usage_history_sessions(date)",
+    // issue #82 问题5：Qoder 网关请求级会话流水（官网无会话明细，转发请求时本地按记录）。
+    // request_id 主键 = UPSERT 幂等（同信封重试复用 rid，后到的成功尝试按 ts 覆盖失败行）；
+    // ts = Unix 秒；stream/ok 存 0/1；
+    // uid="none" 行 = 轮换耗尽早退的失败请求（诚实口径）；保留期与 api_usage 对齐 90 天。
+    "CREATE TABLE IF NOT EXISTS qoder_sessions (
+        request_id  TEXT PRIMARY KEY,
+        session_id  TEXT NOT NULL DEFAULT '',
+        uid         TEXT NOT NULL DEFAULT '',
+        date        TEXT NOT NULL,
+        ts          INTEGER NOT NULL DEFAULT 0,
+        model       TEXT NOT NULL DEFAULT '',
+        credits     REAL NOT NULL DEFAULT 0,
+        pt          INTEGER NOT NULL DEFAULT 0,
+        ct          INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        stream      INTEGER NOT NULL DEFAULT 0,
+        ok          INTEGER NOT NULL DEFAULT 1,
+        preview     TEXT NOT NULL DEFAULT ''
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_qoder_sessions_date ON qoder_sessions(date)",
     // P6 流水迁出：会话粘性绑定（原 kv wb_sticky_sessions；过期项落库前清理）
     "CREATE TABLE IF NOT EXISTS sticky_bindings (
         key        TEXT PRIMARY KEY,
@@ -212,6 +255,8 @@ pub fn init(conn: &Connection) -> Result<(), String> {
     // wb_credits_history 无 earned 列——CREATE TABLE IF NOT EXISTS 对已存在表不生效，
     // 在每次开库的 init 里按 table_info 幂等补列，无需 bump SCHEMA_VERSION 走全量迁移。
     ensure_column(conn, "wb_credits_history", "earned", "REAL")?;
+    // issue #82 问题4-1：credits_daily 补逐账号 earned 维度列（JSON：uid → 当日获得积分）
+    ensure_column(conn, "credits_daily", "accounts", "TEXT NOT NULL DEFAULT '{}'")?;
     Ok(())
 }
 

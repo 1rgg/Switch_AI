@@ -266,9 +266,9 @@ export default function TokensTab({
     return m;
   }, [source, buddyActive, traeActive, tokenStats, gateway, scope, usage, modelFilter]);
 
-  // ---- 覆盖窗口标注（§8.1；Qoder 页无 token 数据源，整页空态不显示窗口文案）----
+  // ---- 覆盖窗口标注（§8.1；Qoder 仅网关源有数据，本地/官网空态不显示窗口文案）----
   const coverage =
-    scope === 'qoder'
+    scope === 'qoder' && source !== 'gateway'
       ? ''
       : source === 'local'
         ? `本地 ${tokenStats?.window_days ?? 365} 天（~/.workbuddy + ~/.codebuddy 会话）`
@@ -291,11 +291,12 @@ export default function TokensTab({
     tickLine: false,
   } as const;
 
-  // Qoder 无任何 token 数据源（本地会话统计/网关池/官网接口均未接入），整页空态优先于单源空态
-  const qoderUnavailable = scope === 'qoder';
+  // Qoder 官网无 token 接口、本地日志 token 恒为 0；唯一可用数据源是 API 网关 Qoder 池
+  //（issue #82 T2.4：网关从上游 usage 落库 prompt/completion tokens），网关源正常渲染
+  const qoderUnavailable = scope === 'qoder' && source !== 'gateway';
   const unavailableHint =
     qoderUnavailable
-      ? { title: 'Qoder 暂无 Token 统计数据源', hint: 'Qoder 官网未提供 token 用量接口；本地日志的 token 字段恒为占位 0（官方模型计费在服务端）。待网关 Qoder 上游接入后由网关侧落库统计。' }
+      ? { title: 'Qoder 暂无 Token 统计数据源', hint: 'Qoder 官网未提供 token 用量接口；本地日志的 token 字段恒为占位 0（官方模型计费在服务端）。请切换「API网关」源查看经本地网关转发请求实测落库的 token 统计。' }
       : localUnavailable
         ? { title: '本地源无 Trae 数据', hint: '本地源 = WorkBuddy 桌面端 + CodeBuddy IDE 会话统计；Trae 无本地源，切「官网」查看 Trae token 明细。' }
         : officialUnavailable

@@ -14,7 +14,7 @@
  * （自定义模型池）。
  */
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { ArrowDown, ArrowUp, Blocks, Bot, Boxes, Layers, Server, SlidersHorizontal, Star } from 'lucide-react';
+import { ArrowDown, ArrowUp, Blocks, Bot, Boxes, Layers, Server, SlidersHorizontal, Star, X } from 'lucide-react';
 import { Badge } from '../ui';
 import { api } from '../../lib/tauri';
 import { useAppStore } from '../../store';
@@ -53,6 +53,27 @@ const POOL_LABELS: Record<string, string> = {
 const selectCls =
   'h-7 rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700 outline-none focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200';
 
+const inputCls =
+  'h-7 w-44 rounded-md border border-slate-200 bg-white px-2 text-xs text-slate-700 outline-none placeholder:text-slate-300 focus:border-brand-400 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200';
+
+/** per_model 候选序选项：三池全排列（6 种，覆盖全部合法顺序） */
+const POOL_ORDERS = [
+  ['buddy', 'trae', 'qoder'],
+  ['buddy', 'qoder', 'trae'],
+  ['trae', 'buddy', 'qoder'],
+  ['trae', 'qoder', 'buddy'],
+  ['qoder', 'buddy', 'trae'],
+  ['qoder', 'trae', 'buddy'],
+].map((arr) => arr.join('>'));
+
+const orderKey = (arr: string[]) => arr.join('>');
+
+const orderLabel = (k: string) =>
+  k
+    .split('>')
+    .map((p) => POOL_LABELS[p] ?? p)
+    .join(' → ');
+
 /**
  * 调度策略中心卡：预设 + 池间 + 池内三块集中管理。
  * pool / onPoolChanged 由父级持有（三池摘要卡共用同一份数据）。
@@ -67,6 +88,9 @@ function DispatchCenterCard({
   const toast = useAppStore((s) => s.pushToast);
   const [policy, setPolicy] = useState<DispatchPolicy | null>(null);
   const [saving, setSaving] = useState(false);
+  // per_model 新增绑定行（本地输入态，添加时才落 policy）
+  const [newPerModelName, setNewPerModelName] = useState('');
+  const [newPerModelOrder, setNewPerModelOrder] = useState(POOL_ORDERS[0]);
 
   useEffect(() => {
     api.apiServer
@@ -245,6 +269,94 @@ function DispatchCenterCard({
         <p className="mt-1.5 text-[11px] text-slate-400 dark:text-zinc-500">
           智能调度按请求模型对可用池排序：积分先到期优先 → 免费 / 倍率小优先 → 剩余积分多优先；全并列时按上方优先级序。
         </p>
+
+        {/* ②+ per_model 模型绑定池（DispatchPolicy.per_model）：显式为单个模型固定
+            池候选序，优先于全局策略且不做智能重排（后端 dispatch.rs 有绑定序即最终序） */}
+        <div className="mt-3">
+          <div className="mb-1.5 text-[11px] font-medium text-slate-500 dark:text-zinc-400">
+            模型绑定池（可选：为单个模型固定池候选序，优先于上方全局策略）
+          </div>
+          {Object.keys(policy.per_model).length === 0 ? (
+            <p className="text-[11px] text-slate-400 dark:text-zinc-500">
+              暂无绑定，全部模型按上方全局策略调度。
+            </p>
+          ) : (
+            <div className="space-y-1.5">
+              {Object.entries(policy.per_model).map(([model, order]) => (
+                <div key={model} className="flex items-center gap-2 text-xs">
+                  <span
+                    className="w-44 truncate font-mono text-slate-700 dark:text-zinc-200"
+                    title={model}
+                  >
+                    {model}
+                  </span>
+                  <select
+                    className={selectCls}
+                    value={orderKey(order)}
+                    onChange={(e) => {
+                      const next = { ...policy.per_model, [model]: e.target.value.split('>') };
+                      void savePolicy({ per_model: next });
+                    }}
+                  >
+                    {POOL_ORDERS.map((k) => (
+                      <option key={k} value={k}>
+                        {orderLabel(k)}
+                      </option>
+                    ))}
+                    {!POOL_ORDERS.includes(orderKey(order)) && (
+                      <option value={orderKey(order)}>{orderKey(order)}（自定义）</option>
+                    )}
+                  </select>
+                  <button
+                    className="rounded p-1 text-slate-400 hover:text-rose-500"
+                    title="移除绑定"
+                    disabled={saving}
+                    onClick={() => {
+                      const next = { ...policy.per_model };
+                      delete next[model];
+                      void savePolicy({ per_model: next });
+                    }}
+                  >
+                    <X size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="mt-1.5 flex items-center gap-2">
+            <input
+              className={inputCls}
+              placeholder="模型名（如 gpt-4.1）"
+              value={newPerModelName}
+              onChange={(e) => setNewPerModelName(e.target.value)}
+            />
+            <select
+              className={selectCls}
+              value={newPerModelOrder}
+              onChange={(e) => setNewPerModelOrder(e.target.value)}
+            >
+              {POOL_ORDERS.map((k) => (
+                <option key={k} value={k}>
+                  {orderLabel(k)}
+                </option>
+              ))}
+            </select>
+            <button
+              className="h-7 rounded-md border border-slate-200 px-2.5 text-xs text-slate-600 transition-colors hover:border-brand-300 hover:text-brand-600 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+              disabled={!newPerModelName.trim() || saving || Boolean(policy.per_model[newPerModelName.trim()])}
+              title={policy.per_model[newPerModelName.trim()] ? '该模型已绑定' : '添加绑定'}
+              onClick={() => {
+                const model = newPerModelName.trim();
+                if (!model || policy.per_model[model]) return;
+                const next = { ...policy.per_model, [model]: newPerModelOrder.split('>') };
+                void savePolicy({ per_model: next });
+                setNewPerModelName('');
+              }}
+            >
+              添加
+            </button>
+          </div>
+        </div>
       </div>
 
       {/* ③ 各资源池池内调度 */}

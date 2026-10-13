@@ -462,10 +462,31 @@ export default function Settings() {
               value={form.trae_credits_sync_mode}
               onChange={(e) => update('trae_credits_sync_mode', e.target.value)}
             >
+              <option value="every_hours">每N小时</option>
               <option value="daily">每日定时</option>
               <option value="hourly">每小时</option>
               <option value="off">关闭</option>
             </select>
+            {form.trae_credits_sync_mode === 'every_hours' && (
+              <>
+                <input
+                  type="number"
+                  min={1}
+                  max={24}
+                  value={form.trae_credits_sync_hours}
+                  onChange={(e) => update('trae_credits_sync_hours', e.target.value || '2')}
+                  onBlur={(e) => {
+                    // 手输可绕过 min/max（0/负数/超 24），失焦时归一到 1-24（与后端 clamp 口径一致）
+                    const n = Math.min(24, Math.max(1, Math.round(Number(e.target.value) || 2)));
+                    update('trae_credits_sync_hours', String(n));
+                  }}
+                  className="input h-9 !w-20 text-sm"
+                />
+                <span className="text-xs text-slate-400">
+                  小时（1-24）；距上次成功同步满 {form.trae_credits_sync_hours || '2'} 小时自动执行一次（含积分快照与消耗/会话明细）
+                </span>
+              </>
+            )}
             {form.trae_credits_sync_mode === 'daily' && (
               <>
                 <div className="relative flex items-center">

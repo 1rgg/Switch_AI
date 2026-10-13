@@ -723,6 +723,19 @@ pub fn logs_clear(state: State<AppState>, log_type: String) -> Result<u32, Strin
 
 // ---------------- 设置 ----------------
 
+/// 待取启动通知（一次性）：后端启动期产生的用户可见消息（如分组统一迁移结果）
+/// 落 kv("startup_notice")，前端 init 拉取 toast 展示后即删——通知不会因
+/// 「事件先于监听注册发出」而丢失，也不会重复弹出。
+#[tauri::command]
+pub fn startup_notice_take(state: State<AppState>) -> Option<String> {
+    let store = crate::store::db(&state.data_dir);
+    let msg: Option<String> = store.kv_get("startup_notice");
+    if msg.is_some() {
+        let _ = store.kv_delete("startup_notice");
+    }
+    msg
+}
+
 #[tauri::command]
 pub fn settings_get(state: State<AppState>) -> Settings {
     state.settings()

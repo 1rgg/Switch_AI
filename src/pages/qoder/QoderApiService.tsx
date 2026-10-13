@@ -11,6 +11,7 @@ import type {
   ApiPoolFile,
   GroupView,
   PoolStatus,
+  TagView,
   UnifiedModel,
   UsageDayView,
   QoderAccountView,
@@ -21,7 +22,8 @@ import type {
  * 参照 Buddy「资源调度」页同构布局，按 Qoder 实际能力裁剪：
  * - 资源开关仅 qoderEnabled 一个（Qoder 无路由级 effort/工具代执行等 wb 同构特性）；
  * - 账号池选择与 Buddy 同构：勾选白名单（清空 = 全部含凭证账号 fail-open 入池）+
- *   分组筛选（qoder_groups 分组体系，账号 group_id 随账号池持久化）；
+ *   分组筛选（跨应用共享分组 shg_ id，账号 group_id 随账号池持久化；D5 与标签
+ *   筛选取交集）；
  * - 模型目录数据源为统一目录聚合（api.apiServer.unifiedModels 过滤 qoder 源），
  *   手动同步复用每日调度任务入口（qoderCatalogSync），每日定时时刻存 app Settings。
  * 网关级功能（服务启停 / 接口配置 / API Keys / 用量统计）在全局 API 管理弹窗，
@@ -45,6 +47,9 @@ export default function QoderApiService() {
   const [qoderUids, setQoderUids] = useState<string[] | null>(null);
   const [qoderPoolGroups, setQoderPoolGroups] = useState<Set<string>>(new Set());
   const [qoderGroups, setQoderGroups] = useState<GroupView[]>([]);
+  // 共享标签筛选（P2 需求④）：与分组筛选取交集（D5），空 = 不限标签
+  const [qoderPoolTags, setQoderPoolTags] = useState<Set<string>>(new Set());
+  const [tagDefs, setTagDefs] = useState<TagView[]>([]);
   const [accounts, setAccounts] = useState<QoderAccountView[]>([]);
   const [models, setModels] = useState<UnifiedModel[]>([]);
   const [syncing, setSyncing] = useState(false);
@@ -61,7 +66,7 @@ export default function QoderApiService() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [st, pf, accs, cat, groups] = await Promise.all([
+      const [st, pf, accs, cat, groups, tags] = await Promise.all([
         api.apiServer.status().catch(() => null),
         api.apiServer.poolList().catch(() => null),
         api.qoder.accountsList().catch(() => [] as QoderAccountView[]),
@@ -70,12 +75,14 @@ export default function QoderApiService() {
           .then((list) => list.filter((m) => m.sources.some((s) => s.pool === 'qoder')))
           .catch(() => [] as UnifiedModel[]),
         api.qoder.groups.list().catch(() => [] as GroupView[]),
+        api.tags.list().catch(() => [] as TagView[]),
       ]);
       setStatus(st);
       setPool(pf);
       setAccounts(accs);
       setModels(cat);
       setQoderGroups(groups);
+      setTagDefs(tags);
       if (pf) {
         setQoderEnabled(pf.qoder_enabled ?? false);
         // F-80-余 v2 参数回显（缺省对齐后端 serde default：对冲 8s / 粘性关）
@@ -89,6 +96,8 @@ export default function QoderApiService() {
         setQoderUids(pf.qoder_enabled_uids?.length ? pf.qoder_enabled_uids : null);
         // 分组筛选：空 = 不限（全部参与）
         setQoderPoolGroups(new Set(pf.qoder_group_ids ?? []));
+        // 标签筛选：空 = 不限（与分组合取交集，D5）
+        setQoderPoolTags(new Set(pf.qoder_tag_ids ?? []));
       }
       api.misc
         .settingsGet()
@@ -163,6 +172,7 @@ export default function QoderApiService() {
           // null = 未自定义（后端保留原值保持 fail-open）；数组 = 白名单覆盖（[] = 清空恢复全量）
           ...(qoderUids !== null ? { qoderUids } : {}),
           qoderGroupIds: Array.from(qoderPoolGroups),
+          qoderTagIds: Array.from(qoderPoolTags),
         }),
         600,
       );
@@ -230,12 +240,19 @@ export default function QoderApiService() {
     () => qoderGroups.map((g) => ({ id: g.id, uids: new Set(g.uids ?? []) })),
     [qoderGroups],
   );
+  // P2 补齐：标签筛选与分组合取交集（D5），预览与灰显同后端装配语义一致
+  const qoderTagUidSets = useMemo(
+    () => tagDefs.map((t) => ({ id: t.id, uids: new Set(t.uids ?? []) })),
+    [tagDefs],
+  );
   const inQoderFilter = (id: string) =>
-    qoderPoolGroups.size === 0 ||
-    qoderGroupUidSets.some((g) => qoderPoolGroups.has(g.id) && g.uids.has(id));
+    (qoderPoolGroups.size === 0 ||
+      qoderGroupUidSets.some((g) => qoderPoolGroups.has(g.id) && g.uids.has(id))) &&
+    (qoderPoolTags.size === 0 ||
+      qoderTagUidSets.some((t) => qoderPoolTags.has(t.id) && t.uids.has(id)));
   const qoderPoolPreview = (() => {
-    // 生效池 = 分组筛选 ∩ 白名单勾选（与后端 apply_pool_snapshot 装配语义一致）；
-    // excluded 仅统计分组外账号（未勾选由 checkbox 状态表达，不计入 excluded）
+    // 生效池 = (分组 ∩ 标签筛选) ∩ 白名单勾选（与后端 apply_pool_snapshot 装配语义一致）；
+    // excluded 仅统计筛选外账号（未勾选由 checkbox 状态表达，不计入 excluded）
     let inPool = 0;
     let excluded = 0;
     for (const a of credAccounts) {
@@ -397,22 +414,66 @@ export default function QoderApiService() {
                         </button>
                       </span>
                     )}
-                    {qoderPoolGroups.size > 0 && (
-                      <span className="pt-0.5 text-xs text-slate-400">
-                        将纳入 {qoderPoolPreview.inPool} 个账号
-                        {qoderPoolPreview.excluded > 0 &&
-                          `，${qoderPoolPreview.excluded} 个分组外账号不参与调度`}
-                      </span>
+                    {(qoderPoolGroups.size > 0 || qoderPoolTags.size > 0) && (
+                      <>
+                        <span className="pt-0.5 text-xs text-slate-400">
+                          将纳入 {qoderPoolPreview.inPool} 个账号
+                          {qoderPoolPreview.excluded > 0 &&
+                            `，${qoderPoolPreview.excluded} 个筛选外账号不参与调度`}
+                        </span>
+                        {qoderPoolPreview.inPool === 0 && (
+                          <span className="pt-0.5 text-xs font-medium text-amber-600 dark:text-amber-400">
+                            当前分组/标签组合展开为空集：保存后该池将无可取号账号
+                          </span>
+                        )}
+                      </>
                     )}
                   </div>
                 </div>
                 <p className="text-xs text-slate-400 dark:text-zinc-500">
                   分组筛选作用于 Qoder 池取号范围，保存后即时生效；不选分组 = 全部参与（分组在「账号管理 → 分组管理」维护）。
                 </p>
+                {/* 标签筛选（P2 需求④）：与分组合取交集（D5）；标签在「账号管理 → 标签管理」维护 */}
+                {(tagDefs.length > 0 || qoderPoolTags.size > 0) && (
+                  <div className="flex items-start gap-2">
+                    <label className="shrink-0 pt-1 text-xs text-slate-500 dark:text-zinc-400">标签筛选</label>
+                    <div className="flex flex-1 flex-wrap gap-1">
+                      {tagDefs.map((t) => {
+                        const active = qoderPoolTags.has(t.id);
+                        return (
+                          <button
+                            key={t.id}
+                            type="button"
+                            className={`rounded-full border px-2 py-0.5 text-xs transition ${
+                              active
+                                ? 'border-teal-400 bg-teal-50 text-teal-700 dark:border-teal-500 dark:bg-teal-500/15 dark:text-teal-300'
+                                : 'border-slate-200 text-slate-500 hover:border-slate-300 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-600'
+                            }`}
+                            onClick={() =>
+                              setQoderPoolTags((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(t.id)) next.delete(t.id);
+                                else next.add(t.id);
+                                return next;
+                              })
+                            }
+                          >
+                            {t.name}
+                          </button>
+                        );
+                      })}
+                      {qoderPoolTags.size > 0 && (
+                        <span className="pt-0.5 text-xs text-slate-400">
+                          与分组筛选取交集（同时满足分组与标签的账号才参与调度）
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
-            {/* 账号清单（勾选白名单：健康状态 / 在途计数 / credits 余额；分组外整行灰显） */}
+            {/* 账号清单（勾选白名单：健康状态 / 在途计数 / credits 余额；筛选外整行灰显） */}
             {credAccounts.length === 0 ? (
               <p className="py-4 text-center text-xs text-slate-400">
                 暂无含凭证账号：请先在「账号管理」PAT 导入或 OAuth 登录入池（凭证写入本地 token store）。
@@ -422,7 +483,7 @@ export default function QoderApiService() {
                 {credAccounts.map((a) => {
                   // 可观测：实时在途并发（服务未运行/未匹配时为 0）；PoolStatus.uid 与账号 id 同域
                   const poolItem = qoderPool.find((p) => p.uid === a.id);
-                  // 分组筛选激活时，分组外账号不参与调度（整行半透明标记，对齐 Buddy/Trae）
+                  // 分组/标签筛选激活时，筛选外账号不参与调度（整行半透明标记，对齐 Buddy/Trae）
                   const filteredOut = !inQoderFilter(a.id);
                   return (
                     <div
@@ -437,7 +498,7 @@ export default function QoderApiService() {
                         onChange={() => toggleQoderUid(a.id)}
                       />
                       <div className="min-w-0 flex-1 truncate font-medium">{a.nickname || a.id}</div>
-                      {filteredOut && <Badge tone="slate">分组外</Badge>}
+                      {filteredOut && <Badge tone="slate">筛选外</Badge>}
                       <Badge tone="slate">{a.plan || a.credential_source || '—'}</Badge>
                       {a.needs_relogin && <Badge tone="amber">需重新登录</Badge>}
                       {/* 运行时健康徽标：禁用/积分耗尽/冷却原因/零积分/在途·就绪（三池共用） */}

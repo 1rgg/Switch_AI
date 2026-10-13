@@ -204,6 +204,21 @@ pub fn migrate_on_startup(data_dir: &Path) -> Option<String> {
         }
     }
     if failed == 0 {
+        // v3→v4 增量：三套独立分组定义统一为共享分组（shg_ 新 ID + id_map 全量重定向）；
+        // kv 标记幂等，全新安装空转
+        match migrate_unified_groups(&store) {
+            Ok(n) if n > 0 => {
+                items.push(json!({"file": "<unified_groups>", "result": "imported", "detail": format!("统一分组 {n} 条")}));
+                imported += 1;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                failed += 1;
+                items.push(json!({"file": "<unified_groups>", "result": "error", "detail": e}));
+            }
+        }
+    }
+    if failed == 0 {
         let _ = store.with_conn(|c| {
             schema::set_user_version(c, schema::SCHEMA_VERSION);
             Ok(())
@@ -491,6 +506,201 @@ fn import_wb_credits_history_value(store: &Store, v: &Value) -> Result<(), Strin
     docs::wb_credits_history_save(store, v)
 }
 
+// ── v3→v4：三套分组定义统一为跨应用共享分组（shg_ 新 ID）─────────────────────
+
+/// 三套分组定义统一（shared-groups-tags-design.md D2，已确认 2026-10-10）：
+/// 1. 读三处 defs（groups 表 + kv workbuddy_groups + kv qoder_groups），
+///    迁移前整体快照至 kv("groups_pre_migration") 可回滚；
+/// 2. 按 name 去重合并（同名即同组，颜色/排序取 Trae > Buddy > Qoder 首个出现），
+///    全部重新生成 `shg_` 新 ID（不保留任何旧应用 id），构建 id_map 全量重定向；
+/// 3. 重定向 group_members 表、WB/Qoder 账号 group_id 字段、
+///    api_pool.group_ids/wb_group_ids/qoder_group_ids；
+/// 4. 全删全写 groups 表；删除 kv workbuddy_groups / qoder_groups；
+/// 5. kv("unified_groups_migrated") 标记幂等，二次启动跳过。
+/// 容错（审查修复）：中途失败重试时，① 快照不覆盖（只写一次保原始备份）；
+/// ② 复用 groups 表已残留的 shg_ 定义 id，重定向引用不悬空。
+/// 返回统一后的分组条数（0 = 幂等跳过）。
+fn migrate_unified_groups(store: &Store) -> Result<usize, String> {
+    use crate::models::Group;
+    if store.kv_get::<bool>("unified_groups_migrated") {
+        return Ok(0);
+    }
+    // 1. 读三处 defs + Trae membership，整体快照备份（可回滚）。
+    //    快照只写一次（审查修复）：中途失败重试时若覆盖快照，备份会被
+    //    「已部分重定向」的状态污染，恰在回滚最需要时失效。
+    let trae_all: Vec<Group> = docs::group_defs_load(store);
+    // 上次中途失败残留的 shg_ 定义不算 Trae 旧定义（迁移计数/备份口径均剔除）
+    let trae: Vec<Group> = trae_all
+        .iter()
+        .filter(|g| !g.id.starts_with("shg_"))
+        .cloned()
+        .collect();
+    let wb: Vec<Group> = store.kv_get("workbuddy_groups");
+    let qoder: Vec<Group> = store.kv_get("qoder_groups");
+    let member_rows: Vec<(String, String)> = store
+        .with_conn(|c| {
+            let mut stmt = c.prepare("SELECT uid, group_id FROM group_members")?;
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .unwrap_or_default();
+    let members_before: std::collections::HashMap<String, String> =
+        member_rows.iter().cloned().collect();
+    if store.kv_get_raw("groups_pre_migration").is_none() {
+        store.kv_set(
+            "groups_pre_migration",
+            &json!({
+                "groups": trae_all,
+                "workbuddy_groups": wb,
+                "qoder_groups": qoder,
+                "group_members": members_before,
+            }),
+        )?;
+    }
+
+    // 2. 按 name 合并 + 生成统一新 ID（id_map 覆盖全部旧 id，含同名多组）。
+    //    中途失败重试场景（审查修复）：groups 表可能残留上次生成的 shg_ 定义
+    //    （重定向已生效但 defs 全删全写失败、标记未置位）——按 name 复用既有
+    //    shg_ id，保证已重定向的成员/账号/池筛选引用不悬空。
+    let mut new_defs: Vec<Group> = trae_all
+        .into_iter()
+        .filter(|g| g.id.starts_with("shg_"))
+        .collect();
+    let mut id_map: std::collections::HashMap<String, String> = Default::default();
+    let mut name_to_new: std::collections::HashMap<String, String> = new_defs
+        .iter()
+        .map(|g| (g.name.clone(), g.id.clone()))
+        .collect();
+    for g in [&trae, &wb, &qoder].into_iter().flatten() {
+        if let Some(nid) = name_to_new.get(&g.name) {
+            id_map.insert(g.id.clone(), nid.clone());
+            continue;
+        }
+        let rand = uuid::Uuid::new_v4().simple().to_string();
+        let nid = format!("shg_{}{}", chrono::Local::now().timestamp_millis(), &rand[..4]);
+        name_to_new.insert(g.name.clone(), nid.clone());
+        id_map.insert(g.id.clone(), nid.clone());
+        new_defs.push(Group { id: nid, name: g.name.clone(), color: g.color.clone(), order: g.order });
+    }
+    // order 重排（合并后保持出现顺序 1..n）
+    for (i, g) in new_defs.iter_mut().enumerate() {
+        g.order = (i + 1) as i32;
+    }
+
+    // 3. id_map 全量重定向（逐条 UPDATE，旧 id 不存在时 0 行受影响，幂等无害）
+    for (old, new) in &id_map {
+        if old == new {
+            continue;
+        }
+        store.with_conn(|c| {
+            c.execute(
+                "UPDATE group_members SET group_id = ?1 WHERE group_id = ?2",
+                rusqlite::params![new, old],
+            )?;
+            Ok(())
+        })?;
+    }
+    redirect_pool_group_ids(store, "wb_accounts", &id_map)?;
+    redirect_pool_group_ids(store, "qoder_accounts", &id_map)?;
+    redirect_api_pool_group_ids(store, &id_map)?;
+
+    // 4. 全删全写统一 defs；5. 删除三套私有 kv
+    docs::group_defs_save(store, &new_defs)?;
+    store.kv_delete("workbuddy_groups")?;
+    store.kv_delete("qoder_groups")?;
+    store.kv_set("unified_groups_migrated", &true)?;
+    // 一次性启动通知（前端 init 拉取 toast 后即清）：合并结果用户可见，不只落日志
+    let _ = store.kv_set(
+        "startup_notice",
+        &format!(
+            "分组已升级为跨应用共享：原 {} 条分组定义合并为 {} 条共享分组（同名自动合并），\
+             成员与调度筛选已同步重定向；原定义已备份，可在系统日志查看详情",
+            trae.len() + wb.len() + qoder.len(),
+            new_defs.len()
+        ),
+    );
+    crate::fs_utils::app_log(
+        &store.data_dir,
+        &format!(
+            "分组统一迁移：{} 条定义合并为 {} 条共享分组（shg_ 新 ID），成员/池筛选引用已全量重定向；原三套定义快照见 kv groups_pre_migration",
+            trae.len() + wb.len() + qoder.len(),
+            new_defs.len()
+        ),
+    );
+    Ok(new_defs.len())
+}
+
+/// 账号池表（wb_accounts/qoder_accounts 行文档，data 内 group_id 字段）重定向
+fn redirect_pool_group_ids(
+    store: &Store,
+    table: &str,
+    id_map: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let rows: Vec<(String, Value)> = store
+        .rows_all(table)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, data)| {
+            data.get("group_id")
+                .and_then(Value::as_str)
+                .map(|g| id_map.contains_key(g))
+                .unwrap_or(false)
+        })
+        .map(|(pk, mut data)| {
+            if let Some(g) = data.get("group_id").and_then(Value::as_str) {
+                let new = id_map.get(g).cloned().unwrap_or_else(|| g.to_string());
+                data["group_id"] = json!(new);
+            }
+            (pk, data)
+        })
+        .collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    for (pk, data) in &rows {
+        let text = serde_json::to_string(data).map_err(|e| format!("序列化失败: {e}"))?;
+        store.with_conn(move |c| {
+            c.execute(
+                &format!("UPDATE {table} SET data = ?1 WHERE pk = ?2"),
+                rusqlite::params![text, pk],
+            )?;
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// api_pool kv 的 group_ids / wb_group_ids / qoder_group_ids 重定向
+fn redirect_api_pool_group_ids(
+    store: &Store,
+    id_map: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let Some(raw) = store.kv_get_raw("api_pool") else {
+        return Ok(());
+    };
+    let mut v: Value = serde_json::from_str(&raw).map_err(|e| format!("api_pool 解析失败: {e}"))?;
+    let mut changed = false;
+    for field in ["group_ids", "wb_group_ids", "qoder_group_ids"] {
+        if let Some(arr) = v.get_mut(field).and_then(Value::as_array_mut) {
+            for item in arr.iter_mut() {
+                if let Some(old) = item.as_str() {
+                    if let Some(new) = id_map.get(old) {
+                        *item = json!(new);
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    if changed {
+        let text = serde_json::to_string(&v).map_err(|e| format!("序列化失败: {e}"))?;
+        store.kv_set_raw("api_pool", &text)?;
+    }
+    Ok(())
+}
+
 fn import_usage_history_value(store: &Store, v: &Value) -> Result<(), String> {
     docs::usage_history_save(store, v)
 }
@@ -677,6 +887,165 @@ mod tests {
         assert_eq!(after.accounts[0].jwt, "", "jwt 必须被占位化抹除");
         assert!(after.accounts[0].refresh_token.is_none(), "refresh_token 必须被抹除");
         assert_eq!(after.accounts[0].name, "a1", "非敏感字段保留");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v3→v4 验收：三套分组定义统一为 shg_ 共享分组——同名合并、旧 id 全量重定向
+    /// （group_members / WB / Qoder 账号字段 / api_pool 筛选）、私有 kv 清除、
+    /// 备份键可回滚、二次调用幂等。
+    #[test]
+    fn unified_groups_migration_merges_redirects_and_is_idempotent() {
+        use crate::models::Group;
+        let dir = tmp_dir("unified_groups");
+        let store = db(&dir);
+
+        // 种子：Trae g_1「主号」；Buddy wbg_1「主号」（同名合并）+ wbg_2「备用」；
+        // Qoder qoderg_1「备用」；成员关系与 api_pool 引用齐全
+        docs::group_defs_save(
+            &store,
+            &[Group { id: "g_1".into(), name: "主号".into(), color: "#f00".into(), order: 1 }],
+        )
+        .unwrap();
+        store
+            .kv_set(
+                "workbuddy_groups",
+                &vec![
+                    Group { id: "wbg_1".into(), name: "主号".into(), color: "#0f0".into(), order: 1 },
+                    Group { id: "wbg_2".into(), name: "备用".into(), color: "#00f".into(), order: 2 },
+                ],
+            )
+            .unwrap();
+        store
+            .kv_set(
+                "qoder_groups",
+                &vec![Group { id: "qoderg_1".into(), name: "备用".into(), color: "#ff0".into(), order: 1 }],
+            )
+            .unwrap();
+        store
+            .with_conn(|c| {
+                c.execute("INSERT INTO group_members(uid, group_id) VALUES('u1','g_1')", [])?;
+                Ok(())
+            })
+            .unwrap();
+        docs::wb_pool_save(&store, &json!({"accounts": [
+            {"id": "wb-1", "group_id": "wbg_1"},
+            {"id": "wb-2", "group_id": "wbg_2"}
+        ]}))
+        .unwrap();
+        docs::qoder_pool_save(&store, &json!({"accounts": [
+            {"id": "qd-1", "group_id": "qoderg_1"}
+        ]}))
+        .unwrap();
+        store
+            .kv_set_raw(
+                "api_pool",
+                r#"{"group_ids":["g_1"],"wb_group_ids":["wbg_2"],"qoder_group_ids":["qoderg_1"]}"#,
+            )
+            .unwrap();
+
+        // 执行迁移
+        let n = migrate_unified_groups(&store).unwrap();
+        assert_eq!(n, 2, "同名「主号」合并 → 主号 + 备用 两条");
+
+        // defs 全部 shg_ 前缀；私有 kv 清除
+        let defs = docs::group_defs_load(&store);
+        assert_eq!(defs.len(), 2);
+        assert!(defs.iter().all(|g| g.id.starts_with("shg_")), "统一新 ID: {:?}", defs);
+        assert!(store.kv_get_raw("workbuddy_groups").is_none());
+        assert!(store.kv_get_raw("qoder_groups").is_none());
+        assert_eq!(store.kv_get::<bool>("unified_groups_migrated"), true);
+        // 备份键可回滚
+        let backup: Value = store.kv_get("groups_pre_migration");
+        assert_eq!(backup["groups"][0]["id"], "g_1");
+        assert_eq!(backup["workbuddy_groups"].as_array().unwrap().len(), 2);
+        // 一次性启动通知已写入（前端 init 拉取 toast 后即清）
+        let notice: Option<String> = store.kv_get("startup_notice");
+        let notice = notice.unwrap();
+        assert!(notice.contains("2 条共享分组"), "通知应含合并结果: {notice}");
+
+        // 旧 id 引用零残留：group_members / WB / Qoder / api_pool 均重定向到对应新 id
+        let name_new: std::collections::HashMap<String, String> =
+            defs.iter().map(|g| (g.name.clone(), g.id.clone())).collect();
+        let main_new = &name_new["主号"];
+        let alt_new = &name_new["备用"];
+        let m: std::collections::HashMap<String, String> = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare("SELECT uid, group_id FROM group_members")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows.into_iter().collect())
+            })
+            .unwrap();
+        assert_eq!(m.get("u1").unwrap(), main_new);
+        let wb = docs::wb_pool_load(&store);
+        assert_eq!(wb["accounts"][0]["group_id"], json!(main_new));
+        assert_eq!(wb["accounts"][1]["group_id"], json!(alt_new));
+        let qd = docs::qoder_pool_load(&store);
+        assert_eq!(qd["accounts"][0]["group_id"], json!(alt_new));
+        let pool: Value = store.kv_get("api_pool");
+        assert_eq!(pool["group_ids"], json!([main_new]));
+        assert_eq!(pool["wb_group_ids"], json!([alt_new]));
+        assert_eq!(pool["qoder_group_ids"], json!([alt_new]));
+
+        // 幂等：二次调用跳过
+        assert_eq!(migrate_unified_groups(&store).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v3→v4 容错验收（审查修复）：上次中途失败残留的 shg_ 定义（重定向已生效、
+    /// defs 全删全写失败、标记未置位）重试时必须按 name 复用既有 shg_ id——
+    /// 不得重新生成新 id，否则已重定向的成员/账号引用悬空。
+    #[test]
+    fn unified_groups_migration_resumes_from_partial_failure() {
+        use crate::models::Group;
+        let dir = tmp_dir("unified_groups_resume");
+        let store = db(&dir);
+        // 模拟残留态：shg_ 定义已在 groups 表、成员与 WB 账号已指向 shg_A，
+        // 但旧 kv 定义仍在（上次 defs 全删全写失败）、迁移标记未置位
+        docs::group_defs_save(
+            &store,
+            &[Group { id: "shg_A".into(), name: "主号".into(), color: "#f00".into(), order: 1 }],
+        )
+        .unwrap();
+        store
+            .kv_set(
+                "workbuddy_groups",
+                &vec![Group { id: "wbg_1".into(), name: "主号".into(), color: "#0f0".into(), order: 1 }],
+            )
+            .unwrap();
+        store
+            .with_conn(|c| {
+                c.execute("INSERT INTO group_members(uid, group_id) VALUES('u1','shg_A')", [])?;
+                Ok(())
+            })
+            .unwrap();
+        docs::wb_pool_save(&store, &json!({"accounts": [{"id": "wb-1", "group_id": "shg_A"}]}))
+            .unwrap();
+
+        // 重试迁移：应复用 shg_A（同名对齐），不生成新 id
+        let n = migrate_unified_groups(&store).unwrap();
+        assert_eq!(n, 1, "残留 shg_ 定义 + 同名旧定义合并 → 仍 1 条");
+        let defs = docs::group_defs_load(&store);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].id, "shg_A", "必须复用残留 shg_ id，防引用悬空");
+        // 已重定向的引用仍有效
+        let m: Vec<(String, String)> = store
+            .with_conn(|c| {
+                let mut stmt = c.prepare("SELECT uid, group_id FROM group_members")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap();
+        assert_eq!(m, vec![("u1".into(), "shg_A".into())], "成员引用未悬空");
+        let wb = docs::wb_pool_load(&store);
+        assert_eq!(wb["accounts"][0]["group_id"], json!("shg_A"), "WB 账号引用未悬空");
+        assert!(store.kv_get_raw("workbuddy_groups").is_none());
+
+        // 幂等：二次调用跳过
+        assert_eq!(migrate_unified_groups(&store).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

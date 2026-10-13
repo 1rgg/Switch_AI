@@ -4,7 +4,7 @@ use tauri::State;
 use crate::fs_utils;
 use crate::jwt;
 use crate::models::{
-    AccountView, AccountsFile, DeviceMap, DeviceEntry, GroupsFile, Group, RawAccount,
+    AccountView, AccountsFile, DeviceMap, DeviceEntry, GroupsFile, RawAccount,
     CreditsFile, CreditsDailyFile, CreditsDailySnapshot, CheckinSummary, RemainingCreditsFile, AccountCooldownsFile,
     CreditDetail, CreditPackDetail,
 };
@@ -206,6 +206,9 @@ pub fn accounts_export_raw(state: State<AppState>) -> Result<serde_json::Value, 
                 "hasRefreshToken": v.has_refresh_token,
                 "jwtAutoRefresh": v.jwt_auto_refresh,
                 "creditsExpireAt": v.credits_expire_at,
+                // 共享标签绑定（tag id 数组；导出文件不携带标签定义本身——
+                // 标签定义属全局数据，导入方以本机标签体系为准）
+                "tags": v.tags,
             })
         })
         .collect();
@@ -270,6 +273,12 @@ pub struct ImportReport {
     pub skipped_names: Vec<String>,
     /// 新增分组数量
     pub groups_added: usize,
+    /// 恢复的标签绑定条数（仅本机已存在的 tag id）
+    #[serde(default)]
+    pub tags_restored: usize,
+    /// 导入文件中本机不存在的 tag id 数量（忽略不自动创建，提示用户）
+    #[serde(default)]
+    pub tags_ignored: usize,
 }
 
 /// 从字段取第一个非空字符串值（兼容导出格式与原始格式两套键名）
@@ -343,8 +352,12 @@ pub fn accounts_import(
         skipped: 0,
         skipped_names: Vec::new(),
         groups_added,
+        tags_restored: 0,
+        tags_ignored: 0,
     };
 
+    // 标签定义循环外一次加载（校验 tag id 存在用；导入过程不修改 tags 表，语义等价）
+    let tag_defs = crate::store::docs::tags_load(&crate::store::db(&state.data_dir));
     for (_, entry) in selected {
         // 兼容导出格式(userId/cloudIdeJwt/dcId)与原始格式(UserID/jwt/dc_id)
         let user_id = pick_str(entry, &["userId", "UserID", "user_id", "uid"]);
@@ -381,6 +394,40 @@ pub fn accounts_import(
         if let Some(gid) = &group_id {
             groups.membership.insert(uid.clone(), gid.clone());
         }
+        // 标签绑定恢复（P2 需求③）：仅恢复本机已存在的 tag id，未知 id 忽略
+        // （不自动创建标签，避免导入方标签体系污染本机；忽略数量记 app_log）
+        let tags_in: Vec<String> = entry
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !tags_in.is_empty() {
+            let mut ignored = 0usize;
+            let valid: Vec<String> = tags_in
+                .into_iter()
+                .filter(|t| {
+                    if tag_defs.iter().any(|d| &d.id == t) {
+                        true
+                    } else {
+                        ignored += 1;
+                        false
+                    }
+                })
+                .collect();
+            if !valid.is_empty() {
+                crate::store::docs::account_tags_set(
+                    &crate::store::db(&state.data_dir),
+                    &uid,
+                    &valid,
+                )?;
+                report.tags_restored += valid.len();
+            }
+            report.tags_ignored += ignored;
+        }
         accounts.accounts.push(RawAccount {
             name,
             user_id: Some(uid),
@@ -404,10 +451,11 @@ pub fn accounts_import(
         fs_utils::app_log(
             &state.data_dir,
             &format!(
-                "导入账号: 新增 {} 跳过 {} 新增分组 {}",
-                report.added, report.skipped, report.groups_added
+                "导入账号: 新增 {} 跳过 {} 新增分组 {}；标签绑定恢复 {}（未知标签忽略 {}）",
+                report.added, report.skipped, report.groups_added, report.tags_restored, report.tags_ignored
             ),
         );
+        crate::api_server::org_index::invalidate(&state.data_dir);
         // 凭据变更联动：运行中 API 池热重载（导入账号已在池白名单内时立即生效）
         if report.added > 0 {
             crate::commands::api_server::reload_pools_if_running(&state, &runtime);
@@ -551,6 +599,10 @@ pub fn accounts_import_preview(
 #[tauri::command]
 pub fn account_add_manual(
     state: State<AppState>,
+    runtime: State<
+        '_,
+        std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>,
+    >,
     name: String,
     jwt: String,
     group_id: Option<String>,
@@ -583,7 +635,11 @@ pub fn account_add_manual(
         let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(uid, g);
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+        // 成员关系变更 → Key 组/标签展开索引失效（与其余全部写路径对齐）
+        crate::api_server::org_index::invalidate(&state.data_dir);
     }
+    // 新增账号影响池装配 → 运行中热重载（服务未运行时 no-op）
+    crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
     Ok(())
 }
 
@@ -604,6 +660,13 @@ pub fn account_delete(
     let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     groups.membership.remove(&user_id);
     crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+
+    // 共享标签绑定清理（审查修复）：防幽灵绑定污染标签计数与 Key 组/标签展开；
+    // 失败不阻断删除（数据卫生问题，落日志可重试）
+    if let Err(e) = crate::store::docs::account_tags_remove_account(&crate::store::db(&state.data_dir), &user_id) {
+        fs_utils::app_log(&state.data_dir, &format!("账号 {user_id} 标签绑定清理失败: {e}"));
+    }
+    crate::api_server::org_index::invalidate(&state.data_dir);
 
     if delete_profile {
         // P0 防目录逃逸：user_id 直接拼进 profiles/ 路径并整目录删除，先做字符集白名单校验
@@ -714,21 +777,13 @@ pub fn groups_list(state: State<AppState>) -> Vec<GroupView> {
         .collect()
 }
 
+/// 创建分组（薄封装转发统一共享分组命令：shg_ 新 ID + 全局重名校验，P0 需求①）
 #[tauri::command]
 pub fn group_create(state: State<AppState>, name: String, color: String) -> Result<String, String> {
-    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    let id = format!("g_{}", chrono::Local::now().timestamp_millis());
-    let order = (groups.groups.len() as i32) + 1;
-    groups.groups.push(Group {
-        id: id.clone(),
-        name,
-        color,
-        order,
-    });
-    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
-    Ok(id)
+    super::shared_groups::create_inner(&state, name, color)
 }
 
+/// 更新分组（薄封装转发统一共享分组命令）
 #[tauri::command]
 pub fn group_update(
     state: State<AppState>,
@@ -737,40 +792,37 @@ pub fn group_update(
     color: Option<String>,
     order: Option<i32>,
 ) -> Result<(), String> {
-    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    let g = groups
-        .groups
-        .iter_mut()
-        .find(|g| g.id == id)
-        .ok_or("分组不存在")?;
-    if let Some(n) = name {
-        g.name = n;
-    }
-    if let Some(c) = color {
-        g.color = c;
-    }
-    if let Some(o) = order {
-        g.order = o;
-    }
-    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
-    Ok(())
+    super::shared_groups::update_inner(&state, id, name, color, order)
 }
 
+/// 删除分组（薄封装转发统一共享分组命令：三池成员回落 + 清 api_pool/api_keys
+/// 引用 + 热重载；旧实现仅删 Trae 侧定义与 membership）
 #[tauri::command]
-pub fn group_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
-    groups.groups.retain(|g| g.id != id);
-    groups.membership.retain(|_, v| *v != id);
-    crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
-    Ok(())
+pub fn group_delete(
+    state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
+    id: String,
+) -> Result<(), String> {
+    super::shared_groups::delete_inner(&state, runtime.inner(), &id)
 }
 
+/// 移动 Trae 账号到分组（成员关系保持 group_members 表机制，D1）。
+/// 联动网关池热重载（对齐 qoder_account_move 惯例）：api_pool.group_ids 按组过滤，
+/// 运行时移动跨组不重载则网关仍按旧组过滤调度。
 #[tauri::command]
 pub fn group_move(
     state: State<AppState>,
+    runtime: State<'_, std::sync::Mutex<Option<crate::commands::api_server::ApiServerRuntime>>>,
     user_id: String,
     group_id: Option<String>,
 ) -> Result<(), String> {
+    // 目标分组校验：group_id 传了非空值但共享分组已删除/不存在时直接拒绝，防幽灵分组
+    // （对齐 workbuddy_account_move / qoder_account_move 语义）
+    if let Some(gid) = group_id.as_deref().filter(|g| !g.is_empty()) {
+        if !super::shared_groups::defs_load(&state).iter().any(|g| g.id == gid) {
+            return Err(format!("目标分组不存在: {gid}"));
+        }
+    }
     let mut groups: GroupsFile = crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
     match group_id {
         Some(g) => {
@@ -781,6 +833,8 @@ pub fn group_move(
         }
     }
     crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+    crate::api_server::org_index::invalidate(&state.data_dir);
+    crate::commands::api_server::reload_pools_if_running(&state, runtime.inner());
     Ok(())
 }
 
@@ -1255,7 +1309,15 @@ pub fn refresh_remaining_credits_impl(
     let mut ok_count = 0usize;
     // (uid, 快照条目)：回写阶段仅移除与快照一致的条目，防扫描窗口内他方重写的新冷却被误清（见函数尾部）
     let mut thawed_uids: Vec<(String, crate::models::CooldownEntry)> = Vec::new();
-    let mut pack_earned_daily: std::collections::BTreeMap<String, f64> = Default::default();
+    // issue #82 问题4-1：按账号保留 pack_earned_daily（uid → date → earned），
+    // 供 credits_daily 快照写入逐账号维度；跨账号合并由 record_daily_snapshot 完成
+    let mut pack_earned_by_uid: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>> =
+        Default::default();
+    // issue #82 审查修复 C：本轮成功扫描的 uid 集合（Err 分支缺席），
+    // 供今日快照区分「成功且无 earned」与「失败未见」，防误清上轮明细
+    let mut synced_uids: std::collections::BTreeSet<String> = Default::default();
+    // 本轮实际尝试过的全部 uid（含失败）：今日快照据此清掉已移除账号的残留明细
+    let mut attempted_uids: std::collections::BTreeSet<String> = Default::default();
     for a in &accounts.accounts {
         let uid = a
             .user_id
@@ -1265,6 +1327,7 @@ pub fn refresh_remaining_credits_impl(
         if uid.is_empty() {
             continue;
         }
+        attempted_uids.insert(uid.clone());
         let dev = resolve_device(&state, &uid);
         match calc_remaining_credits(&a.jwt, &dev) {
             Ok(stats) => {
@@ -1302,11 +1365,15 @@ pub fn refresh_remaining_credits_impl(
                         rc.membership_next_billing.remove(&uid);
                     }
                 }
-                // 各账号包起始日聚合合并（跨账号同日累加）
-                for (d, e) in &stats.pack_earned_daily {
-                    *pack_earned_daily.entry(d.clone()).or_insert(0.0) += e;
+                // 逐账号保留包起始日聚合（uid → date → earned，同日多包累加）
+                if !stats.pack_earned_daily.is_empty() {
+                    let per_uid = pack_earned_by_uid.entry(uid.clone()).or_default();
+                    for (d, e) in &stats.pack_earned_daily {
+                        *per_uid.entry(d.clone()).or_insert(0.0) += e;
+                    }
                 }
                 ok_count += 1;
+                synced_uids.insert(uid.clone());
                 // 自动解冻：有积分 + 冷却类型非 SessionDead → 清除
                 if stats.total > 0.0 {
                     let thaw = cd.cooldowns.get(&uid).and_then(|e| {
@@ -1342,8 +1409,8 @@ pub fn refresh_remaining_credits_impl(
         crate::commands::api_server::push_credits_if_running(state, rt);
     }
 
-    // 记录每日积分快照（total / earned / consumed）
-    record_daily_snapshot(state, &rc, &pack_earned_daily);
+    // 记录每日积分快照（total / earned / consumed + 逐账号 earned 维度）
+    record_daily_snapshot(state, &rc, &pack_earned_by_uid, &synced_uids, &attempted_uids);
 
     if !thawed_uids.is_empty() {
         // C4（审查）：解冻回写两阶段第二段——锁内重读最新表、仅移除本次解冻的
@@ -1384,8 +1451,21 @@ pub fn refresh_remaining_credits_impl(
 fn record_daily_snapshot(
     state: &AppState,
     rc: &RemainingCreditsFile,
-    pack_earned_daily: &std::collections::BTreeMap<String, f64>,
+    pack_earned_by_uid: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>,
+    synced_uids: &std::collections::BTreeSet<String>,
+    attempted_uids: &std::collections::BTreeSet<String>,
 ) {
+    // 逐账号 earned（uid → date → earned）展平为 date → uid → earned（供今日/历史 accounts 维度写入）
+    let mut pack_earned_by_date: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>> =
+        Default::default();
+    for (uid, per_date) in pack_earned_by_uid {
+        for (d, e) in per_date {
+            pack_earned_by_date
+                .entry(d.clone())
+                .or_default()
+                .insert(uid.clone(), *e);
+        }
+    }
     let today = fs_utils::today_prefix(); // "YYYY-MM-DD"
     let total: f64 = rc.credits.values().sum();
     let total = (total * 100.0).round() / 100.0;
@@ -1429,9 +1509,30 @@ fn record_daily_snapshot(
         if r == 0.0 { 0.0 } else { r }
     };
 
+    // 今日逐账号维度：按本轮成功集合合并旧值（issue #82 审查修复 C——失败/无可见包的
+    // 账号保留上轮明细，成功账号以本轮为准），全局 earned 取合并后求和，
+    // 保证今日行恒等式 Σaccounts = earned
+    let today_by_uid = {
+        let fresh = pack_earned_by_date.remove(&today).unwrap_or_default();
+        let mut merged: std::collections::BTreeMap<String, f64> = file
+            .snapshots
+            .iter()
+            .find(|s| s.date == today)
+            .map(|s| s.accounts.clone())
+            .unwrap_or_default();
+        for uid in synced_uids {
+            merged.remove(uid);
+        }
+        // 本轮不再尝试的账号（已移除）残留明细清掉，防止按账号筛选求和虚高
+        merged.retain(|uid, _| attempted_uids.contains(uid));
+        for (uid, e) in fresh {
+            merged.insert(uid, e);
+        }
+        merged
+    };
+
     // earned：今日新开积分包额度合计（CycleStartTime 归今日；今日无新包则为 0）
-    let earned = pack_earned_daily.get(&today).copied().unwrap_or(0.0);
-    let earned = r2(earned);
+    let earned = r2(today_by_uid.values().sum::<f64>());
 
     let consumed = match usage_consumed {
         Some(consumed) => consumed,
@@ -1447,24 +1548,32 @@ fn record_daily_snapshot(
         existing.total = total;
         existing.earned = earned;
         existing.consumed = consumed;
+        // 今日逐账号维度：上方已按成功集合合并（审查修复 C）
+        existing.accounts = today_by_uid;
     } else {
         file.snapshots.push(CreditsDailySnapshot {
             date: today.clone(),
             total,
             earned,
             consumed,
+            accounts: today_by_uid,
         });
     }
 
     // 历史修正：API 可见范围内的历史日期（如昨日已入账的签到/购买包），
     // 用 CycleStartTime 归日口径覆盖旧 earned（旧值多为恒等式反推的失真数据，
-    // 实测昨日 1300）；无快照的日期不补建（total/consumed 无数据源）
-    for (date, e) in pack_earned_daily {
-        if date == &today {
+    // 实测昨日 1300）；无快照的日期不补建（total/consumed 无数据源）。
+    // 逐账号维度仅在旧行缺失时补写、不覆盖（历史行可能只扫描到部分账号，
+    // 若把新 uid 加进 accounts 会让「Σaccounts > earned」，按账号筛选求和会超出全局 earned）
+    for (date, by_uid) in pack_earned_by_date {
+        if date == today {
             continue;
         }
-        if let Some(snap) = file.snapshots.iter_mut().find(|s| &s.date == date) {
-            snap.earned = r2(*e);
+        if let Some(snap) = file.snapshots.iter_mut().find(|s| s.date == date) {
+            snap.earned = r2(by_uid.values().sum::<f64>());
+            if snap.accounts.is_empty() {
+                snap.accounts = by_uid;
+            }
         }
     }
 
@@ -2056,6 +2165,7 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
     }
 
     let now_ts = chrono::Local::now().timestamp();
+    let tag_map = crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir));
     let mut out = Vec::new();
     for a in &accounts.accounts {
         let uid = a
@@ -2168,6 +2278,8 @@ pub fn build_account_views(state: &AppState) -> Vec<AccountView> {
             auth_saved_at: a.auth_saved_at.clone(),
             jwt_uid_mismatch,
             jwt_uid,
+            // 共享标签（account_tags 表联表填充，不落账号持久化结构，D3）
+            tags: tag_map.get(&uid).cloned().unwrap_or_default(),
         });
     }
     out

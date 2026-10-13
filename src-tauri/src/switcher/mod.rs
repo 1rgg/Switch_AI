@@ -516,7 +516,7 @@ fn backup_current(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result
     // 无论成败都在出口失效该槽位体积缓存（失败也可能已 rotate/写入部分文件）——
     // 在此收口可一次覆盖 SaveCurrentLogin / BackupCurrent / Switch / RestoreOnly(last)
     // 全部写槽路径，不再隐式依赖「备份重建槽目录刷新 mtime」这一实现细节
-    crate::commands::profile::invalidate_profile_stats(&slot_dir);
+    crate::commands::profile::invalidate_profile_stats(&slot_dir, &sess.prof.data_dir);
     r
 }
 

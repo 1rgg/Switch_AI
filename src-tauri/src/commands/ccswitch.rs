@@ -346,6 +346,8 @@ fn ensure_ccswitch_key(data_dir: &std::path::Path) -> Result<String, String> {
         dedicated_account: String::new(),
         bind_pool: String::new(),
         daily_stats: Vec::new(),
+        allowed_groups: Vec::new(),
+        allowed_tags: Vec::new(),
     };
     let key = entry.key.clone();
     file.keys.push(entry);

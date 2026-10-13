@@ -43,6 +43,7 @@ import type {
   ProxyLogListResult,
   ProxyStatus,
   Settings,
+  TagView,
   UpdateCheckResult,
   UpdateDownloaded,
   UpdateDownloadProgress,
@@ -76,6 +77,8 @@ import type {
   WbPoolImportResult,
   WbModelInfo,
   UsageHistoryResult,
+  UsageSessionsResult,
+  TraeExpiredEntsResult,
   QoderAccountView,
   QoderCheckinRecord,
   QoderCliStatus,
@@ -218,6 +221,25 @@ export const api = {
     // 积分消耗历史（Trae Work query_user_usage_group_by_session；fresh=true 增量拉取，false 纯缓存）
     usageHistory: (fresh?: boolean) =>
       invoke<UsageHistoryResult>('usage_history_fetch', { fresh: fresh ?? null }),
+    // 逐包到期（issue #82 T5.1：expired_ents 实时查询，含已过期包；credit_packs 只含未过期可用包）
+    traeExpiredEnts: () => invoke<TraeExpiredEntsResult>('trae_expired_ents'),
+    // 会话明细（会话级行缓存查询：区间/模型/账号过滤 + 分页，纯缓存零网络）
+    usageSessions: (opts: {
+      start: string;
+      end: string;
+      model?: string | null;
+      userId?: string | null;
+      page?: number;
+      pageSize?: number;
+    }) =>
+      invoke<UsageSessionsResult>('usage_sessions_query', {
+        start: opts.start,
+        end: opts.end,
+        model: opts.model ?? null,
+        userId: opts.userId ?? null,
+        page: opts.page ?? null,
+        pageSize: opts.pageSize ?? null,
+      }),
   },
   traeApps: {
     localEntitlement: () => invoke<LocalEntitlement>('apps_entitlement_read'),
@@ -229,6 +251,21 @@ export const api = {
       invoke('group_update', { id, ...patch }),
     remove: (id: string) => invoke('group_delete', { id }),
     move: (userId: string, groupId: string | null) => invoke('group_move', { userId, groupId }),
+    /** 共享分组列表（三池成员并集；API Key 分组绑定等跨池消费方用） */
+    sharedList: () => invoke<GroupView[]>('shared_groups_list'),
+  },
+  tags: {
+    /** 共享标签列表（uids 反查自 account_tags，跨池全局） */
+    list: () => invoke<TagView[]>('tags_list'),
+    create: (name: string, color: string) => invoke<string>('tags_create', { name, color }),
+    update: (id: string, patch: { name?: string; color?: string; order?: number }) =>
+      invoke('tags_update', { id, ...patch }),
+    remove: (id: string) => invoke('tags_delete', { id }),
+    /** 全量覆盖式设置账号标签绑定（uid 跨池通用） */
+    setAccountTags: (uid: string, tagIds: string[]) =>
+      invoke('account_tags_set', { uid, tagIds }),
+    /** 全量 uid → tag_ids 映射（一次拉取，避免 N+1 invoke） */
+    map: () => invoke<Record<string, string[]>>('account_tags_map'),
   },
   checkin: {
     start: (opts: CheckinOpts) => invoke('checkin_start', { opts }),
@@ -258,6 +295,8 @@ export const api = {
       }),
     // T6：按类型清理日志文件（all 为全清），返回删除的文件数
     logsClear: (logType: string) => invoke<number>('logs_clear', { logType }),
+    /** 待取启动通知（一次性；后端启动期消息如分组统一迁移结果，拉取后即清） */
+    startupNoticeTake: () => invoke<string | null>('startup_notice_take'),
     settingsGet: () => invoke<Settings>('settings_get'),
     settingsSet: (patch: Partial<Settings>) => invoke('settings_set', { patch }),
     notifyTest: () => invoke<string>('notify_test'),
@@ -484,6 +523,23 @@ export const api = {
       invoke<WbTokenStats>('workbuddy_token_stats', { fresh: fresh ?? null }),
     activityInfo: (userId?: string, fresh?: boolean) =>
       invoke<WbActivityInfo>('workbuddy_activity_info', { userId: userId ?? null, refresh: fresh ?? null }),
+    // Buddy 会话明细（官网请求级明细行缓存查询；上游无 token/会话说明字段 → 前端留空）
+    usageSessions: (opts: {
+      start: string;
+      end: string;
+      model?: string | null;
+      userId?: string | null;
+      page?: number;
+      pageSize?: number;
+    }) =>
+      invoke<UsageSessionsResult>('workbuddy_sessions_query', {
+        start: opts.start,
+        end: opts.end,
+        model: opts.model ?? null,
+        userId: opts.userId ?? null,
+        page: opts.page ?? null,
+        pageSize: opts.pageSize ?? null,
+      }),
   },
   // ---- Qoder（F-80；Rust commands/qoder；字段名严格 snake_case）----
   qoder: {
@@ -548,6 +604,23 @@ export const api = {
       invoke<QoderCreditsResult>('qoder_credits_fetch', { userId: userId ?? null, fresh: fresh ?? null }),
     creditsHistoryList: () =>
       invoke<{ snapshots: QoderCreditsSnapshot[] }>('qoder_credits_history_list'),
+    /** Qoder 会话明细（issue #82 问题5：官网无明细接口，数据源为网关请求级本地流水 qoder_sessions） */
+    usageSessions: (opts: {
+      start: string;
+      end: string;
+      model?: string | null;
+      userId?: string | null;
+      page?: number;
+      pageSize?: number;
+    }) =>
+      invoke<UsageSessionsResult>('qoder_sessions_query', {
+        start: opts.start,
+        end: opts.end,
+        model: opts.model ?? null,
+        userId: opts.userId ?? null,
+        page: opts.page ?? null,
+        pageSize: opts.pageSize ?? null,
+      }),
     /**
      * 账号池导出（M4；includeCredentials=true 必须提供 password——凭证经 AES-256-GCM
      * 加密为 AIWQENC1 信封后才写入导出文件，后端对无密码含凭证导出直接拒绝）
@@ -644,6 +717,12 @@ export const api = {
         qoderStrategy?: string;
         /** Trae 池参与调度开关（默认开）；null/未传 = 保留原值 */
         traeEnabled?: boolean;
+        /** Trae 池标签筛选（共享标签 id）；null/未传 = 保留原值，空数组 = 清空 */
+        traeTagIds?: string[] | null;
+        /** Buddy 池标签筛选；null/未传 = 保留原值 */
+        wbTagIds?: string[] | null;
+        /** Qoder 池标签筛选；null/未传 = 保留原值 */
+        qoderTagIds?: string[] | null;
       },
       wbStrategy?: string,
     ) =>
@@ -676,9 +755,15 @@ export const api = {
         qoderGroupIds: wbFlags?.qoderGroupIds ?? null,
         qoderStrategy: wbFlags?.qoderStrategy ?? null,
         traeEnabled: wbFlags?.traeEnabled ?? null,
+        traeTagIds: wbFlags?.traeTagIds ?? null,
+        wbTagIds: wbFlags?.wbTagIds ?? null,
+        qoderTagIds: wbFlags?.qoderTagIds ?? null,
         wbStrategy: wbStrategy ?? null,
       }),
     poolStatus: () => invoke<PoolStatus[]>('pool_status'),
+    /** Key 组/标签约束覆盖预览（D4/D5 实时展开；{key_id: {trae, buddy, qoder, total}}） */
+    keysOrgPreview: (keys: ApiKeyEntry[]) =>
+      invoke<Record<string, Record<string, number>>>('api_keys_org_preview', { keys }),
     /** WB 池实时状态（F-77⑤：含 per-account inflight 在途计数） */
     wbPoolStatus: () => invoke<PoolStatus[]>('wb_pool_status'),
     /** Qoder 池实时状态（Qoder「资源调度」页：含 per-account inflight 在途计数） */

@@ -299,6 +299,9 @@ fn group_vec(groups: HashMap<String, Totals>) -> Vec<Value> {
 
 /// 结果级缓存 TTL（秒）
 const RESULT_TTL_SECS: u64 = 600;
+/// 结果级缓存落盘 kv 键（B2，issue #84）：进程内 RESULT_CACHE 每次启动即空，重启后
+/// 首个 Token 统计请求此前必然同步全量重扫；落盘后重启可命中上一轮结果，过期则 SWR。
+const RESULT_KV_KEY: &str = "token_stats_result";
 /// 统计窗口（天），与原实现一致
 const WINDOW_DAYS: i64 = 365;
 
@@ -342,7 +345,9 @@ impl DayTotals {
 /// parse_errors 语义随之收紧），旧缓存条目须强制重解析一次以清除口径差。
 /// 3 → 4（2026-10-08）：CodeBuddy IDE 源新增跨文件按 request id 去重（`FileCacheEntry::ids`），
 /// 旧条目没有 id 列表无法判重，须强制重解析一次。
-const PARSE_REV: u32 = 4;
+/// 4 → 5（2026-10-10，issue #84 B1）：新增 per-id 明细 `id_stats`（部分重复时内存重建
+/// 过滤结果免重解析），旧条目没有明细须强制重解析一次补齐。
+const PARSE_REV: u32 = 5;
 
 /// 单文件增量缓存条目
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -364,6 +369,12 @@ struct FileCacheEntry {
     /// 做跨文件去重：整份重复 → 整文件跳过；无重复 → 走快路径；部分重复 → 过滤重解析。
     #[serde(default)]
     ids: Vec<String>,
+    /// id → (day, model, 该请求聚合)：每条计入请求的独立明细（仅 CodeBuddy IDE 源填充）。
+    /// 跨文件「部分重复」时按 id 在内存中重建过滤结果，免去对 index.json 的整文件
+    /// 重解析（issue #84 B1：重复副本每轮扫描都要走过滤路径，是增量缓存之上的
+    /// CPU 放大器）。与 skip 相关的重算结果不进增量缓存，但明细本身是文件的纯函数。
+    #[serde(default)]
+    id_stats: HashMap<String, (String, String, DayTotals)>,
     parse_errors: u64,
 }
 
@@ -667,6 +678,10 @@ fn parse_codebuddy_index(
             write: u.write,
             calls: 1,
         };
+        // per-id 明细（B1）：供聚合层在「部分重复」时内存重建过滤结果，免整文件重解析
+        entry
+            .id_stats
+            .insert(id.to_string(), (day.clone(), model.clone(), d));
         entry.days.entry(day.clone()).or_default().add(&d);
         entry
             .by_model
@@ -848,11 +863,42 @@ fn aggregate_files(
             let mut filtered: Option<FileCacheEntry> = None;
             if dup > 0 {
                 // 部分重复：按「本文件之前已计 id」过滤后重算。过滤结果依赖扫描顺序，
-                // 故不进增量缓存（缓存只存与顺序无关的全量聚合）
-                let t_reparse = Instant::now();
-                filtered = Some(parse_codebuddy_index(path, &mut memo, Some(&counted_ids)));
-                parsed += 1;
-                parse_ms = parse_ms.saturating_add(t_reparse.elapsed().as_millis() as u64);
+                // 故不进增量缓存（缓存只存与顺序无关的全量聚合）。
+                // B1（issue #84，2026-10-10）：优先用增量缓存条目的 per-id 明细（id_stats）
+                // 在内存中重建过滤结果——重复副本每轮扫描都走此路径，此前每次都对
+                // index.json 整文件重解析（增量缓存之上的 CPU 放大器）；明细缺失时
+                // （异常条目兜底）仍走原重解析路径。
+                let rebuild = || -> Option<FileCacheEntry> {
+                    let mut f = FileCacheEntry { rev: PARSE_REV, ..Default::default() };
+                    for id in &entry.ids {
+                        if counted_ids.contains(id.as_str()) {
+                            continue;
+                        }
+                        let (day, model, d) = entry.id_stats.get(id)?;
+                        f.days.entry(day.clone()).or_default().add(d);
+                        f.by_model
+                            .entry(model.clone())
+                            .or_default()
+                            .entry(day.clone())
+                            .or_default()
+                            .add(d);
+                        f.by_project
+                            .entry(CODEBUDDY_IDE_PROJECT.to_string())
+                            .or_default()
+                            .entry(day.clone())
+                            .or_default()
+                            .add(d);
+                    }
+                    f.parse_errors = entry.parse_errors;
+                    Some(f)
+                };
+                filtered = rebuild();
+                if filtered.is_none() {
+                    let t_reparse = Instant::now();
+                    filtered = Some(parse_codebuddy_index(path, &mut memo, Some(&counted_ids)));
+                    parsed += 1;
+                    parse_ms = parse_ms.saturating_add(t_reparse.elapsed().as_millis() as u64);
+                }
             }
             for id in &entry.ids {
                 counted_ids.insert(id.clone());
@@ -964,19 +1010,69 @@ pub fn workbuddy_token_stats(state: State<AppState>, fresh: Option<bool>) -> Val
     workbuddy_token_stats_impl(&state, fresh.unwrap_or(false))
 }
 
+/// token_stats_files 表级读改写互斥（审查 P3-8）：GUI 同步重扫 / 调度器 Token 同步 /
+/// SWR 后台重扫线程三路并发时，kv load→scan→save 互相覆盖丢增量文件条目。
+/// 持锁覆盖全量重扫体（scan 可达秒级，重扫请求串行化；fresh=false 只读路径不持锁）。
+/// 叶子锁：持锁期间不得再获取其他锁。
+static TOKEN_STATS_FILES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 实现（本命令与调度器 wb-credits-snapshot Token 同步共用）：
-/// fresh=true（前端「重扫」/调度同步）跳过结果缓存强制重扫（仍享受增量缓存）
+/// fresh=true（前端「重扫」/调度同步）跳过结果缓存强制重扫（仍享受增量缓存）；
+/// fresh=false 时除进程内 RESULT_CACHE 外还读落盘结果缓存（B2，issue #84）：
+/// 未过期直接命中，过期则 SWR（先回旧值 + 后台重扫）。
 pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value {
     let t_impl = Instant::now();
     if !fresh {
+        // 进程内结果缓存：命中未过期 → 直接回；命中已过期 → 直接 stale 返回、
+        // 不再读落盘 kv（审查 P5）——内存条目与 kv 同写同 TTL（后台重扫成功时一并更新、
+        // 水合时回拨对齐），内存过期 ⇒ kv 必然过期，30s 轮询窗口内免每轮读 kv
         if let Ok(guard) = RESULT_CACHE.lock() {
             if let Some((at, v)) = guard.as_ref() {
                 if at.elapsed().as_secs() < RESULT_TTL_SECS {
                     return v.clone();
                 }
+                spawn_token_stats_refresh(state);
+                let mut stale = v.clone();
+                stale["stale"] = json!(true);
+                stale["stale_reason"] = json!("swr_background_refresh");
+                return stale;
             }
         }
+        // 落盘结果缓存（B2，issue #84）：进程内缓存启动即空，重启后的首个请求此前必然
+        // 同步全量重扫（文件多且大时秒级~十秒级纯 CPU）。未过期 → 水合回内存（记账回拨
+        // 至 kv 的 fetched_at 基准——审查 P2：按水合时刻记账会重置 TTL、把陈旧窗口延长
+        // 最多一个 TTL）；已过期 → SWR（先回旧值 + 后台重扫，并水合为「立即过期」条目，
+        // 后续轮询走上面的内存过期分支免重复读 kv）；完全没有落盘缓存 → 同步全量扫。
+        let kv_cached: Value = crate::store::db(&state.data_dir).kv_get(RESULT_KV_KEY);
+        if let Some(payload) = kv_cached.get("payload").filter(|v| v.is_object()) {
+            let fetched = kv_cached
+                .get("fetched_at_ms")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let stale_secs =
+                ((chrono::Utc::now().timestamp_millis() - fetched) / 1000).max(0) as u64;
+            // 回拨量按 TTL 截断（过期条目只需「立即过期」）；回拨超出进程单调时钟起点
+            // （kv 极旧或时钟异常）时放弃水合，退化为后续轮询重读 kv（开销可忽略）
+            let back = std::time::Duration::from_secs(stale_secs.min(RESULT_TTL_SECS));
+            if let Ok(mut guard) = RESULT_CACHE.lock() {
+                if let Some(at) = Instant::now().checked_sub(back) {
+                    *guard = Some((at, payload.clone()));
+                }
+            }
+            if stale_secs < RESULT_TTL_SECS {
+                return payload.clone();
+            }
+            spawn_token_stats_refresh(state);
+            let mut stale = payload.clone();
+            stale["stale"] = json!(true);
+            stale["stale_reason"] = json!("swr_background_refresh");
+            return stale;
+        }
     }
+
+    // 全量重扫体持表级互斥（审查 P3-8）：load→scan→save 全程串行化，防三路并发
+    // 互相覆盖 kv 条目；fresh=false 只读路径（上方缓存命中分支）不进锁，不被阻塞。
+    let _guard = TOKEN_STATS_FILES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     let now_ms = chrono::Utc::now().timestamp_millis();
@@ -1088,7 +1184,71 @@ pub(crate) fn workbuddy_token_stats_impl(state: &AppState, fresh: bool) -> Value
     if let Ok(mut guard) = RESULT_CACHE.lock() {
         *guard = Some((Instant::now(), merged.clone()));
     }
+    // 落盘结果缓存（B2，issue #84）：与进程内 RESULT_CACHE 同步写入，
+    // 供重启后首个请求直接命中或 SWR 兜底，避免每次启动必然全量重扫。
+    let wrapper = json!({
+        "fetched_at_ms": chrono::Utc::now().timestamp_millis(),
+        "payload": merged.clone(),
+    });
+    let _ = crate::store::db(&state.data_dir).kv_set(RESULT_KV_KEY, &wrapper);
     merged
+}
+
+/// Token 统计后台重扫（SWR 的「后台」半程，issue #84 B2）：fresh=true 全量重扫
+/// （仍享受文件级增量缓存），完成后进程内与落盘缓存一并更新。
+/// 节流 + 在途去重与 credits 后台刷新同款：重扫可达秒级~十秒级纯 CPU，同一时刻
+/// 只跑一轮；落盘缓存仍过期的轮询请求在 5min 节流窗口内不再重复触发。起止均落 app_log。
+fn spawn_token_stats_refresh(state: &AppState) {
+    static LAST_BG_REFRESH: Mutex<Option<Instant>> = Mutex::new(None);
+    const BG_REFRESH_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+    {
+        let last = LAST_BG_REFRESH.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = *last {
+            if t.elapsed() < BG_REFRESH_MIN_INTERVAL {
+                return;
+            }
+        }
+    }
+    static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    *LAST_BG_REFRESH.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    let st = state.clone();
+    std::thread::spawn(move || {
+        struct ResetInFlight;
+        impl Drop for ResetInFlight {
+            fn drop(&mut self) {
+                IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _reset = ResetInFlight;
+        let started = Instant::now();
+        // panic 兜底（审查 P6，同 scheduler.rs 调度线程先例）：重扫体 panic 照常落日志；
+        // IN_FLIGHT 复位由上方 Drop 守卫保证，此处仅补可观测性
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            workbuddy_token_stats_impl(&st, true)
+        }));
+        match outcome {
+            Ok(v) => crate::fs_utils::app_log(
+                &st.data_dir,
+                &format!(
+                    "[wb-token] 后台重扫完成，共 {}ms（文件 {}，解析 {}，错误 {}）",
+                    started.elapsed().as_millis(),
+                    v.get("files_scanned").and_then(Value::as_u64).unwrap_or(0),
+                    v.get("files_parsed").and_then(Value::as_u64).unwrap_or(0),
+                    v.get("parse_errors").and_then(Value::as_u64).unwrap_or(0),
+                ),
+            ),
+            Err(_) => crate::fs_utils::app_log(
+                &st.data_dir,
+                &format!(
+                    "[wb-token] 后台重扫线程 panic（已捕获，不影响下次触发）：{}ms",
+                    started.elapsed().as_millis()
+                ),
+            ),
+        }
+    });
 }
 
 fn add_summary(dst: &mut Value, src: &Value) {

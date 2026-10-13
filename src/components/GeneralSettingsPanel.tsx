@@ -359,6 +359,17 @@ export default function GeneralSettingsPanel() {
               启动时自动开启 API 网关
               <span className="text-xs text-slate-400">（网关监听所有网卡，局域网设备可访问）</span>
             </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.sessions_preview_enabled}
+                onChange={(e) => update('sessions_preview_enabled', e.target.checked)}
+              />
+              会话明细显示首条消息概述
+              <span className="text-xs text-slate-400">
+                （用量看板「会话说明」列；关闭仅隐藏展示，不删除缓存）
+              </span>
+            </label>
             <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
           </div>
         </div>

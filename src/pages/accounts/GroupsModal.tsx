@@ -1,16 +1,31 @@
 import { useEffect, useState } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
-import { Modal } from '../../components/ui';
+import { Badge, Modal } from '../../components/ui';
 import type { GroupView } from '../../types';
 
 const PRESET_COLORS = [
   '#6366f1', '#22c55e', '#f59e0b', '#ef4444', '#0ea5e9', '#a855f7', '#14b8a6',
 ];
 
+/** 池来源徽标计算（设计文档需求①可选增强）：按共享分组 uids 前缀统计该组在哪些池有成员。
+ *  传入 api.groups.sharedList() 的全池并集视图（本池 list 只有本池成员，无法判跨池） */
+export function computePoolBadges(defs: GroupView[]): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const g of defs) {
+    const pools: string[] = [];
+    if (g.uids.some((u) => !u.startsWith('wb-') && !u.startsWith('qd-'))) pools.push('Trae');
+    if (g.uids.some((u) => u.startsWith('wb-'))) pools.push('Buddy');
+    if (g.uids.some((u) => u.startsWith('qd-'))) pools.push('Qoder');
+    out[g.id] = pools;
+  }
+  return out;
+}
+
 export function GroupsModal({
   open,
   onClose,
   groups,
+  poolBadges,
   onCreate,
   onRename,
   onRecolor,
@@ -19,6 +34,8 @@ export function GroupsModal({
   open: boolean;
   onClose: () => void;
   groups: GroupView[];
+  /** 池来源徽标（groupId → 在哪些池有成员；不传则不显示） */
+  poolBadges?: Record<string, string[]>;
   onCreate: (name: string, color: string) => Promise<void>;
   onRename: (id: string, name: string) => Promise<void>;
   onRecolor: (id: string, color: string) => Promise<void>;
@@ -102,6 +119,15 @@ export function GroupsModal({
         {groups.map((g) => (
           <div key={g.id} className="flex items-center gap-2 rounded-lg border border-slate-200 p-2 dark:border-zinc-700">
             <span className="inline-block h-4 w-4 rounded-full" style={{ background: g.color }} />
+            {(poolBadges?.[g.id]?.length ?? 0) > 0 && (
+              <span className="flex shrink-0 gap-0.5" title={`该分组在以下池有成员：${poolBadges![g.id].join('、')}`}>
+                {poolBadges![g.id].map((p) => (
+                  <Badge key={p} tone="slate" className="!px-1 !text-[9px]">
+                    {p}
+                  </Badge>
+                ))}
+              </span>
+            )}
             <input
               value={editingNames[g.id] ?? g.name}
               onChange={(e) =>

@@ -12,12 +12,13 @@ use super::ApiSharedState;
 
 /// API Key 鉴权中间件：
 /// - /health 跳过鉴权
-/// - Key 统一在 data/api_keys.json 列表中维护（带每日配额），
+/// - Key 注册表存 vault（加密），内存权威副本 + flusher 落盘（批次 E），
 ///   支持 Authorization: Bearer <key>（OpenAI 风格）或 x-api-key: <key>（Anthropic 风格）
 /// - 存在启用 Key 时必须鉴权；无任何启用 Key 时：auth_disabled=true（显式关闭鉴权）放行记 anonymous，
 ///   否则拒绝（默认）并返回引导提示
-/// - Key 每次命中即累加当日用量并写盘，超配额返回 429
-/// - 每次请求重读 api_keys.json：新增/删除/禁用/开关立即生效
+/// - 命中即累加当日用量（内存权威副本 + 标脏，flusher 2s 落盘），超配额返回 429
+/// - UI 增删/禁用/开关经 api_keys::save 即时刷新内存副本，立即生效
+/// - 组/标签约束经 org_index 锁外展开（D4）随 ResolvedKey 下发
 /// 校验通过后向 request extensions 插入命中的 Key 标识（KeyId），供 handler 用量记账
 pub async fn bearer_auth(
     State(state): State<Arc<ApiSharedState>>,

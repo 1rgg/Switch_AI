@@ -1494,6 +1494,9 @@ pub fn oauth_login(
             crate::store::docs::groups_load(&crate::store::db(&state.data_dir));
         groups.membership.insert(user_id.clone(), g);
         crate::store::docs::groups_save(&crate::store::db(&state.data_dir), &groups)?;
+        // 成员关系变更 → Key 组/标签展开索引失效（与其余全部写路径对齐，
+        // 不依赖 TTL 5s 兜底）
+        crate::api_server::org_index::invalidate(&state.data_dir);
     }
 
     // 重新登录拿到新凭证 → 运行中 API 池热重载（全量重建，覆盖单点回填管不到的

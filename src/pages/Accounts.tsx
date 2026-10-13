@@ -19,6 +19,7 @@ import {
   ShieldAlert,
   Snowflake,
   SquareTerminal,
+  Tag,
   Tags,
   Trash2,
   Upload,
@@ -32,7 +33,7 @@ import { useAppStore } from '../store';
 import { api } from '../lib/tauri';
 import { withMinDelay } from '../lib/delay';
 import { copyText } from '../lib/clipboard';
-import type { AccountView, DiscoveredAccount, ImportPreview } from '../types';
+import type { AccountView, DiscoveredAccount, ImportPreview, TagView } from '../types';
 import { AddAccountModal } from './accounts/AddAccountModal';
 import { CooldownBadge } from './accounts/CooldownBadge';
 import { CreditCell } from './accounts/CreditCell';
@@ -41,7 +42,9 @@ import { DeleteAccountConfirmModal, DeleteSlotConfirmModal } from './accounts/De
 import { DiscoverModal } from './accounts/DiscoverModal';
 import { EditAccountModal } from './accounts/EditAccountModal';
 import { GroupSelect } from './accounts/GroupSelect';
-import { GroupsModal } from './accounts/GroupsModal';
+import { GroupsModal, computePoolBadges } from './accounts/GroupsModal';
+import { TagChips } from './accounts/TagSelect';
+import { AccountTagsEditModal, TagsModal } from './accounts/TagsModal';
 import { HelpModal } from './accounts/HelpModal';
 import { ImportPreviewModal } from './accounts/ImportPreviewModal';
 import { JwtStatusBadge } from './accounts/JwtStatusBadge';
@@ -89,6 +92,13 @@ export default function Accounts() {
   const [filter, setFilter] = useState<string>('all');
   const [addOpen, setAddOpen] = useState(false);
   const [groupOpen, setGroupOpen] = useState(false);
+  // 共享标签体系（P1 需求③）：定义列表 + 全量 uid→tag_ids 映射 + 编辑弹框目标
+  const [tagDefs, setTagDefs] = useState<TagView[]>([]);
+  const [tagMap, setTagMap] = useState<Record<string, string[]>>({});
+  const [tagsOpen, setTagsOpen] = useState(false);
+  const [tagEditTarget, setTagEditTarget] = useState<AccountView | null>(null);
+  // 池来源徽标（需求①可选增强）：groupId → 在哪些池有成员
+  const [poolBadges, setPoolBadges] = useState<Record<string, string[]>>({});
   const [editTarget, setEditTarget] = useState<AccountView | null>(null);
   // 双应用切换/保存菜单：{ userId, kind } —— kind='switch' 切换登录态 / 'save' 保存登录态
   const [appMenu, setAppMenu] = useState<{ userId: string; kind: 'switch' | 'save'; x: number; y: number } | null>(null);
@@ -196,10 +206,34 @@ export default function Accounts() {
     return accounts.filter((a) => a.group_id === filter);
   }, [accounts, filter]);
 
+  // 共享标签加载/维护（P1 需求③）
+  const refreshTags = async () => {
+    try {
+      const [defs, map] = await Promise.all([api.tags.list(), api.tags.map()]);
+      setTagDefs(defs);
+      setTagMap(map);
+    } catch (err) {
+      toast('error', `标签加载失败：${String(err)}`);
+    }
+  };
+  const saveAccountTags = async (uid: string, ids: string[]) => {
+    try {
+      await api.tags.setAccountTags(uid, ids);
+      await refreshTags();
+      await refreshAccounts();
+      toast('success', '标签已更新');
+    } catch (err) {
+      toast('error', `标签保存失败：${String(err)}`);
+      throw err;
+    }
+  };
+
   useEffect(() => {
     void refreshAccounts();
     void refreshGroups();
     void refreshLocalEntitlement();
+    void refreshTags();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshAccounts, refreshGroups, refreshLocalEntitlement]);
 
   const onDelete = async (a: AccountView) => {
@@ -328,7 +362,11 @@ export default function Accounts() {
       const report = await api.accounts.importAccounts(importContent, only);
       toast(
         'success',
-        `导入完成：新增 ${report.added} 个账号，跳过 ${report.skipped} 个重复${report.groups_added ? `，新增分组 ${report.groups_added} 个` : ''}`,
+        `导入完成：新增 ${report.added} 个账号，跳过 ${report.skipped} 个重复${report.groups_added ? `，新增分组 ${report.groups_added} 个` : ''}${
+          report.tags_restored || report.tags_ignored
+            ? `，标签绑定恢复 ${report.tags_restored ?? 0} 条${report.tags_ignored ? `（未知标签忽略 ${report.tags_ignored}）` : ''}`
+            : ''
+        }`,
       );
       setImportPreviewData(null);
       setImportContent('');
@@ -385,8 +423,22 @@ export default function Accounts() {
             >
               {importing ? <Loader2 size={15} className="animate-spin" /> : <Upload size={15} />} 导入账号
             </button>
-            <button onClick={() => setGroupOpen(true)} className="btn-outline" title="管理账号分组">
+            <button
+              onClick={() => {
+                setGroupOpen(true);
+                // 池来源徽标：共享分组三池成员并集按前缀统计（可选增强，失败静默）
+                api.groups
+                  .sharedList()
+                  .then((defs) => setPoolBadges(computePoolBadges(defs)))
+                  .catch(() => {});
+              }}
+              className="btn-outline"
+              title="管理账号分组"
+            >
               <Tags size={15} /> 分组管理
+            </button>
+            <button onClick={() => void refreshTags().then(() => setTagsOpen(true))} className="btn-outline" title="管理共享标签（三池通用）">
+              <Tag size={15} /> 标签管理
             </button>
             <button onClick={() => { void refreshProfiles(); setProfileOpen(true); }} className="btn-outline" title="查看/备份/恢复登录态快照">
               <Camera size={15} /> 快照管理
@@ -439,6 +491,7 @@ export default function Accounts() {
               <tr>
                 <th className="px-4 py-2 text-left">账号</th>
                 <th className="px-4 py-2 text-left">分组</th>
+                <th className="px-4 py-2 text-left">标签</th>
                 <th className="px-4 py-2 text-left">JWT</th>
                 <th className="px-4 py-2 text-left">设备 ID</th>
                 <th className="px-4 py-2 text-left">今日</th>
@@ -480,6 +533,13 @@ export default function Accounts() {
                         value={a.group_id}
                         groups={groups}
                         onChange={(gid) => void moveAccount(a.user_id, gid)}
+                      />
+                    </td>
+                    <td className="px-4 py-3">
+                      <TagChips
+                        tagIds={tagMap[a.user_id] ?? a.tags}
+                        allTags={tagDefs}
+                        onEdit={() => setTagEditTarget(a)}
                       />
                     </td>
                     <td className="px-4 py-3">
@@ -707,6 +767,7 @@ export default function Accounts() {
         open={groupOpen}
         onClose={() => setGroupOpen(false)}
         groups={groups}
+        poolBadges={poolBadges}
         onCreate={async (name, color) => {
           await createGroup(name, color);
         }}
@@ -718,6 +779,62 @@ export default function Accounts() {
         }}
         onDelete={async (id) => {
           await removeGroup(id);
+        }}
+      />
+      <TagsModal
+        open={tagsOpen}
+        onClose={() => setTagsOpen(false)}
+        tags={tagDefs}
+        onCreate={async (name, color) => {
+          try {
+            await api.tags.create(name, color);
+            await refreshTags();
+          } catch (err) {
+            // 审查 F5：异常兜底 toast（对齐 Buddy/Qoder 账号页），重抛由弹框保留输入便于重试
+            toast('error', `创建标签失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRename={async (id, name) => {
+          try {
+            await api.tags.update(id, { name });
+            await refreshTags();
+            toast('success', `标签已重命名为「${name}」`);
+          } catch (err) {
+            toast('error', `重命名标签失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onRecolor={async (id, color) => {
+          try {
+            await api.tags.update(id, { color });
+            await refreshTags();
+            toast('success', '标签颜色已更新');
+          } catch (err) {
+            toast('error', `修改标签颜色失败：${String(err)}`);
+            throw err;
+          }
+        }}
+        onDelete={async (id) => {
+          try {
+            await api.tags.remove(id);
+            await refreshTags();
+            toast('success', '标签已删除，引用已清理');
+          } catch (err) {
+            toast('error', `删除标签失败：${String(err)}`);
+            throw err;
+          }
+        }}
+      />
+      <AccountTagsEditModal
+        open={tagEditTarget != null}
+        onClose={() => setTagEditTarget(null)}
+        accountName={tagEditTarget?.name ?? ''}
+        tags={tagDefs}
+        selected={tagEditTarget ? (tagMap[tagEditTarget.user_id] ?? tagEditTarget.tags ?? []) : []}
+        onSave={async (ids) => {
+          if (!tagEditTarget) return;
+          await saveAccountTags(tagEditTarget.user_id, ids);
         }}
       />
       <ProfileModal

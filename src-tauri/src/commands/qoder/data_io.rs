@@ -208,10 +208,13 @@ fn qoder_accounts_export_impl(
     } else {
         Value::Null
     };
+    // 共享标签绑定随账号导出（tag id 数组；标签定义属全局数据不随文件携带）
+    let tag_map = crate::store::docs::account_tags_map(&crate::store::db(&state.data_dir));
     let accounts: Vec<Value> = pool
         .iter()
         .map(|a| {
             let mut v = serde_json::to_value(a).map_err(|e| format!("序列化失败: {e}"))?;
+            v["tags"] = serde_json::json!(tag_map.get(&a.id).cloned().unwrap_or_default());
             if include_cred {
                 // §5.10 对齐导入侧（审查 P3）：导出前剥离设备字段——正常链路
                 // token store 不落指纹，但历史版本/旁路写入存在时防泄漏
@@ -227,9 +230,10 @@ fn qoder_accounts_export_impl(
         })
         .collect::<Result<Vec<_>, String>>()?;
     // 分组定义随载荷导出（审查修复）：成员关系存在账号 group_id 上，异机导入时
-    // 无分组定义会产生幽灵 group_id（聚合落空）。旧版导入器忽略未知字段，向后兼容
+    // 无分组定义会产生幽灵 group_id（聚合落空）。P0 需求①：分组定义统一存共享
+    // groups 表，此处导出统一 defs（旧版导入器忽略未知字段，向后兼容）
     let groups: Vec<crate::models::Group> =
-        crate::store::db(&state.data_dir).kv_get("qoder_groups");
+        crate::store::docs::group_defs_load(&crate::store::db(&state.data_dir));
     let payload = serde_json::json!({
         "kind": "aiwork-qoder-pool",
         "version": 1,
@@ -264,6 +268,36 @@ fn qoder_accounts_export_impl(
 
 /// 单账号合并结果：Ok((生效 id, 是否新增))；Err = 拒绝原因。
 type MergeResult = Result<(String, bool), String>;
+
+/// 导入条目的 tags 字段收集（P2 需求③）：仅保留本机已存在的 tag id（未知 id
+/// 计入 ignored，不自动创建标签）；final_id = 原位更新保留的原 id 或新增 id
+fn collect_import_tags(
+    entry: &Value,
+    final_id: &str,
+    tag_defs: &[crate::models::Tag],
+    out: &mut Vec<(String, Vec<String>)>,
+    ignored: &mut usize,
+) {
+    let Some(arr) = entry.get("tags").and_then(Value::as_array) else {
+        return;
+    };
+    let valid: Vec<String> = arr
+        .iter()
+        .filter_map(|t| t.as_str())
+        .filter(|t| {
+            if tag_defs.iter().any(|d| d.id == **t) {
+                true
+            } else {
+                *ignored += 1;
+                false
+            }
+        })
+        .map(String::from)
+        .collect();
+    if !valid.is_empty() {
+        out.push((final_id.to_string(), valid));
+    }
+}
 
 /// 单账号幂等合并（纯函数，可单测）：uid 优先 id 兜底原位更新，保留原 id
 /// （换 token / 异机 id 的同账号不再产生重复条目，分组引用不悬空）。
@@ -418,10 +452,13 @@ fn qoder_accounts_import_impl(
     let mut pool = load_pool_checked(state)?;
     // 分组定义合并（审查修复）：导出载荷携带 groups（旧版无此字段则跳过），
     // 按 id 幂等 upsert——本地已有同 id 分组保留本地定义（用户可能已改名），仅补缺失。
-    // 持池锁执行：与并发导入互斥，防 kv("qoder_groups") 读改写竞争丢定义；
+    // 持池锁执行：与并发导入互斥，防账号池读改写竞争丢账号；
     // 且池损坏提前 Err 时不再产生分组定义副作用
     let store = crate::store::db(&state.data_dir);
-    let mut defs: Vec<crate::models::Group> = store.kv_get("qoder_groups");
+    // P0 需求①：分组定义统一读共享 groups 表；导出载荷携带的 groups（旧版无此
+    // 字段则跳过）按 id 幂等合并进共享定义——本地已有同 id 分组保留本地定义
+    //（用户可能已改名），仅补缺失。持池锁执行防读改写竞争。
+    let mut defs: Vec<crate::models::Group> = crate::store::docs::group_defs_load(&store);
     if let Some(groups) = payload.get("groups").and_then(Value::as_array) {
         let mut defs_changed = false;
         for g in groups {
@@ -435,7 +472,7 @@ fn qoder_accounts_import_impl(
             defs_changed = true;
         }
         if defs_changed {
-            store.kv_set("qoder_groups", &defs)?;
+            crate::store::docs::group_defs_save(&store, &defs)?;
         }
     }
     let valid_group_ids: std::collections::HashSet<String> =
@@ -445,6 +482,10 @@ fn qoder_accounts_import_impl(
     // 凭证已落库而池条目丢失，产生列表不可见、移除接口原先拒绝清理的孤儿凭证。
     // 调序后最坏情况是凭证单条失败（rejected 聚合、重新导入可补齐），语义不变
     let mut cred_writes: Vec<(String, crate::tasks::qoder_common::QoderCreds)> = Vec::new();
+    // 标签绑定恢复（P2 需求③）：仅本机已存在的 tag id，未知 id 忽略不自动创建
+    let tag_defs = crate::store::docs::tags_load(&store);
+    let mut tag_bindings: Vec<(String, Vec<String>)> = Vec::new();
+    let mut tags_ignored = 0usize;
     for a in accounts {
         match merge_account(&mut pool, a) {
             Ok((final_id, is_new)) => {
@@ -453,6 +494,7 @@ fn qoder_accounts_import_impl(
                 } else {
                     updated += 1;
                 }
+                collect_import_tags(a, &final_id, &tag_defs, &mut tag_bindings, &mut tags_ignored);
                 // 凭证副本回写（导出时含凭证才有效）：至少有作业令牌或 PAT 才落库
                 if let Some(cred) = a.get("credential").filter(|c| c.is_object()) {
                     // §5.10 红线纵深：入库前剥离设备字段（指纹只存账号池 device_profile，
@@ -479,6 +521,11 @@ fn qoder_accounts_import_impl(
         }
     }
     save_pool(state, &pool)?;
+    // 标签绑定落 account_tags 表（uid 键跨池通用）
+    for (uid, ids) in &tag_bindings {
+        crate::store::docs::account_tags_set(&store, uid, ids)?;
+    }
+    crate::api_server::org_index::invalidate(&state.data_dir);
     for (final_id, creds) in cred_writes {
         // 单账号凭证落库失败不中断整体（部分导入比整体中断更糟）：
         // 聚合进 rejected 继续导入；账号信息已入池，重新导入可补齐凭证

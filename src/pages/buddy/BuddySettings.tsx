@@ -193,8 +193,8 @@ function TaskConfigCard({
   patch: (p: Partial<WorkBuddySettings>) => void;
   growthForm: { enabled: boolean; hhmm: string };
   setGrowthForm: (f: { enabled: boolean; hhmm: string }) => void;
-  creditsForm: { mode: string; hhmm: string };
-  setCreditsForm: (f: { mode: string; hhmm: string }) => void;
+  creditsForm: { mode: string; hhmm: string; hours: string };
+  setCreditsForm: (f: { mode: string; hhmm: string; hours: string }) => void;
   checkinHhmm: string;
   setCheckinHhmm: (v: string) => void;
   checkinGap: number;
@@ -521,11 +521,32 @@ function TaskConfigCard({
             value={creditsForm.mode}
             onChange={(e) => setCreditsForm({ ...creditsForm, mode: e.target.value })}
           >
+            <option value="every_hours">每N小时</option>
             <option value="daily">每日定时</option>
             <option value="hourly">每小时</option>
             <option value="off">关闭</option>
           </select>
         </label>
+        {creditsForm.mode === 'every_hours' && (
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-medium text-slate-500">同步间隔</span>
+            <input
+              type="number"
+              min={1}
+              max={24}
+              value={creditsForm.hours}
+              onChange={(e) => setCreditsForm({ ...creditsForm, hours: e.target.value || '2' })}
+              onBlur={() => {
+                const n = Math.min(24, Math.max(1, Math.round(Number(creditsForm.hours) || 2)));
+                setCreditsForm({ ...creditsForm, hours: String(n) });
+              }}
+              className="input h-9 !w-20 text-sm"
+            />
+            <span className="text-xs text-slate-400">
+              小时（1-24）；距上次成功同步满 {creditsForm.hours || '2'} 小时自动执行一次（含会话明细）
+            </span>
+          </div>
+        )}
         {creditsForm.mode === 'daily' && (
           <div className="flex items-center gap-2">
             <span className="text-xs font-medium text-slate-500">每日执行时刻</span>
@@ -623,7 +644,7 @@ export default function BuddySettings() {
   // 成长调度表单（wb_growth_enabled/hhmm 存 app Settings，随「保存配置」统一提交）
   const [growthForm, setGrowthForm] = useState({ enabled: true, hhmm: '09:00' });
   // 积分与 Token 同步表单（wb_credits_sync_mode/hhmm 存 app Settings，随「保存配置」统一提交）
-  const [creditsForm, setCreditsForm] = useState({ mode: 'daily', hhmm: '23:30' });
+  const [creditsForm, setCreditsForm] = useState({ mode: 'every_hours', hhmm: '23:30', hours: '2' });
   // 每日签到调度时刻与多账号间隔（wb_checkin_hhmm/gap_secs 存 app Settings，随「保存配置」统一提交）
   const [checkinHhmm, setCheckinHhmm] = useState('09:10');
   const [checkinGap, setCheckinGap] = useState(3);
@@ -680,8 +701,9 @@ export default function BuddySettings() {
       hhmm: appSettings.wb_growth_hhmm || '09:00',
     });
     setCreditsForm({
-      mode: appSettings.wb_credits_sync_mode || 'daily',
+      mode: appSettings.wb_credits_sync_mode || 'every_hours',
       hhmm: appSettings.wb_credits_sync_hhmm || '23:30',
+      hours: appSettings.wb_credits_sync_hours || '2',
     });
     setCheckinHhmm(appSettings.wb_checkin_hhmm || '09:10');
     setCheckinGap(appSettings.wb_checkin_gap_secs ?? 3);
@@ -703,6 +725,7 @@ export default function BuddySettings() {
         wb_growth_hhmm: growthForm.hhmm.trim() || '09:00',
         wb_credits_sync_mode: creditsForm.mode,
         wb_credits_sync_hhmm: creditsForm.hhmm.trim() || '23:30',
+        wb_credits_sync_hours: creditsForm.hours.trim() || '2',
         wb_checkin_hhmm: checkinHhmm.trim() || '09:10',
         wb_checkin_gap_secs: checkinGap,
       });

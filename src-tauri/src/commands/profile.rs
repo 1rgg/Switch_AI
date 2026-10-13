@@ -117,8 +117,8 @@ fn dir_stats_many(paths: &[PathBuf]) -> Vec<(u64, u64)> {
     out
 }
 
-/// 槽位体积缓存项。
-#[derive(Clone, Copy)]
+/// 槽位体积缓存项（可落盘）。
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct CachedDirStats {
     size: u64,
     files: u64,
@@ -126,7 +126,9 @@ struct CachedDirStats {
     /// （子目录内文件改动不会），且更新时间戳存在延迟（同一毫秒内写入常读不到变化）——
     /// 故它只作**尽力而为**的失效信号：命中与否不影响正确性，正确性由 TTL 与显式失效保证。
     slot_mtime_ms: i64,
-    at: Instant,
+    /// 统计时刻（unix 毫秒）。原为进程内 `Instant`；issue #84 C2 落盘后跨进程仍需判 TTL，
+    /// 故换 unix 毫秒（TTL 仅 5 分钟，墙钟跳变影响可忽略）。
+    at_ms: i64,
 }
 
 /// 槽位体积缓存：列表页每次打开/切档都要体积，而体积统计是「遍历整棵快照目录」的重活。
@@ -138,8 +140,52 @@ static PROFILE_STATS_CACHE: OnceLock<Mutex<HashMap<String, CachedDirStats>>> = O
 /// 取 5 分钟是权衡：命中即零遍历（弹窗秒开），代价是体积最多滞后 5 分钟。
 const PROFILE_STATS_TTL: Duration = Duration::from_secs(300);
 
+/// 体积统计的落盘 kv 键（issue #84 C2）：进程内缓存是静态的，每次启动首刷都要对全部
+/// 槽位重算一遍体积（实测 CodeBuddy 档 28,750 文件约 712-780ms）。落盘后启动首刷直接
+/// 命中；失效仍以 slot_mtime_ms + TTL + 显式失效三层保证，落盘条目陈旧最多导致一次重算。
+const PROFILE_STATS_KV: &str = "profile_stats_cache";
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 从落盘 kv 读体积缓存（键不存在 / 损坏 → 空 map，重算自愈）。
+fn kv_stats_load(data_dir: &Path) -> HashMap<String, CachedDirStats> {
+    crate::store::db(data_dir).kv_get::<HashMap<String, CachedDirStats>>(PROFILE_STATS_KV)
+}
+
+/// 列表首刷前的批量水合（审查 P3）：此前逐槽位 miss 时各读一次落盘 kv 全量 map，
+/// 28 个槽位即 28 次重复读；一次读入、批量 or_insert（不覆盖并发新值）后，
+/// 整轮列表的命中判定全部走内存。单键水合兜底仍保留在 cached_stats（invalidate 后
+/// 再 miss 的键重新水合）。
+fn hydrate_stats_cache(data_dir: &Path) {
+    let kv_map = kv_stats_load(data_dir);
+    if kv_map.is_empty() {
+        return;
+    }
+    if let Ok(mut cache) = stats_cache().lock() {
+        for (k, v) in kv_map {
+            cache.entry(k).or_insert(v);
+        }
+    }
+}
+
 fn stats_cache() -> &'static Mutex<HashMap<String, CachedDirStats>> {
     PROFILE_STATS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 落盘 kv 读-改-写的串行化锁（审查 P4）：store_stats 与 invalidate_profile_stats
+/// 并发时各自的「load → 改 → set」会互相覆盖（lost-update：备份/删除路径的 kv 移除
+/// 被并发写回复活）。复活的条目 slot_mtime_ms 已过期、会被 fresh 判定挡住并在 TTL
+/// 内自愈，但代价是一次无谓全量重算；加锁后读-改-写原子化。
+/// 锁序恒为 stats_cache → 本锁（两处写路径同序），无死锁风险。
+static STATS_KV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn stats_kv_lock() -> &'static Mutex<()> {
+    STATS_KV_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn mtime_ms(meta: &std::fs::Metadata) -> i64 {
@@ -150,32 +196,56 @@ fn mtime_ms(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn cached_stats(path: &Path, slot_mtime_ms: i64) -> Option<(u64, u64)> {
+fn cached_stats(path: &Path, slot_mtime_ms: i64, data_dir: &Path) -> Option<(u64, u64)> {
     let key = path.to_string_lossy().to_string();
-    let cache = stats_cache().lock().ok()?;
-    let hit = cache.get(&key)?;
-    if hit.slot_mtime_ms == slot_mtime_ms && hit.at.elapsed() < PROFILE_STATS_TTL {
-        Some((hit.size, hit.files))
-    } else {
-        None
+    let fresh = |hit: &CachedDirStats| {
+        hit.slot_mtime_ms == slot_mtime_ms
+            && now_ms() - hit.at_ms < PROFILE_STATS_TTL.as_millis() as i64
+    };
+    {
+        let cache = stats_cache().lock().ok()?;
+        if let Some(hit) = cache.get(&key) {
+            return fresh(hit).then_some((hit.size, hit.files));
+        }
     }
+    // 内存 miss（典型为启动后首刷）：从落盘 kv 水合该键再判定，免一次全量重算。
+    let kv_map = kv_stats_load(data_dir);
+    if let Some(hit) = kv_map.get(&key) {
+        if let Ok(mut cache) = stats_cache().lock() {
+            cache.entry(key).or_insert(*hit);
+        }
+        return fresh(hit).then_some((hit.size, hit.files));
+    }
+    None
 }
 
-fn store_stats(path: &Path, slot_mtime_ms: i64, size: u64, files: u64) {
+fn store_stats(path: &Path, slot_mtime_ms: i64, size: u64, files: u64, data_dir: &Path) {
     let key = path.to_string_lossy().to_string();
+    let v = CachedDirStats { size, files, slot_mtime_ms, at_ms: now_ms() };
     if let Ok(mut cache) = stats_cache().lock() {
-        cache.insert(
-            key,
-            CachedDirStats { size, files, slot_mtime_ms, at: Instant::now() },
-        );
+        cache.insert(key.clone(), v);
     }
+    // 同步落盘（读-改-写，与 invalidate 路径经 STATS_KV_LOCK 串行——审查 P4）：
+    // 不加锁时备份/删除的 kv 移除可能被并发写回复活（mtime/TTL 判定兜底自愈，
+    // 但多一次无谓全量重算）
+    let _guard = stats_kv_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut kv_map = kv_stats_load(data_dir);
+    kv_map.insert(key, v);
+    let _ = crate::store::db(data_dir).kv_set(PROFILE_STATS_KV, &kv_map);
 }
 
 /// 槽位内容被整体写入（备份）/删除后主动失效，避免 mtime 粒度或实现差异留下陈旧体积。
-pub(crate) fn invalidate_profile_stats(slot_dir: &Path) {
+/// 内存与落盘 kv 同步移除（kv 移除失败只是残留陈旧条目，mtime/TTL 判定兜底）。
+/// kv 读-改-写经 STATS_KV_LOCK 与 store_stats 串行（审查 P4），防移除被并发写回复活。
+pub(crate) fn invalidate_profile_stats(slot_dir: &Path, data_dir: &Path) {
     let key = slot_dir.to_string_lossy().to_string();
     if let Ok(mut cache) = stats_cache().lock() {
         cache.remove(&key);
+    }
+    let _guard = stats_kv_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let mut kv_map = kv_stats_load(data_dir);
+    if kv_map.remove(&key).is_some() {
+        let _ = crate::store::db(data_dir).kv_set(PROFILE_STATS_KV, &kv_map);
     }
 }
 
@@ -243,10 +313,14 @@ fn list_profiles_blocking(dir: &Path, data_dir: &Path, fresh: bool) -> Vec<Profi
     }
 
     // ② 命中缓存直接用；其余收集起来并行统计（常态命中 → 零遍历）
+    // 启动首刷批量水合（审查 P3）：免逐槽位 miss 时各读一次落盘 kv
+    if !fresh {
+        hydrate_stats_cache(data_dir);
+    }
     let mut sizes: Vec<Option<(u64, u64)>> = vec![None; slots.len()];
     let mut pending: Vec<(usize, PathBuf)> = Vec::new();
     for (i, (_, path, mtime, _)) in slots.iter().enumerate() {
-        let hit = if fresh { None } else { cached_stats(path, *mtime) };
+        let hit = if fresh { None } else { cached_stats(path, *mtime, data_dir) };
         match hit {
             Some(v) => sizes[i] = Some(v),
             None => pending.push((i, path.clone())),
@@ -259,7 +333,7 @@ fn list_profiles_blocking(dir: &Path, data_dir: &Path, fresh: bool) -> Vec<Profi
         let t0 = Instant::now();
         let paths: Vec<PathBuf> = pending.iter().map(|(_, p)| p.clone()).collect();
         for ((i, path), (size, files)) in pending.iter().zip(dir_stats_many(&paths)) {
-            store_stats(path, slots[*i].2, size, files);
+            store_stats(path, slots[*i].2, size, files, data_dir);
             sizes[*i] = Some((size, files));
             computed += 1;
             computed_bytes += size;
@@ -343,7 +417,7 @@ pub fn profile_backup(
             crate::switcher::run_action(args, &sink)
         }));
         // 无论成败都失效该槽位体积缓存：失败也可能已写入部分新文件
-        invalidate_profile_stats(&slot_dir);
+        invalidate_profile_stats(&slot_dir, &data_dir);
         super::switch::finish_action_thread(
             &app2,
             "profile-done",
@@ -427,7 +501,7 @@ pub fn profile_delete(
     }
     std::fs::remove_dir_all(&slot_dir)
         .map_err(|e| format!("删除快照失败: {e}"))?;
-    invalidate_profile_stats(&slot_dir);
+    invalidate_profile_stats(&slot_dir, &state.data_dir);
     fs_utils::app_log(&state.data_dir, &format!("已删除登录态快照: user_id={user_id}"));
     Ok(())
 }
@@ -475,12 +549,38 @@ mod tests {
     #[test]
     fn stats_cache_hits_only_while_slot_mtime_matches() {
         let probe = tmp_root("primitive").join("slot-probe");
-        store_stats(&probe, 111, 4096, 7);
-        assert_eq!(cached_stats(&probe, 111), Some((4096, 7)), "同 mtime 应命中");
-        assert_eq!(cached_stats(&probe, 222), None, "mtime 变化应视为失效");
-        invalidate_profile_stats(&probe);
-        assert_eq!(cached_stats(&probe, 111), None, "显式失效后不应命中");
+        let data_dir = tmp_root("primitive_kv");
+        store_stats(&probe, 111, 4096, 7, &data_dir);
+        assert_eq!(cached_stats(&probe, 111, &data_dir), Some((4096, 7)), "同 mtime 应命中");
+        assert_eq!(cached_stats(&probe, 222, &data_dir), None, "mtime 变化应视为失效");
+        invalidate_profile_stats(&probe, &data_dir);
+        assert_eq!(cached_stats(&probe, 111, &data_dir), None, "显式失效后不应命中");
         let _ = std::fs::remove_dir_all(probe.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// C2 持久化：`store_stats` 写入的统计在模拟「重启」（清空进程内 map）后，
+    /// 仍能从落盘 kv 水合命中；显式失效同样清落盘，重启后也不复活。
+    #[test]
+    fn stats_cache_survives_process_restart_via_kv() {
+        let probe = tmp_root("persist").join("slot-persist");
+        let data_dir = tmp_root("persist_kv");
+        store_stats(&probe, 555, 12345, 9, &data_dir);
+        stats_cache().lock().unwrap().clear();
+        assert_eq!(
+            cached_stats(&probe, 555, &data_dir),
+            Some((12345, 9)),
+            "进程内清空后应从落盘 kv 水合命中（启动首刷免重算）"
+        );
+        invalidate_profile_stats(&probe, &data_dir);
+        stats_cache().lock().unwrap().clear();
+        assert_eq!(
+            cached_stats(&probe, 555, &data_dir),
+            None,
+            "显式失效同时清落盘：重启后也不应复活陈旧体积"
+        );
+        let _ = std::fs::remove_dir_all(probe.parent().unwrap());
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     /// 端到端：体积/文件数正确；`fresh=true`（刷新按钮）与显式失效都能拿到最新体积。
@@ -509,7 +609,7 @@ mod tests {
 
         // 子目录内文件增长（不改槽位目录 mtime）：靠显式失效让普通调用也拿到新值
         std::fs::write(slot.join("Deep").join("g.bin"), vec![7u8; 250]).unwrap();
-        invalidate_profile_stats(&slot);
+        invalidate_profile_stats(&slot, &data_dir);
         assert_eq!(
             list_profiles_blocking(&root, &data_dir, false)[0].size_bytes,
             2 * 100 + 250 + 10
