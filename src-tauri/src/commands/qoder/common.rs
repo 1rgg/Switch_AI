@@ -56,6 +56,11 @@ pub struct QoderAccount {
     /// 存量账号经 ensure_pool_profiles 惰性回填）
     #[serde(default)]
     pub device_profile: Option<crate::tasks::qoder_device::QoderDeviceProfile>,
+    /// 账号区域：`"cn"` 国内版 / `"intl"` 国际版。**空串 = 按 domain 推断再回落
+    /// 国内版**——存量账号（无该字段）行为零变化。所有区域相关端点（签到/积分/
+    /// 模型目录/凭证刷新/重新登录指引）据此路由。
+    #[serde(default)]
+    pub region: String,
 }
 
 /// Qoder 设置（kv `qoder_settings`；对照 WorkBuddySettings 裁剪）

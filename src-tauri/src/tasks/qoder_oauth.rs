@@ -23,12 +23,19 @@ use sha2::{Digest, Sha256};
 use super::qoder_common::{self, QoderCreds};
 use crate::fs_utils;
 
-/// 授权页基址（需求方实测样例：qoder.cn/device/selectAccounts）
+/// 授权页路径（拼在区域 `website` 之后；CN/Intl 同路径，仅基址与参数集不同）。
+pub const DEVICE_AUTH_PATH: &str = "/device/selectAccounts";
+
+/// 国内版授权页基址（历史常量；新代码请走 [`DeviceFlow::new_for`]）。
+/// 保留为兼容位（测试断言用），勿在新代码使用。
+#[allow(dead_code)]
 pub const DEVICE_AUTH_BASE: &str = "https://qoder.cn/device/selectAccounts";
 
-/// 授权页 client_id（官方注册常量，新版 Qoder CN 客户端 `authClientIds.prod`）。
-/// 实测 2026-10-02：随机生成 client_id 会被授权页判「参数无效」；社区实现
-/// （10router/cockpit-tools）则完全省略该参数，两者均为可行方案。
+/// 国内版授权页 client_id（历史常量，新版 Qoder CN 客户端 `authClientIds.prod`）。
+///
+/// ⚠️ 与参考实现 `REALM_CONFIGS["cn"].client_id` **不同**：那是官方 QoderWork
+/// 客户端的注册 id；本项目实测可用的是 CN 客户端 `authClientIds.prod` 常量。
+/// 两区 client_id 绝不通用——串用会被授权页判「参数无效」。
 pub const DEVICE_AUTH_CLIENT_ID: &str = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa";
 
 /// 轮询间隔（抓包实测约 1s）
@@ -38,6 +45,8 @@ pub const POLL_TIMEOUT_MS: u64 = 180_000;
 
 /// 一次设备流会话的入参（nonce/verifier/machine_id/client_id 全程自持）
 pub struct DeviceFlow {
+    /// 本会话所属区域（poll 端点基址据此路由）
+    pub realm: qoder_common::QoderRealm,
     pub nonce: String,
     pub verifier: String,
     /// 会话标识（仅入授权页 URL 与测试断言；M2 MITM 透传时复用）
@@ -51,39 +60,66 @@ pub struct DeviceFlow {
 }
 
 impl DeviceFlow {
-    /// 常规模式：携带官方注册固定 client_id（与真实客户端跳转逐字一致）
+    /// 国内版常规模式（既有语义：携带官方注册固定 client_id）
     pub fn new() -> Self {
-        Self::build(true)
+        Self::new_for(qoder_common::QoderRealm::Cn)
     }
 
-    /// 兼容模式：不带 client_id（2026-10-02 审查预案落地）——官方常量一旦被
-    /// Qoder 轮换导致授权页「参数无效」，改用本模式即可恢复（前端在授权超时后
-    /// 自动切换到本模式重试）。
+    /// 兼容模式（不带 client_id）：官方常量一旦被轮换导致授权页「参数无效」，
+    /// 改用本模式即可恢复（前端在授权超时后自动切换重试）。
+    #[allow(dead_code)]
     pub fn new_compat() -> Self {
-        Self::build(false)
+        Self::build(qoder_common::QoderRealm::Cn, false)
     }
 
-    fn build(with_client_id: bool) -> Self {
+    /// 按区域构造常规会话。
+    pub fn new_for(realm: qoder_common::QoderRealm) -> Self {
+        Self::build(realm, true)
+    }
+
+    /// 按区域构造兼容模式会话（授权页「参数无效」时的恢复预案）。
+    pub fn new_compat_for(realm: qoder_common::QoderRealm) -> Self {
+        Self::build(realm, false)
+    }
+
+    /// 构造会话。**区域参数差异（对照参考实现 `start_login`）**：
+    /// - CN：`challenge, challenge_method, nonce(带横线), redirect_uri, client_id, machine_id`
+    /// - Intl：`challenge, challenge_method, nonce(32-hex 无横线), client_id, machine_id`
+    ///   ——**不携带 redirect_uri**（国际版新协议）
+    /// 两区 client_id 不通用；CN 用本项目实测可用的常量，Intl 用参考实现 `REALM_CONFIGS`。
+    fn build(realm: qoder_common::QoderRealm, with_client_id: bool) -> Self {
         // verifier：双 uuid v4 拼接 = 64 hex 字符（抓包样本同为 64 字符长度量级）
         let verifier = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let nonce = uuid::Uuid::new_v4().to_string();
+        // nonce 形态按区域（CN 带横线 / Intl 32-hex 无横线）
+        let nonce = qoder_common::realm_nonce(realm);
         let machine_id = uuid::Uuid::new_v4().to_string();
         // client_id：官方注册固定常量（随机生成会被授权页判「参数无效」）
-        let client_id = with_client_id.then(|| DEVICE_AUTH_CLIENT_ID.to_string());
+        let client_id = with_client_id.then(|| {
+            if realm == qoder_common::QoderRealm::Cn {
+                DEVICE_AUTH_CLIENT_ID.to_string()
+            } else {
+                realm.spec().client_id.to_string()
+            }
+        });
         // challenge：BASE64URL_NO_PAD(SHA256(verifier))（PKCE S256）
         let digest = Sha256::digest(verifier.as_bytes());
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+        let base = format!("{}{DEVICE_AUTH_PATH}", realm.website());
         let mut url = format!(
-            "{DEVICE_AUTH_BASE}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}"
+            "{base}?challenge={challenge}&challenge_method=S256&nonce={nonce}&machine_id={machine_id}"
         );
+        // redirect_uri 仅国内版携带（国际版协议不带该参数）
+        if let Some(ru) = realm.spec().redirect_uri {
+            url.push_str(&format!("&redirect_uri={}", urlencode(ru)));
+        }
         if let Some(cid) = &client_id {
             url.push_str(&format!("&client_id={cid}"));
         }
-        Self { nonce, verifier, machine_id, client_id, auth_url: url }
+        Self { realm, nonce, verifier, machine_id, client_id, auth_url: url }
     }
 }
 
@@ -96,9 +132,10 @@ impl Default for DeviceFlow {
 /// 单次轮询：GET /api/v1/deviceToken/poll（无 Authorization 头，与客户端一致）。
 /// 返回 (http_status, parsed)；status=0 网络不可达。
 pub fn poll_once(agent: &ureq::Agent, flow: &DeviceFlow) -> (u16, Option<Value>) {
+    // 轮询必须打**本会话所属区域**的 openapi（国际会话轮询国内站会永远 pending）
     let url = format!(
         "{}/api/v1/deviceToken/poll?nonce={}&verifier={}&challenge_method=S256",
-        qoder_common::OPEN_API_BASE,
+        flow.realm.openapi(),
         flow.nonce,
         urlencode(&flow.verifier)
     );
@@ -115,7 +152,11 @@ pub fn poll_once(agent: &ureq::Agent, flow: &DeviceFlow) -> (u16, Option<Value>)
 /// nonce 回验（审查 L-防会话混淆）：响应 nonce 与本会话 flow.nonce 必须一致——
 /// poll 端点按 nonce 定位授权会话，响应携带其他会话的 token 即为异常（结构变更/
 /// 中间人替换），一律拒绝。同时解析 refresh_token_expires_in 落库（≈360d，审查 L-RT）。
-pub fn parse_poll_success(body: &Value, expected_nonce: &str) -> Option<(QoderCreds, String)> {
+pub fn parse_poll_success(
+    body: &Value,
+    expected_nonce: &str,
+    realm: qoder_common::QoderRealm,
+) -> Option<(QoderCreds, String)> {
     let resp_nonce = fs_utils::dig(body, &["nonce"])
         .and_then(Value::as_str)
         .unwrap_or("");
@@ -159,6 +200,8 @@ pub fn parse_poll_success(body: &Value, expected_nonce: &str) -> Option<(QoderCr
             refresh_expires_at_ms,
             kind: "client".into(),
             uid: uid.clone(),
+            // 区域随凭证落库（此后所有端点按它路由）
+            region: realm.as_str().to_string(),
             ..Default::default()
         },
         uid,
@@ -182,9 +225,19 @@ mod tests {
         assert_ne!(f1.nonce, f2.nonce);
         assert_ne!(f1.verifier, f2.verifier);
         assert_eq!(f1.verifier.len(), 64);
+        assert_eq!(f1.realm, qoder_common::QoderRealm::Cn);
         assert!(f1.auth_url.starts_with(DEVICE_AUTH_BASE));
-        // query 参数完整性（与真实客户端跳转参数集一致）
-        for key in ["challenge=", "challenge_method=S256", "nonce=", "machine_id=", "client_id="] {
+        // CN nonce 带横线（8-4-4-4-12）
+        assert_eq!(f1.nonce.len(), 36, "CN nonce 应为带横线 uuid");
+        // query 参数完整性（含 CN 专属 redirect_uri）
+        for key in [
+            "challenge=",
+            "challenge_method=S256",
+            "nonce=",
+            "machine_id=",
+            "client_id=",
+            "redirect_uri=",
+        ] {
             assert!(f1.auth_url.contains(key), "auth_url 缺少 {key}");
         }
         // client_id 必须是官方注册固定常量（随机 uuid 会被判「参数无效」）
@@ -214,6 +267,32 @@ mod tests {
         assert!(f.auth_url.contains(&format!("challenge={expect}")));
     }
 
+    /// 国际版会话（对照参考实现 `REALM_CONFIGS["intl"]`）：
+    /// 基址 `qoder.com`、**不带 redirect_uri**、nonce 为 32-hex 无横线、
+    /// client_id 用国际版常量（与 CN 不通用）。
+    #[test]
+    fn flow_intl_realm_differs_from_cn() {
+        let g = DeviceFlow::new_for(qoder_common::QoderRealm::Intl);
+        assert_eq!(g.realm, qoder_common::QoderRealm::Intl);
+        assert!(g.auth_url.starts_with("https://qoder.com/device/selectAccounts"));
+        assert!(
+            !g.auth_url.contains("redirect_uri"),
+            "国际版授权 URL 不得携带 redirect_uri：{}",
+            g.auth_url
+        );
+        assert!(!g.auth_url.contains("client_id=732aef47"), "不得串用 CN client_id");
+        assert_eq!(g.nonce.len(), 32, "Intl nonce 应为 32-hex 无横线");
+        assert!(g.nonce.chars().all(|c| c.is_ascii_hexdigit()));
+        for key in ["challenge=", "challenge_method=S256", "nonce=", "machine_id=", "client_id="] {
+            assert!(g.auth_url.contains(key), "Intl auth_url 缺少 {key}");
+        }
+        // 兼容模式同样不带 client_id，且仍不携带 redirect_uri
+        let gc = DeviceFlow::new_compat_for(qoder_common::QoderRealm::Intl);
+        assert!(!gc.auth_url.contains("client_id="));
+        assert!(!gc.auth_url.contains("redirect_uri"));
+        assert_eq!(gc.nonce.len(), 32);
+    }
+
     #[test]
     fn parse_poll_success_maps_captured_shape() {
         // R-10 抓包样本（token/refresh_token 已脱敏为占位）
@@ -221,7 +300,7 @@ mod tests {
             r#"{"id":"01a0e03b-5f90-73b8-958e-443488ccf81e","token":"dt-placeholder","user_id":"01a0dff8-cc47-7b64-bd6d-d9cb2aea6792","code_challenge":"kiGczYiWCRH2Csra26Fx4NlhHp2n2CLT8QhMD678dqQ","code_challenge_method":"S256","nonce":"8872dcb1-d9c6-4453-bfb6-3bcbe9b0500b","expires_at":"2026-10-27T00:19:42Z","refresh_token_id":"01a0e03b-5f8f-7e4c-b112-1de3f25908cd","created_at":"2026-09-27T00:19:42Z","updated_at":"2026-09-27T00:19:42Z","refresh_token":"rt-placeholder","expires_in":2591999999,"refresh_token_expires_in":31103999999,"refresh_token_expires_at":"2027-09-22T00:19:42Z"}"#,
         )
         .unwrap();
-        let (creds, uid) = parse_poll_success(&body, "8872dcb1-d9c6-4453-bfb6-3bcbe9b0500b").unwrap();
+        let (creds, uid) = parse_poll_success(&body, "8872dcb1-d9c6-4453-bfb6-3bcbe9b0500b", qoder_common::QoderRealm::Cn).unwrap();
         assert_eq!(creds.access_token, "dt-placeholder");
         assert_eq!(creds.kind, "client");
         assert_eq!(uid, "01a0dff8-cc47-7b64-bd6d-d9cb2aea6792");
@@ -238,7 +317,7 @@ mod tests {
     fn parse_poll_success_rejects_pending_shape() {
         let body: Value =
             serde_json::from_str(r#"{"errorCode":"NotFound","errorMessage":"Not found"}"#).unwrap();
-        assert!(parse_poll_success(&body, "n").is_none());
+        assert!(parse_poll_success(&body, "n", qoder_common::QoderRealm::Cn).is_none());
     }
 
     /// nonce 回验（审查 L）：响应 nonce 与本会话不一致 → 拒绝（防会话混淆）
@@ -248,7 +327,7 @@ mod tests {
             r#"{"token":"dt-x","user_id":"u1","nonce":"session-a","expires_in":2591999999}"#,
         )
         .unwrap();
-        assert!(parse_poll_success(&body, "session-a").is_some());
-        assert!(parse_poll_success(&body, "session-b").is_none(), "nonce 不匹配必须拒绝");
+        assert!(parse_poll_success(&body, "session-a", qoder_common::QoderRealm::Cn).is_some());
+        assert!(parse_poll_success(&body, "session-b", qoder_common::QoderRealm::Cn).is_none(), "nonce 不匹配必须拒绝");
     }
 }

@@ -349,6 +349,11 @@ fn merge_account(pool: &mut Vec<QoderAccount>, a: &Value) -> MergeResult {
         if !parsed.credential_source.is_empty() {
             x.credential_source = parsed.credential_source.clone();
         }
+        // 区域：仅在本地为空时补入——已归属的账号不因导入文件而漂移区域
+        //（跨区误改会把该账号的签到/积分打到错误站点）
+        if x.region.is_empty() && !parsed.region.is_empty() {
+            x.region = parsed.region.clone();
+        }
         if parsed.token_expires_at.is_some() {
             x.token_expires_at = parsed.token_expires_at;
         }

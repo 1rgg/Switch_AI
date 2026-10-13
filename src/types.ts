@@ -1501,6 +1501,25 @@ export interface QoderAccountView {
   fingerprint: string | null;
   /** 完整设备指纹（指纹查看弹框数据源） */
   device_profile: QoderDeviceProfile | null;
+  /** 账号区域：`cn` 国内版 / `intl` 国际版（后端已归一，不会为空） */
+  region: QoderRegionKey;
+}
+
+/** Qoder 区域键（与 WorkBuddy 侧同名概念，但取值域不同：cn | intl） */
+export type QoderRegionKey = 'cn' | 'intl';
+
+export const QODER_REGIONS: ReadonlyArray<{
+  key: QoderRegionKey;
+  label: string;
+  hint: string;
+  site: string;
+}> = [
+  { key: 'cn', label: '国内版', hint: 'qoder.com.cn', site: 'qoder.com.cn' },
+  { key: 'intl', label: '国际版', hint: 'qoder.com', site: 'qoder.com' },
+];
+
+export function qoderRegionLabel(region?: string | null): string {
+  return region === 'intl' ? '国际版' : '国内版';
 }
 
 export interface QoderSettings {

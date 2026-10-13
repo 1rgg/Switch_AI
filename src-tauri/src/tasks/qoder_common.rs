@@ -26,12 +26,12 @@ use sha2::{Digest, Sha256};
 use crate::fs_utils;
 use crate::state::AppState;
 
-/// OpenAPI 基址（CN 域；端点常量集中可改，R-7 主备域探测位预留）
-pub const OPEN_API_BASE: &str = "https://openapi.qoder.com.cn";
-
-/// 官网 Web 域（R-11 抓包 2026-10-04：账户页 `/api/v2/me/usages/big_model_credits`
-/// 端点在此域，Bearer 鉴权与 openapi 同源；openapi 主机无该路由——实测 alb 503）
-pub const WEB_BASE: &str = "https://qoder.cn";
+/// 国内版 OpenAPI 基址（历史常量；新代码请走 [`QoderRealmSpec::openapi`]）
+pub const OPEN_API_BASE_CN: &str = "https://openapi.qoder.com.cn";
+/// 国内版官网 Web 域（历史常量；R-11 抓包 2026-10-04：账户页
+/// `/api/v2/me/usages/big_model_credits` 端点在此域，Bearer 鉴权与 openapi 同源；
+/// openapi 主机无该路由——实测 alb 503）
+pub const WEB_BASE_CN: &str = "https://qoder.cn";
 
 /// `Cosy-ClientType` 真实值（R-4 已闭合：2026-09-27 抓包实测主进程恒带 `cosy-clienttype: 10`）
 pub const COSY_CLIENT_TYPE: &str = "10";
@@ -48,6 +48,185 @@ pub const CLIENT_COSY_VERSION: &str = "0.4.3";
 /// 客户端 openapi 域机器 OS 标识（同抓包实测 `cosy-machineos: x86_64_win32`；
 /// qoder_sign 网关域为 x86_64_windows，形态不同勿混用）
 pub const CLIENT_MACHINE_OS: &str = "x86_64_win32";
+
+// ── 区域抽象（Qoder 国内版 / 国际版）────────────────────────────────────────
+//
+// 差异表来源：参考实现 `shuishuipingan/qoder2api-hub` 的 `REALM_CONFIGS`
+// （`qoder_accounts.py`，逆向自官方桌面/CLI 客户端），逐字段对照落表。
+// 取向与 WorkBuddy 侧 `WbRegion` 一致：**全部区域差异收敛到一张表**，调用方查表
+// 派生，不散落 `if intl` 分支。
+
+/// Qoder 账号区域。`Cn` 为既有默认（保证存量账号行为零变化），`Intl` 为国际版。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QoderRealm {
+    #[default]
+    Cn,
+    Intl,
+}
+
+impl QoderRealm {
+    /// 稳定标识（用于文件名 / 序列化 / 前端）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QoderRealm::Cn => "cn",
+            QoderRealm::Intl => "intl",
+        }
+    }
+
+    /// 宽松解析（兼容历史别名与前端写法）。未知一律回落 Cn（保持既有默认）。
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "intl" | "international" | "global" | "overseas" | "oversea" | "com" | "en" => {
+                QoderRealm::Intl
+            }
+            _ => QoderRealm::Cn,
+        }
+    }
+
+    /// 全部已知区域（遍历用）。
+    pub fn all() -> [QoderRealm; 2] {
+        [QoderRealm::Cn, QoderRealm::Intl]
+    }
+
+    /// 本区域的差异表。
+    pub fn spec(self) -> &'static QoderRealmSpec {
+        match self {
+            QoderRealm::Cn => &CN_SPEC,
+            QoderRealm::Intl => &INTL_SPEC,
+        }
+    }
+
+    pub fn openapi(self) -> &'static str {
+        self.spec().openapi
+    }
+    pub fn website(self) -> &'static str {
+        self.spec().website
+    }
+    /// 展示名（"国内版" / "国际版"）——供事件与日志使用
+    #[allow(dead_code)]
+    pub fn display_name(self) -> &'static str {
+        self.spec().display_name
+    }
+}
+
+/// 由登录域推断区域（`qoder.sh` / `qoder.com` 系 → 国际版；含空值回落 CN）。
+///
+/// 判据按**主机名后缀**匹配并拒绝后缀伪造（`qoder.com.evil.com` 不得判为国际版）。
+pub fn realm_of_domain(domain: &str) -> QoderRealm {
+    let d = domain.trim().to_ascii_lowercase();
+    if d.is_empty() {
+        return QoderRealm::Cn;
+    }
+    let host = d
+        .rsplit("://")
+        .next()
+        .unwrap_or(&d)
+        .split('/')
+        .next()
+        .unwrap_or(&d)
+        .split(':')
+        .next()
+        .unwrap_or(&d)
+        .trim_start_matches('.');
+    let is_under = |root: &str| host == root || host.ends_with(&format!(".{root}"));
+    if is_under("qoder.sh") || is_under("qoder.com") {
+        QoderRealm::Intl
+    } else {
+        QoderRealm::Cn
+    }
+}
+
+/// 一个区域的全部差异（对照参考实现 `REALM_CONFIGS`）。
+///
+/// 表驱动设计：字段**刻意保持完整**（含当前尚未消费的 `ua`/`domain`/`home_dir`/
+/// `app_dir`）——差异表是「官方客户端行为基线」的单一事实来源，删字段会让后续
+/// 补链路时重新去逆向。故整体允许未读字段。
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct QoderRealmSpec {
+    pub realm: QoderRealm,
+    /// 展示名："国内版" / "国际版"
+    pub display_name: &'static str,
+    /// 业务 API 基址（sash 活动 / quota / userinfo / deviceToken）
+    pub openapi: &'static str,
+    /// 官网 Web 域（账户页用量明细端点所在域）
+    pub website: &'static str,
+    /// 官方客户端 UA
+    pub ua: &'static str,
+    /// 设备授权页 client_id（官方注册常量，不可随机生成）
+    pub client_id: &'static str,
+    /// 设备授权回调（`None` = 该区域授权 URL 不携带 redirect_uri）
+    pub redirect_uri: Option<&'static str>,
+    /// 登录域标识（用于账号导入/导出归属判定）
+    pub domain: &'static str,
+    /// nonce 形态：true = 带横线 uuid，false = 32 位无横线 hex
+    pub nonce_dashed: bool,
+    /// 客户端本地目录名（`.qoder-cn` / `.qoder`）
+    pub home_dir: &'static str,
+    /// 桌面 App 数据目录名
+    pub app_dir: &'static str,
+}
+
+/// 国内版描述符（字段值 = 改造前的硬编码常量原值，保证存量行为零变化）。
+const CN_SPEC: QoderRealmSpec = QoderRealmSpec {
+    realm: QoderRealm::Cn,
+    display_name: "国内版",
+    openapi: OPEN_API_BASE_CN,
+    website: WEB_BASE_CN,
+    ua: "QoderWork/1.1.64",
+    client_id: "1c5e33e1-364d-4ce6-b02c-acaa81274a5c",
+    redirect_uri: Some("qoder-work-cn://"),
+    domain: "qoder.com.cn",
+    nonce_dashed: true,
+    home_dir: ".qoder-cn",
+    app_dir: "com.qodercn.app.stable",
+};
+
+/// 国际版描述符（对照 `REALM_CONFIGS["intl"]`）。
+const INTL_SPEC: QoderRealmSpec = QoderRealmSpec {
+    realm: QoderRealm::Intl,
+    display_name: "国际版",
+    openapi: "https://openapi.qoder.sh",
+    website: "https://qoder.com",
+    ua: "Qoder/1.1.64",
+    client_id: "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
+    // 国际版设备授权 URL **不带 redirect_uri**（官方新协议）
+    redirect_uri: None,
+    domain: "qoder.com",
+    nonce_dashed: false,
+    home_dir: ".qoder",
+    app_dir: "com.qoder.app.stable",
+};
+
+/// 国内版业务 API 基址（历史常量别名；新代码用 [`QoderRealm::openapi`]）。
+/// 保留为兼容位（测试与外部引用），勿在新代码使用。
+#[allow(dead_code)]
+pub const OPEN_API_BASE: &str = OPEN_API_BASE_CN;
+/// 国内版官网 Web 域（历史常量别名）。
+#[allow(dead_code)]
+pub const WEB_BASE: &str = WEB_BASE_CN;
+
+/// 由账号 `domain`/`region` 解析区域——**区域权威来源**。
+///
+/// 优先级：账号显式 `region` 字段 > 凭证记录 `domain` > 默认 CN。
+/// 显式字段的意义：手工录入/旧版导入的账号往往没有 `domain`，此时按 domain
+/// 推断会**静默落到国内版**，把国际版账号的请求打到国内站。
+pub fn resolve_realm(explicit_region: &str, domain: &str) -> QoderRealm {
+    if !explicit_region.trim().is_empty() {
+        return QoderRealm::parse(explicit_region);
+    }
+    realm_of_domain(domain)
+}
+
+/// 按区域生成 nonce（CN 带横线 uuid / Intl 32 位无横线 hex）。
+pub fn realm_nonce(realm: QoderRealm) -> String {
+    if realm.spec().nonce_dashed {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+}
 
 // ── 凭证结构 ────────────────────────────────────────────────────────────────
 
@@ -80,6 +259,10 @@ pub struct QoderCreds {
     pub machine_id: String,
     #[serde(default)]
     pub machine_token: String,
+    /// 账号区域（国内版 / 国际版）。空/缺失 = 按 domain 推断再回落国内版，
+    /// 保证存量账号（无该字段）行为零变化。所有区域相关端点据此路由。
+    #[serde(default)]
+    pub region: String,
 }
 
 // 手写脱敏 Debug（derive(Debug) 会把 access_token/refresh_token/pat/machine_token
@@ -98,6 +281,7 @@ impl std::fmt::Debug for QoderCreds {
             .field("refresh_expires_at_ms", &self.refresh_expires_at_ms)
             .field("machine_id", &self.machine_id)
             .field("machine_token", &mask(&self.machine_token))
+            .field("region", &self.region)
             .finish()
     }
 }
@@ -149,7 +333,13 @@ pub fn creds_of(source: &Value) -> QoderCreds {
         .and_then(clamp_expires_at),
         machine_id: s_of(fs_utils::dig(source, &["machine_id", "machineId", "cosy_machine_id"])),
         machine_token: s_of(fs_utils::dig(source, &["machine_token", "machineToken", "cosy_machine_token"])),
+        region: s_of(fs_utils::dig(source, &["region", "realm"])),
     }
+}
+
+/// 账号区域解析（凭证记录版）：显式 `region` 优先，`domain` 兜底，默认国内版。
+pub fn realm_of_creds(creds: &QoderCreds) -> QoderRealm {
+    resolve_realm(&creds.region, "")
 }
 
 // ── token store（qoder_tokens 表；结构 {version, tokens: {id: rec}}）────────
@@ -715,7 +905,12 @@ pub fn refresh_token_once_ex(
     // 刷新端点不带 Authorization（下方 retain 移除；鉴权完全靠 body 中的 refresh_token）+ Cosy 头
     let mut h = build_auth_headers(creds);
     h.retain(|(k, _)| k != "Authorization");
-    let url = format!("{OPEN_API_BASE}{}", refresh_endpoint_for(&creds.refresh_token));
+    // 区域路由：国际版刷新必须打 openapi.qoder.sh（打国内站会把 RT 送到错误网关）
+    let url = format!(
+        "{}{}",
+        realm_of_creds(creds).openapi(),
+        refresh_endpoint_for(&creds.refresh_token)
+    );
     let (status, body) = post_json(
         agent,
         &url,
@@ -769,7 +964,7 @@ pub fn refresh_token_once_ex(
 /// （R-13 侦察注：设计文档 L553 写 GET，但实现一直以 POST 在用且未被证伪——
 /// 端点真实方法未实测，若后续发现 404/405 再切 get_json。）
 pub fn fetch_userinfo(agent: &ureq::Agent, creds: &QoderCreds) -> (Option<String>, Option<String>) {
-    let url = format!("{OPEN_API_BASE}/api/v1/userinfo");
+    let url = format!("{}/api/v1/userinfo", realm_of_creds(creds).openapi());
     let (status, body) = post_json(agent, &url, &build_auth_headers(creds), &serde_json::json!({}));
     if status != 200 {
         return (None, None);
@@ -826,7 +1021,7 @@ pub fn need_plan_fetch(row_ok: bool, stored_plan: &str) -> bool {
 /// 实测响应：{"user_type":"personal_professional_trial","plan_tier_name":"Pro Trial",
 ///           "is_personal_version":true,"is_paid_plan":false,...,"end_date":1791673619906}
 pub fn fetch_plan(agent: &ureq::Agent, creds: &QoderCreds) -> (Option<String>, Option<String>, Option<i64>) {
-    let url = format!("{OPEN_API_BASE}/api/v2/user/plan");
+    let url = format!("{}/api/v2/user/plan", realm_of_creds(creds).openapi());
     let (status, body, _raw) = get_json(agent, &url, &build_auth_headers(creds));
     if status != 200 {
         return (None, None, None);
@@ -919,19 +1114,23 @@ fn job_token_attempts(pat: &str) -> [(&'static str, Value, &'static str); 3] {
     ]
 }
 
-pub fn exchange_job_token(
+/// 按**区域**换取作业令牌（`region` 决定打国内站还是国际站）。
+pub fn exchange_job_token_for(
     agent: &ureq::Agent,
     pat: &str,
     data_dir: &std::path::Path,
+    region: QoderRealm,
 ) -> Result<QoderCreds, JobExchangeFail> {
     let attempts = job_token_attempts(pat);
     // 首通道（已证实 R-6 路径）状态码决定失败分类；None = 首通道未产生 HTTP 状态
     //（理论不可达——attempts 非空），按暂态兜底保守处理
     let mut first_status: Option<u16> = None;
+    // 区域基址（PAT 换作业令牌走该账号所属区域的 openapi）
+    let realm = region;
     for (i, (path, body, tag)) in attempts.iter().enumerate() {
         let path = *path;
         let tag = *tag;
-        let url = format!("{OPEN_API_BASE}{path}");
+        let url = format!("{}{path}", realm.openapi());
         let headers = vec![
             ("Authorization".to_string(), format!("Bearer {pat}")),
             ("Cosy-ClientType".to_string(), COSY_CLIENT_TYPE.to_string()),
@@ -961,6 +1160,7 @@ pub fn exchange_job_token(
                         expires_at_ms,
                         kind: "pat".into(),
                         pat: pat.to_string(),
+                        region: region.as_str().to_string(),
                         ..Default::default()
                     });
                 }
@@ -1019,6 +1219,11 @@ pub fn ensure_fresh(
         return (creds, false, "no_credential");
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
+    // 区域：PAT 重换必须打**该账号所属区域**的 openapi（此前恒打国内站，
+    // 国际版账号的 PAT 会被国内站拒绝）
+    let realm = realm_of_creds(&creds);
+    // pt- 直判（PAT 原始凭证）：与 is_pat_channel 的区别是后者还覆盖「jt- 作业令牌
+    // + pat 备份字段」——这里保留「原始 PAT ⇒ 必然重换」的语义
     let is_pat = creds.access_token.starts_with("pt-");
     // PAT 通道判定收编为 is_pat_channel（疑点① 单测锁定 jt- 换号链路）
     // PAT 通道覆盖全部携带 pat 备份的凭证（含作业令牌）：其生命周期由原始 PAT
@@ -1041,7 +1246,7 @@ pub fn ensure_fresh(
         if !need_exchange {
             return (creds, false, "fresh");
         }
-        return match exchange_job_token(agent, &pat, &state.data_dir) {
+        return match exchange_job_token_for(agent, &pat, &state.data_dir, realm) {
             Ok(new) => {
                 // 落库失败不能静默：否则新作业令牌只存活本轮，下轮仍走 PAT 重换
                 if let Err(e) = save_token_store(state, acct_id, &new) {
@@ -1090,6 +1295,13 @@ pub fn ensure_fresh(
     // 无限重试；永久失败回写池 needs_relogin（对照 wb_common::mark_needs_relogin 落库）
     // 并返回 auth_dead，qoder_refresh 等调用方按「需重登」处理、不再重试
     let (new, fail) = refresh_token_once_ex(agent, &creds);
+    // 刷新产物须继承区域标识（否则落库后 region 丢失 → 下轮回落国内版端点）
+    let new = new.map(|mut c| {
+        if c.region.is_empty() {
+            c.region = realm.as_str().to_string();
+        }
+        c
+    });
     if let Some(new) = new {
         // §5.10：指纹不落库。refresh_token_once_ex 原样保留注入指纹（返回值供本轮请求带
         // 设备头），但落库前须剥离设备字段——注入值/随机 machine_token 回写 store 后会被

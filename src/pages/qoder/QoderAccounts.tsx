@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
+import { QODER_REGIONS, qoderRegionLabel, type QoderRegionKey } from '../../types';
 import { createPortal } from 'react-dom';
 import { listen } from '@tauri-apps/api/event';
 import { save } from '@tauri-apps/plugin-dialog';
@@ -58,7 +59,49 @@ import type {
  * 账号级登录态快照备份/恢复与一键切换（M3 Icube 管线，恢复自动注入绑定指纹 §5.10）。
  */
 
-const PAT_URL = 'https://qoder.com.cn/account/integrations';
+const PAT_URL_CN = 'https://qoder.com.cn/account/integrations';
+const PAT_URL_INTL = 'https://qoder.com/account/integrations';
+
+/** 区域选择器（Qoder 国内版 / 国际版）：分段按钮，选中态高亮。
+ *  用于 OAuth 登录与 PAT 导入——两区的授权页基址、client_id、nonce 形态与
+ *  回调参数都不同，必须在入口处显式指定区域。 */
+function RegionPicker({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: QoderRegionKey;
+  onChange: (v: QoderRegionKey) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="shrink-0 text-xs text-slate-500">区域</span>
+      <div className="inline-flex overflow-hidden rounded-md border border-slate-200 dark:border-zinc-700">
+        {QODER_REGIONS.map((r) => {
+          const active = r.key === value;
+          return (
+            <button
+              key={r.key}
+              type="button"
+              disabled={disabled}
+              onClick={() => onChange(r.key)}
+              className={
+                'px-2.5 py-1 text-xs transition disabled:opacity-50 ' +
+                (active
+                  ? 'bg-sky-100 font-medium text-sky-700 dark:bg-sky-500/20 dark:text-sky-300'
+                  : 'bg-transparent text-slate-500 hover:bg-slate-100 dark:hover:bg-zinc-800')
+              }
+            >
+              {r.label}
+              <span className="ml-1 text-[10px] opacity-70">{r.hint}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 /** 破坏性操作确认弹框目标（禁 window.confirm，红线）：移除账号 / 恢复快照 / 删除快照 */
 type QoderConfirm =
@@ -154,6 +197,9 @@ export default function QoderAccounts() {
   const [filter, setFilter] = useState('all');
   // PAT 导入弹框
   const [showImport, setShowImport] = useState(false);
+  // 区域选择（Qoder 国际版）：OAuth 与 PAT 导入各自独立记忆，默认国内版
+  const [oauthRealm, setOauthRealm] = useState<QoderRegionKey>('cn');
+  const [importRealm, setImportRealm] = useState<QoderRegionKey>('cn');
   const [patName, setPatName] = useState('');
   const [patValue, setPatValue] = useState('');
   const [importing, setImporting] = useState(false);
@@ -407,12 +453,17 @@ export default function QoderAccounts() {
     setOauthCanceling(false);
     // 兼容模式（上次授权超时后自动切换）：授权 URL 不带 client_id（预案见 qoder_oauth.rs）
     const compat = oauthCompatRef.current;
-    setOauthMsg(compat ? '正在打开 Qoder 授权页（兼容模式）…' : '正在打开 Qoder 授权页…');
+    const rg = qoderRegionLabel(oauthRealm);
+    setOauthMsg(
+      compat
+        ? `正在打开${rg} Qoder 授权页（兼容模式）…`
+        : `正在打开${rg} Qoder 授权页…`,
+    );
     if (compat) pushToast('info', '本次 OAuth 使用兼容模式（不带 client_id），用于绕过授权页「参数无效」');
     setOauthUrl(null);
     setShowOauth(true);
     try {
-      await api.qoder.oauthLogin(compat);
+      await api.qoder.oauthLogin(compat, oauthRealm);
     } catch (err) {
       setOauthRunning(false);
       setOauthCanceling(false);
@@ -462,8 +513,9 @@ export default function QoderAccounts() {
 
   const importPat = async () => {
     const token = patValue.trim();
+    const patSite = importRealm === 'intl' ? 'qoder.com' : 'qoder.com.cn';
     if (!token) {
-      pushToast('warn', '请粘贴 PAT（pt- 前缀，qoder.com.cn/account/integrations 创建）');
+      pushToast('warn', `请粘贴 PAT（pt- 前缀，${patSite}/account/integrations 创建）`);
       return;
     }
     // 前缀本地预检（对齐后端 accounts.rs 格式门禁）：pt- = 官方 PAT，jt- = 客户端
@@ -474,8 +526,12 @@ export default function QoderAccounts() {
     }
     setImporting(true);
     try {
-      const v = await api.qoder.accountImportPat(patName.trim() || undefined, token);
-      pushToast('success', `账号已导入：${v.nickname || v.id}`);
+      const v = await api.qoder.accountImportPat(
+        patName.trim() || undefined,
+        token,
+        importRealm,
+      );
+      pushToast('success', `账号已导入（${qoderRegionLabel(v.region)}）：${v.nickname || v.id}`);
       closeImport();
       void refresh();
     } catch (err) {
@@ -767,11 +823,12 @@ export default function QoderAccounts() {
             <button onClick={() => void refresh()} className="btn-outline" disabled={loading}>
               <RefreshCw size={15} className={loading ? 'animate-spin' : ''} /> 刷新
             </button>
+            <RegionPicker value={oauthRealm} onChange={setOauthRealm} disabled={oauthRunning} />
             <button
               className="btn-outline"
               disabled={oauthRunning}
               onClick={() => void startOauth()}
-              title="模拟客户端设备流：浏览器授权后自动获取 dt- 凭证入池"
+              title="模拟客户端设备流：浏览器授权后自动获取 dt- 凭证入池（按所选区域）"
             >
               {oauthRunning ? <Loader2 size={15} className="animate-spin" /> : <Globe size={15} />} OAuth登录
             </button>
@@ -905,6 +962,7 @@ export default function QoderAccounts() {
                   <th className="px-4 py-2 text-left">分组</th>
                   <th className="px-4 py-2 text-left">标签</th>
                   <th className="px-4 py-2 text-left">套餐</th>
+                  <th className="px-4 py-2 text-left">区域</th>
                   <th className="px-4 py-2 text-left">凭证来源</th>
                   <th className="px-4 py-2 text-left">Token 状态</th>
                   <th className="px-4 py-2 text-left">设备指纹</th>
@@ -958,6 +1016,11 @@ export default function QoderAccounts() {
                     </td>
                     <td className="px-4 py-3 text-xs text-slate-500">
                       {a.plan ? <span className="font-medium text-sky-600 dark:text-sky-400">{a.plan}</span> : <span className="text-slate-300 dark:text-zinc-600">—</span>}
+                    </td>
+                    <td className="px-4 py-3">
+                      <Badge tone={a.region === 'intl' ? 'blue' : 'slate'}>
+                        {qoderRegionLabel(a.region)}
+                      </Badge>
                     </td>
                     <td className="px-4 py-3">
                       <Badge tone={a.credential_source === 'pat' ? 'green' : 'slate'}>
@@ -1312,12 +1375,19 @@ export default function QoderAccounts() {
         }
       >
         <div className="space-y-3">
+          <RegionPicker value={importRealm} onChange={setImportRealm} />
           <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300">
             <KeyRound size={14} className="mt-0.5 shrink-0" />
             <span>
               PAT 仅在创建页关闭前可见一次，请先在
-              <a href={PAT_URL} target="_blank" rel="noreferrer" className="mx-1 inline-flex items-center gap-0.5 underline">
-                qoder.com.cn/account/integrations <ExternalLink size={10} />
+              <a
+                href={importRealm === 'intl' ? PAT_URL_INTL : PAT_URL_CN}
+                target="_blank"
+                rel="noreferrer"
+                className="mx-1 inline-flex items-center gap-0.5 underline"
+              >
+                {importRealm === 'intl' ? 'qoder.com' : 'qoder.com.cn'}/account/integrations{' '}
+                <ExternalLink size={10} />
               </a>
               创建后立即粘贴到下方。PAT 等同密码，仅存储在本机。
             </span>

@@ -19,22 +19,88 @@ use super::{http_agent, qoder_common, qoder_sign, qoder_upstream};
 /// GET 空体，COSY 签名覆盖见 qoder_sign——sigpath 自动剥离 /algo 前缀与查询串）
 const MODEL_LIST_PATH: &str = "algo/api/v2/model/list";
 
-/// CN 区 model/list 完整 URL（抽纯函数便于单测锚定端点形态）
-fn model_list_url() -> String {
-    format!("{}{MODEL_LIST_PATH}", qoder_upstream::QoderRegion::Cn.gateway())
+/// 区 model/list 完整 URL（抽纯函数便于单测锚定端点形态）。
+///
+/// `QoderRegion` 与 `QoderRealm` 在这里做**唯一一次**桥接：前者服务目录/网关
+/// 层的双桶缓存，后者服务业务层（签到/凭证/登录）。两者的 Global/Intl 语义一致。
+fn model_list_url(region: qoder_upstream::QoderRegion) -> String {
+    format!("{}{MODEL_LIST_PATH}", region.gateway())
 }
 
-/// 调度器/CLI 共用入口：CN 区模型目录同步
+/// 双区桥接：业务区域 → 目录区域
+pub fn catalog_region_for(realm: qoder_common::QoderRealm) -> qoder_upstream::QoderRegion {
+    match realm {
+        qoder_common::QoderRealm::Cn => qoder_upstream::QoderRegion::Cn,
+        qoder_common::QoderRealm::Intl => qoder_upstream::QoderRegion::Global,
+    }
+}
+
+/// 调度器/CLI 共用入口：**逐区**模型目录同步。
+///
+/// 账号按自身区域分组，各区分别用该区账号拉取该区的 `model/list` 并写入该区
+/// 目录缓存——国际版账号的清单与国内版不是同一份，混用会把国际版模型写进国内桶。
 pub fn run_task(state: &AppState) -> Result<Value, String> {
     let accounts = crate::commands::qoder::load_pool(state);
     if accounts.is_empty() {
         return Ok(json!({ "ok": true, "skipped": "无 Qoder 账号" }));
     }
+    let mut results: Vec<Value> = Vec::new();
+    let mut any_ok = false;
+    let mut last_err: Option<String> = None;
+    for realm in qoder_common::QoderRealm::all() {
+        let group: Vec<_> = accounts
+            .iter()
+            .filter(|a| qoder_common::resolve_realm(&a.region, "") == realm)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        match run_task_for_realm(state, realm, &group) {
+            Ok(v) => {
+                // 只有**真的采纳了模型**才算成功；`ok:true + skipped`（无凭证可试）
+                // 不是成功——否则会吞掉顶层 skipped 契约（测试钉住）
+                if v.get("models").and_then(Value::as_u64).is_some() {
+                    any_ok = true;
+                }
+                results.push(v);
+            }
+            Err(e) => {
+                last_err = Some(e.clone());
+                results.push(json!({ "ok": false, "realm": realm.as_str(), "error": e }));
+            }
+        }
+    }
+    // 至少一个区域成功同步 → ok（附双区明细）
+    if any_ok {
+        return Ok(json!({ "ok": true, "realm_results": results }));
+    }
+    // 没有任何区域同步成功：区分「无凭证可试」（保留既有 skipped 契约：
+    // 调度器据此判定为跳过而非失败）与「尝试过但失败」（上抛错误交冷却重试）
+    let no_creds = results
+        .iter()
+        .all(|r| r.get("skipped").and_then(Value::as_str).is_some());
+    if no_creds {
+        return Ok(json!({
+            "ok": true,
+            "skipped": "无可用 Qoder 凭证",
+            "realm_results": results,
+        }));
+    }
+    Err(last_err.unwrap_or_else(|| "Qoder 目录同步失败".into()))
+}
+
+/// 单区域目录同步：按池序逐可用账号尝试，任一成功即收口（P3 语义不变）。
+fn run_task_for_realm(
+    state: &AppState,
+    realm: qoder_common::QoderRealm,
+    accounts: &[&crate::commands::qoder::QoderAccount],
+) -> Result<Value, String> {
+    let region = catalog_region_for(realm);
     let agent = http_agent(20);
-    let url = model_list_url();
+    let url = model_list_url(region);
     // P3：单个账号失败不再整体 Err——记日志后试下一个可用账号，全部失败才上抛
     let mut last_err: Option<String> = None;
-    for a in &accounts {
+    for a in accounts {
         let id = a.id.as_str();
         // 24h 惰性窗口（对齐探针/常规任务语义）：临期先刷再用
         let (creds, _refreshed, _note) = qoder_common::ensure_fresh(state, &agent, id, 24);
@@ -81,11 +147,15 @@ pub fn run_task(state: &AppState) -> Result<Value, String> {
                             .map_err(|e| format!("model/list 响应非 JSON: {e}"))
                     })
                     .and_then(|payload| {
-                        qoder_upstream::adopt_remote(qoder_upstream::QoderRegion::Cn, &payload)
+                        qoder_upstream::adopt_remote(region, &payload)
                             .map_err(|e| format!("model/list 目录采纳失败: {e}"))
                     })
                 {
-                    Ok(count) => return Ok(json!({ "ok": true, "models": count, "account": id })),
+                    Ok(count) => {
+                        return Ok(json!({
+                            "ok": true, "models": count, "account": id, "realm": realm.as_str(),
+                        }))
+                    }
                     Err(e) => last_err = Some(e),
                 }
             }
@@ -103,7 +173,9 @@ pub fn run_task(state: &AppState) -> Result<Value, String> {
     }
     match last_err {
         Some(e) => Err(e),
-        None => Ok(json!({ "ok": true, "skipped": "无可用 Qoder 凭证" })),
+        None => Ok(json!({
+            "ok": true, "skipped": "无可用 Qoder 凭证", "realm": realm.as_str(),
+        })),
     }
 }
 
@@ -126,10 +198,28 @@ mod tests {
     }
 
     #[test]
-    fn url_anchored_to_cn_gateway() {
+    fn url_anchored_to_per_region_gateway() {
         assert_eq!(
-            model_list_url(),
+            model_list_url(qoder_upstream::QoderRegion::Cn),
             "https://gateway.qoder.com.cn/algo/api/v2/model/list"
+        );
+        // 国际版网关（api3.qoder.sh）——漏桥接会把国际版目录拉到国内站
+        assert_eq!(
+            model_list_url(qoder_upstream::QoderRegion::Global),
+            "https://api3.qoder.sh/algo/api/v2/model/list"
+        );
+    }
+
+    /// 业务区域 ↔ 目录区域桥接（唯一桥接点，回归钉）
+    #[test]
+    fn realm_maps_to_catalog_region() {
+        assert_eq!(
+            catalog_region_for(qoder_common::QoderRealm::Cn),
+            qoder_upstream::QoderRegion::Cn
+        );
+        assert_eq!(
+            catalog_region_for(qoder_common::QoderRealm::Intl),
+            qoder_upstream::QoderRegion::Global
         );
     }
 

@@ -80,16 +80,23 @@ fn emit_done(app: &AppHandle, data_dir: &Path, ok: bool, id: &str, nickname: &st
 /// 验证可用）。官方常量被 Qoder 轮换导致授权页「参数无效」时，前端在授权超时后
 /// 自动改用本模式重试。
 #[tauri::command(async)]
-pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<bool>) -> Result<(), String> {
+pub fn qoder_oauth_login(
+    app: AppHandle,
+    state: State<AppState>,
+    compat: Option<bool>,
+    realm: Option<String>,
+) -> Result<(), String> {
     if OAUTH_RUNNING.swap(true, Ordering::SeqCst) {
         return Err("已有 OAuth 登录在执行中，请等待完成".into());
     }
     // 复位取消标志（上一轮会话的取消请求不应影响本次登录）
     OAUTH_CANCEL.store(false, Ordering::SeqCst);
+    // 区域：决定授权页基址、client_id、nonce 形态、redirect_uri 与 poll 端点
+    let realm = qoder_common::QoderRealm::parse(realm.as_deref().unwrap_or(""));
     let flow = if compat.unwrap_or(false) {
-        qoder_oauth::DeviceFlow::new_compat()
+        qoder_oauth::DeviceFlow::new_compat_for(realm)
     } else {
-        qoder_oauth::DeviceFlow::new()
+        qoder_oauth::DeviceFlow::new_for(realm)
     };
     let auth_url = flow.auth_url.clone();
     emit_progress(&app, "init", "正在打开 Qoder 授权页…", Some(&auth_url));
@@ -143,7 +150,7 @@ pub fn qoder_oauth_login(app: AppHandle, state: State<AppState>, compat: Option<
                         };
                         // nonce 回验（审查 L）：响应必须属于本次会话，防 poll 响应
                         // 被替换为其他会话的授权结果
-                        let Some((creds, uid)) = qoder_oauth::parse_poll_success(&b, &flow.nonce) else {
+                        let Some((creds, uid)) = qoder_oauth::parse_poll_success(&b, &flow.nonce, flow.realm) else {
                             emit_done(&app2, &state2.data_dir, false, "", "", "授权响应校验失败（nonce 不匹配或缺少令牌字段），请重试");
                             return;
                         };
@@ -222,9 +229,12 @@ fn import_device_creds(
     let id = account_id_of(&creds.access_token);
     // userinfo/plan 回填（失败容错：dt- 对 openapi 端点的可用性随客户端一致）
     let agent = http_agent(15);
+    // 区域随凭证透传（userinfo/plan 必须打该账号所属区域的 openapi）
+    let realm = qoder_common::realm_of_creds(&creds).as_str().to_string();
     let probe = qoder_common::QoderCreds {
         access_token: creds.access_token.clone(),
         kind: "client".into(),
+        region: realm.clone(),
         ..Default::default()
     };
     let (info_uid, nickname) = qoder_common::fetch_userinfo(&agent, &probe);
@@ -273,6 +283,10 @@ fn import_device_creds(
             if a.device_profile.is_none() {
                 a.device_profile = Some(crate::tasks::qoder_device::QoderDeviceProfile::generate());
             }
+            // 区域：仅在既有为空时按本次登录区域补写（已在池账号不因重登漂移区域）
+            if a.region.is_empty() {
+                a.region = realm.clone();
+            }
             Ok(a.id.clone())
         } else {
             accounts.push(QoderAccount {
@@ -281,6 +295,7 @@ fn import_device_creds(
                 nickname: display.clone(),
                 plan: tier,
                 credential_source: "client".into(),
+                region: realm.clone(),
                 // 入池即生成稳定指纹（§5.10：一次生成永不轮换）
                 device_profile: Some(crate::tasks::qoder_device::QoderDeviceProfile::generate()),
                 ..Default::default()

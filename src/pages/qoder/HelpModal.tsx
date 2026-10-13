@@ -17,17 +17,40 @@ export function QoderHelpModal({ open, onClose }: { open: boolean; onClose: () =
       <div className="space-y-4 text-sm">
         <section className="rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-700 dark:bg-amber-900/20">
           <h3 className="mb-1.5 flex items-center gap-1.5 font-semibold text-amber-700 dark:text-amber-300">
+            <Globe size={15} /> 区域（国内版 / 国际版）
+          </h3>
+          <p className="text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+            右上角工具条的<b>「区域」切换器</b>决定本次登录 / 导入的账号归属，并在账号列表的
+            「区域」列长期标注。两区是<b>完全独立的站点</b>（授权页、API、模型目录、每日活动都不通用），
+            账号入池后其所有请求（签到 / 积分 / 目录 / 凭证刷新）都按该区域路由，请勿混用：
+          </p>
+          <ul className="ml-4 mt-1 list-disc space-y-0.5 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
+            <li>
+              <b>国内版</b>：qoder.com.cn · 授权页 client_id 与 API 走国内站；支持「扫描本地账号」。
+            </li>
+            <li>
+              <b>国际版</b>：qoder.com / qoder.sh；授权 URL 参数集与回调与国内版不同
+              （不带 redirect_uri、nonce 为 32 位 hex），暂无本地客户端可扫描，请用 PAT 或 OAuth 入池。
+            </li>
+          </ul>
+        </section>
+
+        <section className="rounded-lg border border-amber-200 bg-amber-50 p-3 dark:border-amber-700 dark:bg-amber-900/20">
+          <h3 className="mb-1.5 flex items-center gap-1.5 font-semibold text-amber-700 dark:text-amber-300">
             <Globe size={15} /> 账号入池流程（三通道）
           </h3>
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-amber-800 dark:text-amber-200">
             <li>
-              <b>导入 PAT</b>：在 qoder.com.cn → Integrations 创建 PAT（pt- 前缀），点右上角「导入 PAT」粘贴入池。
+              <b>导入 PAT</b>：在所选区域的 Integrations 页创建 PAT（pt- 前缀）——国内版
+              qoder.com.cn、国际版 qoder.com——点右上角「导入 PAT」粘贴入池。
             </li>
             <li>
-              <b>OAuth 设备流登录</b>：点右上角「OAuth登录」，应用自动发起设备流授权，成功后凭证自动入池。
+              <b>OAuth 设备流登录</b>：先选区域，再点「OAuth登录」，应用自动按该区域发起设备流授权，
+              成功后凭证自动入池。
             </li>
             <li>
-              <b>扫描本地账号</b>：本机 Qoder CN IDE 已登录时，点「扫描本地账号」一键解密导入。
+              <b>扫描本地账号</b>：本机 Qoder CN IDE 已登录时，点「扫描本地账号」一键解密导入
+              （<b>仅国内版</b>——国际版无本地客户端，请走前两条通道）。
             </li>
           </ol>
         </section>
@@ -37,9 +60,13 @@ export function QoderHelpModal({ open, onClose }: { open: boolean; onClose: () =
             <KeyRound size={15} className="text-amber-500" /> 导入 PAT
           </h3>
           <p className="text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
-            在 Qoder 官网 Integrations 页面创建 Personal Access Token 后粘贴导入。PAT
-            为官方认可凭证（pt- 前缀），可用于积分查询 / 签到 / API 服务。同一账号的 PAT
+            在所选区域的 Qoder 官网 Integrations 页面创建 Personal Access Token 后粘贴导入。
+            PAT 为官方认可凭证（pt- 前缀），可用于积分查询 / 签到 / API 服务。同一账号的 PAT
             与客户端凭证按 token 派生 id，分属两条池记录，互不覆盖。
+          </p>
+          <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
+            ⚠ PAT 本身不含域名信息，区域由导入时的切换器决定——国际版账号误按国内版导入会把
+            请求打到错误站点（表现为恒 401/403）。
           </p>
         </section>
 
@@ -62,6 +89,7 @@ export function QoderHelpModal({ open, onClose }: { open: boolean; onClose: () =
           </p>
           <p className="mt-1 text-xs font-medium text-amber-600 dark:text-amber-400">
             ⚠ IDE 退出登录后本地凭证已被清空，将无法导入——需先重新登录 IDE。
+            该通道读取的是本机 Qoder CN IDE，<b>仅支持国内版</b>。
           </p>
         </section>
 

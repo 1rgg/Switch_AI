@@ -6,6 +6,46 @@
 
 ---
 
+## [Switch AI 3.8.8] · 新增 Qoder 国际版支持（区域抽象 + 国际版登录/签到/积分/目录）
+
+> 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。
+
+Qoder 此前**只有国内版**：授权页、API 基址、模型目录全部写死 qoder.com.cn / gateway.qoder.com.cn。
+本版对照参考实现 [shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)
+的 `REALM_CONFIGS`（逆向自官方桌面/CLI 客户端），把区域提升为一条**贯通的轴**。
+
+### 新功能
+
+- **Qoder 区域抽象**：新增 `QoderRealm{Cn,Intl}` + `QoderRealmSpec` 差异表——把两区的
+  API 基址 / 官网域 / 授权页 client_id / 回调参数 / nonce 形态 / 客户端本地目录全部收敛到一张表，
+  调用方查表派生。取向与 WorkBuddy 侧 `WbRegion` 一致，不再散落 `if intl` 分支。
+- **国际版账号入池（两条通道）**：
+  - **OAuth 设备流**：国际版走 `qoder.com/device/selectAccounts`，**参数集与国内版不同**——不带
+    `redirect_uri`、nonce 为 32 位无横线 hex、使用国际版专属 client_id；轮询打 `openapi.qoder.sh`。
+  - **导入 PAT**：在所选区域的 Integrations 页创建后粘贴入池。
+  - 「扫描本地账号」保持**仅国内版**（读本机 Qoder CN IDE 存储，国际版无本地客户端）。
+- **区域路由贯通**：签到（活动列表 / 领取 / 盲发）、积分（usage / 逐包明细）、凭证刷新
+  （deviceToken/refresh、PAT→作业令牌重换）、userinfo / 套餐查询，全部按账号所属区域选择站点。
+- **模型目录双区同步**：每日目录任务改为**逐区**执行——各区用本区账号拉本区 `model/list`
+  写入本区目录缓存（两区清单不是同一份，混用会把国际版模型写进国内桶）。
+- **前端**：账号页新增**区域切换器**（决定本次 OAuth/PAT 的归属）与账号列表「区域」列徽标；
+  签到事件随行下发区域名；帮助弹框补充区域说明。
+
+### 兼容与迁移
+
+- **存量账号零变化**：账号池 / 凭证记录新增的 `region` 字段缺省为空——空值一律回落国内版，
+  所有既有路径行为不变；账号列表接口对空值做归一，前端始终拿到确定区域。
+- 账号导入 / 导出、OAuth 重登、PAT 重复导入都**不会让既有账号的区域漂移**（仅空值时补写）。
+- 区域相关提示语（如 PAT 失效指引）改为按该账号区域生成对应站点，不再一律指向 qoder.com.cn。
+
+### 已知限制
+
+- 国际版**无本地客户端**可扫描，`扫描本地账号` 与 `环境重置` 仍只覆盖国内版。
+- 推理网关（API 服务页）沿用既有的双区目录与 `api1/api2/api3.qoder.sh` 出口，
+  未经真实国际版账号端到端验证——本版仅保证目录与业务链路（签到/积分/登录）的区域正确性。
+
+---
+
 ## [Switch AI 3.8.7] · 修复 Qoder 自动签到（当日活动 id 重学习失效导致全轮失败）
 
 > 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。

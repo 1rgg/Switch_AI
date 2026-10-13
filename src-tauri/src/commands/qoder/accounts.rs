@@ -40,6 +40,8 @@ pub struct QoderAccountView {
     /// 共享标签 tag id 列表（account_tags 表联表填充，不改账号持久化结构，D3）
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// 账号区域：`"cn"` 国内版 / `"intl"` 国际版（前端区域徽标与筛选用）
+    pub region: String,
 }
 
 fn account_tags_for(state: &AppState, id: &str) -> Vec<String> {
@@ -89,6 +91,9 @@ fn view_of(a: &QoderAccount, tokens: &Value, tags: Vec<String>) -> QoderAccountV
             .map(|p| p.machine_id.chars().take(8).collect::<String>()),
         device_profile: a.device_profile.clone(),
         tags,
+        // 池内 `region` 空串（存量账号）按「无 domain 信息」回落国内版，
+        // 前端始终拿到确定值，无需自行推断
+        region: crate::tasks::qoder_common::resolve_realm(&a.region, "").as_str().to_string(),
     }
 }
 
@@ -246,23 +251,38 @@ pub async fn qoder_account_import_pat(
     state: State<'_, AppState>,
     name: Option<String>,
     pat: String,
+    realm: Option<String>,
 ) -> Result<QoderAccountView, String> {
     let pat = pat.trim().to_string();
     if pat.is_empty() {
         return Err("PAT 不能为空".into());
     }
     if !pat.starts_with("pt-") && !pat.starts_with("jt-") {
-        return Err("凭证格式不识别：应为 qoder.com.cn/account/integrations 创建的 PAT（pt-）或客户端抓包获取的 job token（jt-）".into());
+        let site = if crate::tasks::qoder_common::QoderRealm::parse(realm.as_deref().unwrap_or(""))
+            == crate::tasks::qoder_common::QoderRealm::Intl
+        {
+            "qoder.com"
+        } else {
+            "qoder.com.cn"
+        };
+        return Err(format!(
+            "凭证格式不识别：应为 {site}/account/integrations 创建的 PAT（pt-）或客户端抓包获取的 job token（jt-）"
+        ));
     }
+    // 区域：PAT 无域名信息，只能由调用方指定；缺省回落国内版（存量行为不变）
+    let realm = crate::tasks::qoder_common::QoderRealm::parse(realm.as_deref().unwrap_or(""));
+    let realm_str = realm.as_str().to_string();
     let id = account_id_of(&pat);
     // spawn_blocking：fetch_userinfo/fetch_plan 为阻塞 ureq 网络请求（15s 超时），
     // async 命令体内直接执行会占用 async worker 线程
     let pat2 = pat.clone();
+    let realm_probe = realm_str.clone();
     let (uid, nickname, plan) = tauri::async_runtime::spawn_blocking(move || {
         let agent = crate::tasks::http_agent(15);
         let creds = QoderCreds {
             access_token: pat2,
             kind: "pat".into(),
+            region: realm_probe,
             ..Default::default()
         };
         let (uid, nickname) = qoder_common::fetch_userinfo(&agent, &creds);
@@ -282,6 +302,7 @@ pub async fn qoder_account_import_pat(
     let app2 = app.clone();
     let id2 = id.clone();
     let pat3 = pat;
+    let realm_str2 = realm_str.clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<QoderAccountView, String> {
         let (display, uid, nickname, plan) = (display, uid, nickname, plan);
         // P2 审查修复：入池匹配补 uid 兜底（对齐 oauth import_device_creds / data_io
@@ -317,6 +338,10 @@ pub async fn qoder_account_import_pat(
                 if a.device_profile.is_none() {
                     a.device_profile = Some(crate::tasks::qoder_device::QoderDeviceProfile::generate());
                 }
+                // 区域：仅空时补写（既有归属不因再次导入而漂移）
+                if a.region.is_empty() {
+                    a.region = realm_str2.clone();
+                }
                 Ok(a.id.clone())
             } else {
                 accounts.push(QoderAccount {
@@ -326,6 +351,7 @@ pub async fn qoder_account_import_pat(
                         .unwrap_or_else(|| format!("Qoder {}", &id2[3..9])),
                     plan,
                     credential_source: "pat".into(),
+                    region: realm_str2.clone(),
                     // 入池即生成稳定指纹（§5.10：一次生成永不轮换）
                     device_profile: Some(crate::tasks::qoder_device::QoderDeviceProfile::generate()),
                     ..Default::default()
@@ -343,6 +369,8 @@ pub async fn qoder_account_import_pat(
             kind: "pat".into(),
             uid: uid.clone(),
             nickname: nickname.clone(),
+            // 区域随凭证落库（此后签到/积分/目录/刷新均按它路由）
+            region: realm_str2.clone(),
             ..Default::default()
         };
         // 凭证按生效 id 落库（uid 兜底命中时为池内既有 id），与池条目对齐——

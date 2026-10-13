@@ -567,16 +567,22 @@ export const api = {
         }),
       remove: (id: string) => invoke('qoder_groups_remove', { id }),
     },
-    /** PAT 手工导入（M1 最可靠凭证通道；qoder.com.cn/account/integrations 自建，pt- 前缀）。pat 后端必填 */
-    accountImportPat: (name: string | undefined, pat: string) =>
-      invoke<QoderAccountView>('qoder_account_import_pat', { name: name ?? null, pat }),
+    /** PAT 手工导入（M1 最可靠凭证通道；国内版 qoder.com.cn / 国际版 qoder.com 的
+     *  account/integrations 自建，pt- 前缀）。pat 后端必填；realm 缺省国内版 */
+    accountImportPat: (name: string | undefined, pat: string, realm?: string) =>
+      invoke<QoderAccountView>('qoder_account_import_pat', {
+        name: name ?? null,
+        pat,
+        realm: realm ?? null,
+      }),
     /** 单账号凭证续期（手动按钮，force 恒刷；成功返回续期后的最新账号视图） */
     accountRefreshToken: (accountId: string) =>
       invoke<QoderAccountView>('qoder_account_refresh_token', { accountId }),
     /** OAuth 设备流登录（浏览器授权页 + deviceToken/poll 轮询；事件 qoder-oauth-progress/done）。
      *  compat=true = 兼容模式（授权 URL 不带 client_id）：官方 client_id 常量被
      *  Qoder 轮换导致授权页「参数无效」时的降级链路；前端在授权超时后自动切换重试 */
-    oauthLogin: (compat?: boolean) => invoke<void>('qoder_oauth_login', { compat: compat ?? null }),
+    oauthLogin: (compat?: boolean, realm?: string) =>
+      invoke<void>('qoder_oauth_login', { compat: compat ?? null, realm: realm ?? null }),
     /** 取消进行中的 OAuth 轮询（弹框「取消授权」）：后端置标志后轮询线程自行发失败终态 */
     oauthCancel: () => invoke<void>('qoder_oauth_cancel'),
     /** IDE 存储账号发现/导入（M3；secret://aicoding.auth.userInfo DPAPI+AES-GCM 解密） */
