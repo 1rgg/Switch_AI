@@ -226,6 +226,28 @@ fn packages_from(body: &Value) -> Vec<Value> {
         );
         let end_ts = to_ts(end_raw);
         let used = num_of(fs_utils::dig(item, &["UsedCapacity", "used", "Used"]));
+        // 发放日归集（Switch AI：获得积分权威口径）——`CycleStartTime` 是本地(+8)墙钟
+        // 字符串（实测与国际站 CreateTime 毫秒交叉验证一致），直接取日期前缀即本地发放日。
+        //
+        // 为何不用 CreateTime：实测 Free Plan Subscription 的 CreateTime = 账号创建时刻
+        // （2026-10-07），而其 CycleStartTime = 周期起始（2026-10-01），两者相差 6 天；
+        // 用 CreateTime 归日会把该包 100 分错记到 10-07。且 CreateTime 是 UTC 毫秒，
+        // 按 UTC 归日还会把 10-07/10-08 两天的包并成一天（实测 380 vs 正确 250+30）。
+        //
+        // 为何不用 entitlement_base_info.start_time：该字段是 **Trae** 侧的包结构
+        // （accounts.rs 的 pack_earned_daily 口径），WorkBuddy 的 billing 包结构里没有它。
+        let start_date = fs_utils::dig(item, &["CycleStartTime", "cycleStartTime"])
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| s.len() >= 10)
+            .map(|s| s[..10].to_string())
+            // 兜底：CreateTime 毫秒（仅当无 CycleStartTime 时；按本地时区归日纠正 UTC 错位）
+            .or_else(|| {
+                num_of(fs_utils::dig(item, &["CreateTime", "createTime"])).and_then(|ms| {
+                    chrono::DateTime::from_timestamp_millis(ms as i64)
+                        .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+                })
+            });
         out.push(json!({
             "name": name,
             "code": code,
@@ -234,6 +256,14 @@ fn packages_from(body: &Value) -> Vec<Value> {
             "used": used.unwrap_or(0.0),
             "end_time": end_ts.map(fmt_ts),
             "expire_ts": end_ts,
+            // 发放日（本地自然日 YYYY-MM-DD）：供「某日获得积分 = 该日新开包面额合计」
+            "grant_date": start_date,
+            // 面额（精确字段优先，实测 CapacitySizePrecise="250" 为字符串）
+            "grant_amount": num_of(fs_utils::dig(
+                item,
+                &["CapacitySizePrecise", "CycleCapacitySizePrecise", "CapacitySize", "CycleCapacitySize"],
+            ))
+            .or(total),
         }));
     }
     out
@@ -288,13 +318,29 @@ fn creds_region(creds: &wb_common::Creds) -> wb_common::WbRegion {
 
 /// 区域路由（T4.5/F-36，§5.2）：Global 账号 billing 走 www.workbuddy.ai。
 /// 返回 (summary, paid, free, old_resource) 四元组。
+///
+/// ⚠ 路径前缀存在**区域差异**（Switch AI 实测 2026-10，对照参考实现
+/// workbuddy2api-panel `client.go` 的 `billingMeterPaths`）：
+///
+/// ```text
+/// /billing/meter/get-user-resource-summary        👈 国际版 401（存在）
+/// /v2/billing/meter/get-user-resource-summary     👈 国际版 404（不存在）
+/// /billing/meter/get-user-request-usage           👈 国际版 401（存在）
+/// /v2/billing/meter/get-user-request-usage        👈 国际版 404（不存在）
+/// ```
+///
+/// 即**国际版没有 `/v2` 前缀**（国内版现状是带 `/v2`）。summary/paid/free 三个
+/// 路径恰好本就无前缀，故国际版可用；但旧回退接口原写死 `/v2/...`，国际版账号
+/// 一旦走到回退分支必然 404 —— 此处改为按区域选择前缀。
 fn billing_urls(region: wb_common::WbRegion) -> (String, String, String, String) {
     let base = region.billing_base();
+    // 国际版无 /v2 前缀；国内版保持既有语义（零回归）
+    let v2 = if region.is_global() { "" } else { "/v2" };
     (
         format!("{base}/billing/meter/get-user-resource-summary"),
         format!("{base}/billing/meter/get-user-resource-paid-packages"),
         format!("{base}/billing/meter/get-user-resource-free-packages"),
-        format!("{base}/v2/billing/meter/get-user-resource"),
+        format!("{base}{v2}/billing/meter/get-user-resource"),
     )
 }
 
@@ -653,6 +699,125 @@ mod wb_credits_tests {
         // 倒推不为负
         let pkg2 = json!({"CycleTotalCapacity": 10.0, "UsedCapacity": 90.0});
         assert_eq!(remaining_of(&pkg2, total_of(&pkg2)), Some(0.0));
+    }
+
+    // ── 发放日归集（Switch AI：获得积分权威口径；fixture 取自国际站真实响应）──────
+
+    /// 国际站 `get-user-resource` 实包样本（脱敏：仅保留本用例断言所需字段）
+    fn intl_pkg(name: &str, cycle_start: &str, cap: i64, create_ms: i64) -> Value {
+        json!({
+            "PackageName": name,
+            "PackageCode": "TCACA_code_007_x",
+            "CycleStartTime": cycle_start,
+            "CreateTime": create_ms,
+            "CapacitySize": cap,
+            "CapacitySizePrecise": cap.to_string(),
+            "CapacityRemain": cap,
+        })
+    }
+
+    #[test]
+    fn packages_from_extracts_grant_date_from_cycle_start_time() {
+        let body = json!({"Accounts": [
+            intl_pkg("Bonus Pack", "2026-10-13 03:05:17", 30, 1_791_831_917_000),
+        ]});
+        let pkgs = packages_from(&body);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(
+            pkgs[0].get("grant_date").and_then(Value::as_str),
+            Some("2026-10-13"),
+            "CycleStartTime 前 10 位即本地发放日"
+        );
+        assert_eq!(pkgs[0].get("grant_amount").and_then(Value::as_f64), Some(30.0));
+    }
+
+    /// 回归（真实数据踩到的坑）：Free Plan 的 CreateTime 是**账号创建时刻**
+    /// （2026-10-07），而 CycleStartTime 是周期起始（2026-10-01），相差 6 天。
+    /// 若误用 CreateTime 归日，该包 100 分会被错记到 10-07。
+    #[test]
+    fn packages_from_prefers_cycle_start_over_create_time() {
+        let body = json!({"Accounts": [
+            intl_pkg("Free Plan Subscription", "2026-10-01 00:00:00", 100, 1_791_332_605_000),
+        ]});
+        let p = &packages_from(&body)[0];
+        assert_eq!(
+            p.get("grant_date").and_then(Value::as_str),
+            Some("2026-10-01"),
+            "必须以 CycleStartTime 为准，不得用 CreateTime（那是账号创建时刻）"
+        );
+    }
+
+    /// CreateTime 兜底时必须按**本地时区**归日：毫秒是 UTC，
+    /// 实测 1_791_332_605_000 = 2026-10-07T00:23:25Z = 本地 10-07 08:23，
+    /// 但另一包 1_791_397_266_000 = 10-07T18:21:06Z = 本地 **10-08** 02:21 ——
+    /// 按 UTC 归日会把这两天的包并成 10-07（实测 380 vs 正确 250+30）。
+    #[test]
+    fn packages_from_create_time_fallback_uses_local_timezone() {
+        let body = json!({"Accounts": [
+            { "PackageName": "NoCycleField", "CapacitySize": 30, "CreateTime": 1_791_397_266_000i64 },
+        ]});
+        let p = &packages_from(&body)[0];
+        assert_eq!(
+            p.get("grant_date").and_then(Value::as_str),
+            Some("2026-10-08"),
+            "UTC 18:21 的包按本地(+8)属于次日 10-08"
+        );
+    }
+
+    #[test]
+    fn packages_from_grant_fields_null_without_any_time_source() {
+        // 两个时间字段都缺 → grant_date 为 null（不臆造），amount 仍可用
+        let body = json!({"Accounts": [{"PackageName": "无时间", "CapacitySize": 30}]});
+        let p = &packages_from(&body)[0];
+        assert_eq!(p.get("grant_date"), Some(&Value::Null));
+        assert_eq!(p.get("grant_amount").and_then(Value::as_f64), Some(30.0));
+    }
+
+    /// 按发放日归集（与前端消费同款）：今日新增 = 该日新开全部包的面额合计。
+    /// 用真实样本验证 10-13 归集 = 30（截图当日新增 100 另有来源，见口径说明）。
+    #[test]
+    fn grant_grouping_sums_packages_by_local_grant_date() {
+        let body = json!({"Accounts": [
+            intl_pkg("Bonus Pack", "2026-10-07 08:23:25", 250, 1_791_332_605_000),
+            intl_pkg("Free Plan Subscription", "2026-10-01 00:00:00", 100, 1_791_332_605_000),
+            intl_pkg("Bonus Pack", "2026-10-08 02:21:05", 30, 1_791_397_266_000),
+            intl_pkg("Bonus Pack", "2026-10-13 03:05:17", 30, 1_791_831_917_000),
+        ]});
+        let mut by_date: std::collections::BTreeMap<String, f64> = Default::default();
+        for p in packages_from(&body) {
+            if let (Some(d), Some(a)) = (
+                p.get("grant_date").and_then(Value::as_str),
+                p.get("grant_amount").and_then(Value::as_f64),
+            ) {
+                *by_date.entry(d.to_string()).or_insert(0.0) += a;
+            }
+        }
+        assert_eq!(by_date.get("2026-10-01"), Some(&100.0));
+        assert_eq!(by_date.get("2026-10-07"), Some(&250.0));
+        assert_eq!(by_date.get("2026-10-08"), Some(&30.0));
+        assert_eq!(by_date.get("2026-10-13"), Some(&30.0));
+        // 总量守恒：各日归集合计 == 各包面额合计
+        let sum: f64 = by_date.values().sum();
+        assert_eq!(sum, 410.0);
+    }
+
+    /// 区域路径前缀：国际版无 `/v2`（实测 404），国内版保持现状（零回归）
+    #[test]
+    fn billing_urls_v2_prefix_is_region_aware() {
+        let (s_g, _p_g, _f_g, old_g) = billing_urls(wb_common::WbRegion::Global);
+        assert!(
+            old_g.starts_with("https://www.workbuddy.ai/billing/meter/get-user-resource"),
+            "国际版旧回退接口不得带 /v2（实测 404）：{old_g}"
+        );
+        assert!(!old_g.contains("/v2/"), "国际版路径不应含 /v2：{old_g}");
+        assert!(s_g.contains("www.workbuddy.ai"));
+
+        let (_s_c, _p_c, _f_c, old_c) = billing_urls(wb_common::WbRegion::Cn);
+        assert!(
+            old_c.contains("/v2/billing/meter/get-user-resource"),
+            "国内版必须保持既有 /v2 语义（零回归）：{old_c}"
+        );
+        assert!(old_c.contains("codebuddy.cn"));
     }
 
     #[test]

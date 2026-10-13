@@ -1410,6 +1410,14 @@ export interface WbCreditPackage {
   end_time: string | null;
   expire_ts: number | null;
   expire_soon?: boolean;
+  /**
+   * 发放日（本地自然日 YYYY-MM-DD，源自官方 `CycleStartTime`；缺失时回退出
+   * `CreateTime` 并按本地时区归日）。供「某日获得积分 = 该日新开包面额合计」
+   * 这一权威口径使用；两者都缺时为 null（不臆造）。
+   */
+  grant_date?: string | null;
+  /** 发放面额（精确字段优先：CapacitySizePrecise → CapacitySize） */
+  grant_amount?: number | null;
 }
 
 export interface WbCreditAccount {

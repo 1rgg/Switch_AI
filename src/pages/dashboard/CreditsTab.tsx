@@ -14,6 +14,7 @@ import type {
   QoderCreditsSnapshot,
   UsageHistoryResult,
   WbCheckinRecord,
+  WbCreditAccount,
   WbCreditsSnapshot,
   WbUsageFallback,
   WbUsageOfficialAll,
@@ -33,6 +34,7 @@ import {
   wbCheckinEarnedByDate,
   wbEarnedByDateFiltered,
   wbFallbackToPoints,
+  wbGrantEarnedByDate,
   wbOfficialAllToPoints,
   wbOfficialModels,
   wbRegionAvailable,
@@ -91,6 +93,7 @@ export default function CreditsTab({
   wbFallback,
   wbSnapshots,
   wbCheckin,
+  wbPackages,
   qoderSnapshots,
   qoderCheckin,
   gateway,
@@ -111,6 +114,12 @@ export default function CreditsTab({
   wbSnapshots: WbCreditsSnapshot[];
   /** Buddy 签到日志（90 天，方案 A 回退口径） */
   wbCheckin: WbCheckinRecord[];
+  /**
+   * Buddy 账号积分包明细（workbuddy_credits_fetch）：含每包发放日 `grant_date` 与
+   * 面额 `grant_amount`，是「获得积分」的**权威来源**（发放事实，非差分推导）。
+   * 为空时回落快照/签到推导口径。
+   */
+  wbPackages?: WbCreditAccount[] | null;
   /** Qoder 积分快照时序（本地源消耗差分 + earned 获得口径） */
   qoderSnapshots: QoderCreditsSnapshot[];
   /** Qoder 签到日志（账号筛选时 earned 按 uid 过滤 reward；与全局快照 earned 同源） */
@@ -229,6 +238,8 @@ export default function CreditsTab({
     let earnedSkippedDates = 0;
     // 获得积分是否真的按版本收敛成功（供 KPI 口径标注：失败时如实说明仍为全版本）
     let earnedRegionApplied = false;
+    // 获得积分实际采用的口径：grant = 积分包发放日归集（权威）/ derived = 快照差分推导
+    let earnedSource: 'grant' | 'derived' = 'derived';
     const addConsume = (date: string, v: number) => {
       consumeByDate.set(date, (consumeByDate.get(date) ?? 0) + v);
     };
@@ -304,29 +315,46 @@ export default function CreditsTab({
           }
         }
       }
-      // Buddy 获得（方案 B 快照 earned 优先，缺失日回退方案 A 签到）
+      // Buddy 获得（Switch AI）：**优先积分包发放日归集**（权威口径），
+      // 包明细不可得时回落「方案 B 快照 earned + 方案 A 签到」。
+      //
+      // 为何包归集优先：它是上游下发的**发放事实**（官方 CycleStartTime 归日），
+      // 而快照 earned 是余额差分推导（会被包过期/消耗波动污染，Trae 侧实测虚增至 1300）。
+      // 版本收敛：包清单带 user_id，经账号清单反查所属版本（同消耗口径）。
       if (buddyActive) {
-        // 版本维度（Switch AI）：快照 / 签到日志本身不带区域字段，但其 `user_id` 可经
-        // 官方用量的账号清单（accounts[].region，与后端分桶同源）反查所属版本。
-        // 此前「获得积分」完全无视版本选择 → 切国内版/国际版该数字**一模一样**
-        // （截图即为此问题），是口径错误：消耗按版本、获得却全版本。
-        // 现按与消耗**同一版本口径**收敛：该版本账号集 ∩ 账号筛选集。
+        const scopeAccs = uidSet
+          ? (wbPackages ?? []).filter((a) => uidSet.has(a.user_id))
+          : (wbPackages ?? []);
+        const scoped =
+          regionAvailable && effectiveRegion !== 'all' && regionUids
+            ? scopeAccs.filter((a) => regionUids.has(a.user_id))
+            : scopeAccs;
+        const grant = wbGrantEarnedByDate(scoped);
         const earnedUids =
           regionAvailable && effectiveRegion !== 'all' && regionUids
             ? uidSet
               ? new Set([...uidSet].filter((u) => regionUids.has(u)))
               : regionUids
             : uidSet;
-        // 该版本下无可用账号映射（如账号清单缺失）→ 无法安全分版本，退回全版本并标注口径，
-        // 不静默按空集处理（否则会显示为 0，同样失真）
         const earnedRegionScoped = earnedUids !== null && earnedUids !== uidSet;
-        const earned = earnedUids
-          ? wbEarnedByDateFiltered(wbSnapshots, wbCheckin, earnedUids)
-          : mergeEarned(wbCheckinEarnedByDate(wbCheckin), wbSnapshotEarnedByDate(wbSnapshots));
-        for (const [d, v] of earned) {
-          if (inRange(d)) consumeEarned(d, v);
+        if (grant.size > 0) {
+          // 权威口径命中：用包归集覆盖，不再叠加推导值（避免重复计数）
+          for (const [d, v] of grant) {
+            if (inRange(d)) consumeEarned(d, v);
+          }
+          earnedSource = 'grant';
+          earnedRegionApplied = earnedRegionScoped;
+        } else {
+          // 包明细缺失（旧缓存 / 接口失败）→ 回落推导口径，并标注
+          const earned = earnedUids
+            ? wbEarnedByDateFiltered(wbSnapshots, wbCheckin, earnedUids)
+            : mergeEarned(wbCheckinEarnedByDate(wbCheckin), wbSnapshotEarnedByDate(wbSnapshots));
+          for (const [d, v] of earned) {
+            if (inRange(d)) consumeEarned(d, v);
+          }
+          earnedSource = 'derived';
+          earnedRegionApplied = earnedRegionScoped;
         }
-        earnedRegionApplied = earnedRegionScoped;
       }
       // Qoder 消耗：本地快照差分日合计（官网无按日明细；模型筛选时不计入，保持口径诚实）
       if (qoderActive && source === 'local' && !modelFilter) {
@@ -347,7 +375,7 @@ export default function CreditsTab({
     for (const v of consumeByDate.values()) consumed += v;
     let earned = 0;
     for (const v of earnedByDate.values()) earned += v;
-    return { consumeByDate, earnedByDate, modelTotals, consumed, earned, sessions, requests, okRequests, errRequests, earnedSkippedDates, earnedRegionApplied };
+    return { consumeByDate, earnedByDate, modelTotals, consumed, earned, sessions, requests, okRequests, errRequests, earnedSkippedDates, earnedRegionApplied, earnedSource };
 
     function consumeEarned(date: string, v: number) {
       earnedByDate.set(date, (earnedByDate.get(date) ?? 0) + v);
@@ -356,7 +384,7 @@ export default function CreditsTab({
   }, [
     isGateway, isGatewayCredits, scope, gateway, traeActive, buddyActive, qoderActive, source, traePoints, buddyPoints, qoderPoints,
     modelFilter, creditsDaily, wbCheckin, wbSnapshots, wbOfficial, qoderSnapshots, qoderCheckin, uidSet, startStr, todayStr,
-    regionAvailable, effectiveRegion, regionUids,
+    regionAvailable, effectiveRegion, regionUids, wbPackages,
   ]);
 
   // ---- 趋势数据（消耗柱 + 获得线；网关源为请求数柱）----
@@ -608,13 +636,15 @@ export default function CreditsTab({
                   value={fmtCredits(agg.earned)}
                   hint={[
                     traeActive && source === 'official' ? 'Trae 积分包归日' : null,
-                    // 获得侧已按版本收敛（经账号清单反查所属版本）；映射不可得时如实退回全版本
+                    // 获得侧口径：包发放日归集为权威口径；回落推导时如实标注
                     buddyActive
-                      ? regionAvailable && effectiveRegion !== 'all'
-                        ? agg.earnedRegionApplied
-                          ? `Buddy 快照 earned（${REGION_LABELS[effectiveRegion]}口径）`
-                          : 'Buddy 快照 earned（全版本合计 · 账号版本映射不可得）'
-                        : 'Buddy 快照 earned（缺失日回退签到口径）'
+                      ? agg.earnedSource === 'grant'
+                        ? `Buddy 积分包发放日归集（${regionAvailable && effectiveRegion !== 'all' ? `${REGION_LABELS[effectiveRegion]}口径` : '全版本'}）`
+                        : regionAvailable && effectiveRegion !== 'all'
+                          ? agg.earnedRegionApplied
+                            ? `Buddy 快照 earned（${REGION_LABELS[effectiveRegion]}口径 · 包明细不可得，回退推导）`
+                            : 'Buddy 快照 earned（全版本合计 · 账号版本映射不可得）'
+                          : 'Buddy 快照 earned（缺失日回退签到口径）'
                       : null,
                     qoderActive ? 'Qoder 快照 earned（签到合计）' : null,
                     // issue #82 问题4-1：分组/账号筛选生效时按账号维度取值并标注口径

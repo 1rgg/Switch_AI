@@ -4,6 +4,7 @@ import type {
   QoderCreditsSnapshot,
   UsageHistoryResult,
   WbCheckinRecord,
+  WbCreditAccount,
   WbCreditsSnapshot,
   WbUsageFallback,
   WbUsageModelPoint,
@@ -197,7 +198,35 @@ export function wbSnapshotEarnedByDate(snaps: WbCreditsSnapshot[]): Map<string, 
   return m;
 }
 
-/** 两张 earned 映射归并：优先取 b（快照口径），缺失日期回落 a（签到口径） */
+/**
+ * Buddy 区间「获得积分」权威口径（Switch AI）：积分包发放日归集。
+ *
+ * 某日获得积分 = 该日**新开**全部积分包的发放面额合计（官方 `CycleStartTime` 归日）。
+ * 为什么优于余额差分（与 Trae 侧 accounts.rs 同款结论）：
+ * - 余额差分会被包过期/消耗波动污染（Trae 实测虚增至 1300）；
+ * - 差分的「恢复账号不参与」守卫会漏算（账号某日中招失败 → 两日都推不出）；
+ * - 差分无法区分「获得」与「消耗回补」，包归集则是**上游下发的发放事实**。
+ *
+ * 覆盖范围诚实说明：包明细只列**当前仍有效/未耗尽**的包，故更早的历史获得
+ * 无法回溯（那些包已不在响应里）——区间越靠近当前越准，这由调用方标注。
+ */
+export function wbGrantEarnedByDate(accounts: WbCreditAccount[] | null | undefined): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const a of accounts ?? []) {
+    for (const p of a.packages ?? []) {
+      const d = p.grant_date;
+      if (!d) continue;
+      const amt = p.grant_amount ?? 0;
+      if (amt <= 0) continue;
+      m.set(d, (m.get(d) ?? 0) + amt);
+    }
+  }
+  return m;
+}
+
+/**
+ * 两张 earned 映射归并：优先取 b（快照口径），缺失日期回落 a（签到口径）
+ */
 export function mergeEarned(
   fallback: Map<string, number>,
   preferred: Map<string, number>,

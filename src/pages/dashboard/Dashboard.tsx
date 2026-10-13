@@ -872,6 +872,7 @@ export default function CreditsDashboard({ platform }: { platform: 'trae' | 'bud
           wbFallback={wbFallback}
           wbSnapshots={wbSnapshots}
           wbCheckin={wbCheckin}
+          wbPackages={visibleWbCredits?.accounts}
           qoderSnapshots={qoderSnapshots}
           qoderCheckin={qoderCheckin}
           gateway={gateway}
