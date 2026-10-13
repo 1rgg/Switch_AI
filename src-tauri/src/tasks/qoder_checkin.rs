@@ -241,13 +241,55 @@ fn filter_claimable(campaigns: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// 从 `campaignKey` 提取活动所属日期段（`act-YYYYMMDD-xxx` → `YYYYMMDD`）。
+///
+/// 官方每日活动 key 实测形态：`act-20261013-250`（2026-10-13 当日活动）。
+/// 长度/字符双校验，非法形态返回 None（不猜）。
+fn campaign_key_date(key: &str) -> Option<String> {
+    let date = key.strip_prefix("act-")?.split('-').next()?;
+    (date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit())).then(|| date.to_string())
+}
+
+/// 当日日期串 `YYYYMMDD`（**CST/UTC+8**，与官方「每日 10:00（UTC+8）刷新」对齐）。
+fn cst_today_yyyymmdd(now_secs: i64) -> String {
+    chrono::DateTime::from_timestamp(now_secs + 8 * 3600, 0)
+        .map(|d| d.format("%Y%m%d").to_string())
+        .unwrap_or_default()
+}
+
+/// 活动是否属于**当前这一轮**（当日窗口）。
+///
+/// 主判据 `startAt/endAt` 窗口；**字段缺失时回退到 `campaignKey` 的日期段**
+/// （`act-YYYYMMDD-*` == 当日 CST）。
+///
+/// 为什么必须有回退（2026-10-13 实机根因）：官方在每日 10:00 刷新后的**窗口期**
+/// 会先下发活动条目、稍后才补齐 `startAt/endAt`。原实现「字段缺失即判不在窗口」，
+/// 于是刷新后不久运行的定时签到（每日 10:15）会：① 学不到当日活动 id
+/// （`learn_daily_campaign_ids` 同款窗口判据）→ 盲发兜底 → ② 已领活动也判不出
+/// （`daily_credits_claimed_in_list` 同款）→ 走盲发分支 → 硬编码兜底 id 早已过期
+/// → 409 CAMPAIGN_NOT_ACTIVE → 全轮报失败并指数退避重试（实机日志：10-10 起每日
+/// 全轮「盲发失败 409」）。`campaignKey` 自带日期段，是比窗口字段更可靠的
+/// 「当日」判据——且同样不会把昨日已领误判为今日（昨日 key 的日期段 ≠ 今日）。
+fn campaign_in_current_round(c: &Value, now_secs: i64) -> bool {
+    let start = c.get("startAt").and_then(|v| num_or_none(Some(v))).map(|v| v as i64);
+    let end = c.get("endAt").and_then(|v| num_or_none(Some(v))).map(|v| v as i64);
+    if let (Some(s), Some(e)) = (start, end) {
+        return now_secs >= s && now_secs <= e;
+    }
+    let key = s_of(fs_utils::dig(c, &["campaignKey", "campaign_key"]));
+    campaign_key_date(&key)
+        .map(|d| d == cst_today_yyyymmdd(now_secs))
+        .unwrap_or(false)
+}
+
 /// 「每日 100 Credits」已领判定（纯函数，**从严**口径——宁 fail 不假 already）：
 /// 列表中存在同时满足以下**全部**条件的条目才算已领：
 /// - claimStatus == CLAIMED（大小写宽容）
 /// - actionType == CLAIM_BENEFIT（排除 bogo 类 VIEW_DETAILS「只看不领」活动）
 /// - benefit.kind == CREDITS（每日 100 Credits 活动的奖励类型）
-/// - startAt <= now <= endAt（当日窗口内；字段缺失视为不命中——昨日的
-///   CLAIMED grant 无条件展示在列表里，没有窗口校验会把昨日已领误判今日已领）
+/// - 属于当前这一轮（[`campaign_in_current_round`]：窗口字段缺失时回退
+///   campaignKey 日期段——昨日的 CLAIMED grant 无条件展示在列表里，没有
+///   当日校验会把昨日已领误判今日已领）
 fn daily_credits_claimed_in_list(campaigns: &[Value], now_secs: i64) -> bool {
     campaigns.iter().any(|c| {
         let claimed =
@@ -259,13 +301,7 @@ fn daily_credits_claimed_in_list(campaigns: &[Value], now_secs: i64) -> bool {
             .and_then(|x| x.get("kind"))
             .map(|v| s_of(Some(v)).to_ascii_uppercase() == "CREDITS")
             .unwrap_or(false);
-        let start = c.get("startAt").and_then(|v| num_or_none(Some(v))).map(|v| v as i64);
-        let end = c.get("endAt").and_then(|v| num_or_none(Some(v))).map(|v| v as i64);
-        let in_window = match (start, end) {
-            (Some(s), Some(e)) => now_secs >= s && now_secs <= e,
-            _ => false,
-        };
-        claimed && action && credits && in_window
+        claimed && action && credits && campaign_in_current_round(c, now_secs)
     })
 }
 
@@ -410,6 +446,29 @@ fn claim_one(
         }
         return ("success".into(), "领取成功".into(), reward);
     }
+    // 409：上游「已领取」幂等形态（对齐参考实现 qoder2api-hub 的
+    // `if "ALREADY_CLAIMED" in body → already` 归一化）。实测错误码有两族：
+    // `AlreadyExists`（campaign 账本已有当日记录，2026-10-13 实测）与
+    // `ALREADY_CLAIMED` / `REPLAYED`——都代表「今日确已领」，**不能当失败**，
+    // 否则触发全天指数退避无效重试（并让 UI 误报「签到失败」）。
+    if status == 409 {
+        let blob = body
+            .as_ref()
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| raw.clone())
+            .to_ascii_uppercase();
+        if blob.contains("ALREADYEXISTS")
+            || blob.contains("ALREADY_CLAIMED")
+            || blob.contains("ALREADY CLAIMED")
+            || blob.contains("REPLAYED")
+        {
+            return (
+                "already".into(),
+                "今日已领取（上游幂等确认）".into(),
+                known_reward,
+            );
+        }
+    }
     let msg = body
         .as_ref()
         .and_then(|b| fs_utils::dig(b, &["message", "msg"]))
@@ -444,9 +503,16 @@ fn claim_one(
 // 重学覆盖（重学候选优先于本表），本表仅作列表结构变更致重学失效时的人工兜底。
 /// 已知每日活动常量表：(campaignId, 展示名)。campaignId 仅允许 [A-Za-z0-9_-]
 ///（路径安全白名单，known_daily_fallback 内强制校验）。
-const KNOWN_DAILY_CAMPAIGNS: &[(&str, &str)] = &[
-    ("01a0f1cd-945c-7217-b373-f62e70da792d", "每日领 100 Credits"),
-];
+///
+/// **2026-10-13 起刻意清空**：官方每日活动的 campaignId **每天轮换**
+/// （UUIDv7 前缀 + 随机后缀，`act-YYYYMMDD-*` 单日窗口），硬编码任何具体 id 都会
+/// 在次日变成死值——盲发死 id 必然得到 409 CAMPAIGN_NOT_ACTIVE，制造「全轮失败」
+/// 并触发指数退避重试（实机 10-10 ~ 10-13 连续四天全轮失败的直接成因之一：
+/// 曾硬编码 `01a0f1cd-…`（2026-10-07 当日活动），此后每日盲发必 409）。
+/// 当日 id 一律由 [`learn_daily_campaign_ids`] 从活动列表**实时学习**（列表条目
+/// 本身始终返回——探针实测），本表仅保留为「列表结构变更致学习失效」时的人工
+/// 兜底位，**请勿再填入会过期的具体 id**。
+const KNOWN_DAILY_CAMPAIGNS: &[(&str, &str)] = &[];
 
 /// 从活动列表学习当日「每日 100 Credits」活动 id（issue #66 健壮性①：每日轮换
 /// 的 campaignId 硬编码必然过期，逐日人工抓包更新不可持续）。
@@ -457,7 +523,8 @@ const KNOWN_DAILY_CAMPAIGNS: &[(&str, &str)] = &[
 ///
 /// 口径（对齐 daily_credits_claimed_in_list 但**不要求 claimStatus**——
 /// CLAIMED/CLAIMABLE/未领均为有效候选，保证零 CLAIMABLE 时仍能学到 id）：
-/// actionType == CLAIM_BENEFIT && benefit.kind == CREDITS && startAt <= now <= endAt。
+/// actionType == CLAIM_BENEFIT && benefit.kind == CREDITS && 属于当前这一轮
+/// （窗口字段缺失时回退 `campaignKey` 日期段，见 [`campaign_in_current_round`]）。
 /// id 过路径白名单 [A-Za-z0-9_-]（非法丢弃）；展示名取 name/title/campaignName/
 /// campaign_name 候选键，缺失回退 id 前 8 位。
 fn learn_daily_campaign_ids(campaigns: &[Value], now_secs: i64) -> Vec<(String, String)> {
@@ -469,13 +536,7 @@ fn learn_daily_campaign_ids(campaigns: &[Value], now_secs: i64) -> Vec<(String, 
             .and_then(|x| x.get("kind"))
             .map(|v| s_of(Some(v)).to_ascii_uppercase() == "CREDITS")
             .unwrap_or(false);
-        let start = c.get("startAt").and_then(|v| num_or_none(Some(v))).map(|v| v as i64);
-        let end = c.get("endAt").and_then(|v| num_or_none(Some(v))).map(|v| v as i64);
-        let in_window = match (start, end) {
-            (Some(s), Some(e)) => now_secs >= s && now_secs <= e,
-            _ => false,
-        };
-        if !(action && credits && in_window) {
+        if !(action && credits && campaign_in_current_round(c, now_secs)) {
             continue;
         }
         let cid = s_of(fs_utils::dig(c, &["campaignId", "campaign_id"]));
@@ -635,6 +696,15 @@ fn known_daily_fallback(
             candidates.push((cid.to_string(), cname.to_string()));
         }
     }
+    // 无任何候选（当日活动尚未出现在列表 + 硬编码兜底表已刻意清空）：如实说明
+    // 真实原因，而不是报一句无从下手的「表为空」。仍归 Failed——保留调度器的
+    // 指数退避重试（活动在刷新窗口期过后出现时，重试轮可正常领取/判已领）。
+    if candidates.is_empty() {
+        return FallbackOutcome::Failed(
+            "当日活动未出现在活动列表（未能重学 id，本轮跳过；多为每日 10:00 刷新窗口期）"
+                .into(),
+        );
+    }
     let mut messages: Vec<String> = Vec::new();
     let mut fail_parts: Vec<String> = Vec::new();
     let mut stale_parts: Vec<String> = Vec::new();
@@ -683,6 +753,19 @@ fn known_daily_fallback(
                 any_replay = true;
             }
             BlindStep::Failed(code) => {
+                // 409 的另一族形态：上游「已领」幂等（errorCode = AlreadyExists /
+                // ALREADY_CLAIMED / REPLAYED）。与 CAMPAIGN_NOT_ACTIVE（候选 id
+                // 过期）同为 409，必须按 body 区分——前者代表「今日确已领」，
+                // 归 already（幂等回放）而非失败，否则误报并触发无效重试。
+                let blob = raw.to_ascii_uppercase();
+                if code == 409
+                    && (blob.contains("ALREADYEXISTS")
+                        || blob.contains("ALREADY_CLAIMED")
+                        || blob.contains("REPLAYED"))
+                {
+                    any_replay = true;
+                    continue;
+                }
                 let reason = describe_blind_failure(code, claimed.as_deref(), &raw);
                 // 409 CAMPAIGN_NOT_ACTIVE = 候选 id 过期（活动每日轮换）→ 归
                 // stale_parts 不掩码新鲜成功/回放；其余真实失败照旧掩码。
@@ -776,6 +859,28 @@ fn process_account(
             );
             let claimable = filter_claimable(&campaigns);
             if claimable.is_empty() {
+                // 诊断（2026-10-13 排障闭环）：零 CLAIMABLE 时把列表现场写入 app.log。
+                // 「工具看不到活动」究竟是无活动、还是活动未被判为「当日」，此前只能从
+                // 日志里那句笼统的「盲发失败」猜；现在一行定位。
+                let now_diag = chrono::Utc::now().timestamp();
+                let round_credits = campaigns
+                    .iter()
+                    .filter(|c| {
+                        s_of(c.get("actionType")).to_ascii_uppercase() == "CLAIM_BENEFIT"
+                            && benefit_is_credits(c)
+                            && campaign_in_current_round(c, now_diag)
+                    })
+                    .count();
+                crate::fs_utils::app_log(
+                    &state.data_dir,
+                    &format!(
+                        "qoder checkin: {aid} 列表 {} 条 / 零 CLAIMABLE；当日 CREDITS 活动 {} 条、已领判定 {}、本轮重学 id {} 个",
+                        campaigns.len(),
+                        round_credits,
+                        daily_credits_claimed_in_list(&campaigns, now_diag),
+                        learned.len(),
+                    ),
+                );
                 // 列表零 CLAIMABLE：campaigns 列表对工具请求形态按投放过滤
                 // CLAIMABLE 条目（已领 grant 无条件展示）。两步定真话：
                 // ① 先查列表内当日「每日 100 Credits」CLAIMED grant（服务端对
@@ -1197,9 +1302,17 @@ mod tests {
 
     /// 兜底常量表 campaignId 路径安全（与 claim_one 同白名单 [A-Za-z0-9_-]）：
     /// 非法字符会改变 claim URL 路径语义，must 在表内即被拦下
+    /// KNOWN_DAILY_CAMPAIGNS **刻意为空**（2026-10-13）：每日活动 id 每天轮换，
+    /// 硬编码必然过期 → 盲发死 id 得到 409 CAMPAIGN_NOT_ACTIVE → 制造「全轮失败 +
+    /// 全天指数退避重试」（实机连续四天）。当日 id 一律由 learn_daily_campaign_ids
+    /// 从活动列表实时学习。本断言堵死硬编码回归。
     #[test]
     fn known_daily_campaigns_ids_path_safe() {
-        assert!(!KNOWN_DAILY_CAMPAIGNS.is_empty());
+        assert!(
+            KNOWN_DAILY_CAMPAIGNS.is_empty(),
+            "勿向 KNOWN_DAILY_CAMPAIGNS 硬编码每日活动 id——每日轮换，必然过期"
+        );
+        // 若将来确需保留人工兜底位，下列路径安全断言仍然生效
         for (cid, cname) in KNOWN_DAILY_CAMPAIGNS {
             assert!(
                 !cid.is_empty()
@@ -1210,6 +1323,90 @@ mod tests {
             );
             assert!(!cname.is_empty(), "KNOWN_DAILY_CAMPAIGNS 条目缺展示名：{cid}");
         }
+    }
+
+    /// campaignKey 日期段解析：官方 `act-YYYYMMDD-xxx` 形态；非法形态返回 None
+    #[test]
+    fn campaign_key_date_parses_official_shape() {
+        assert_eq!(
+            campaign_key_date("act-20261013-250").as_deref(),
+            Some("20261013")
+        );
+        assert_eq!(
+            campaign_key_date("act-20260930-664").as_deref(),
+            Some("20260930")
+        );
+        // 非 act- 前缀 / 日期段非 8 位 / 非数字 / 缺段 → None（不猜）
+        assert!(campaign_key_date("legacy").is_none());
+        assert!(campaign_key_date("act-2026101-250").is_none());
+        assert!(campaign_key_date("act-abcdefgh-250").is_none());
+        assert!(campaign_key_date("act-").is_none());
+        assert!(campaign_key_date("").is_none());
+    }
+
+    /// 当日判定的窗口回退（2026-10-13 实机根因回归钉）：官方在每日 10:00 刷新
+    /// 窗口期**先下发活动条目、后补 startAt/endAt**。旧实现「字段缺失即判不在
+    /// 窗口」，会让 10:15 的定时签到既学不到当日 id、也判不出已领，退化到盲发兜底。
+    #[test]
+    fn campaign_round_falls_back_to_key_date_without_window_fields() {
+        // 2026-10-13 10:30 (UTC+8) == 1_791_858_600
+        let now = 1_791_858_600i64;
+        // 有窗口字段：走窗口判定
+        let win = json!({"startAt": 1_791_856_800i64, "endAt": 1_791_943_140i64});
+        assert!(campaign_in_current_round(&win, now));
+        let out_of_win = json!({
+            "startAt": 1_791_856_800i64 - 86_400,
+            "endAt": 1_791_943_140i64 - 86_400,
+        });
+        assert!(!campaign_in_current_round(&out_of_win, now));
+        // 无窗口字段：回退 campaignKey 日期段（当日命中、昨日不命中）
+        assert!(campaign_in_current_round(
+            &json!({"campaignKey": "act-20261013-250"}),
+            now
+        ));
+        assert!(!campaign_in_current_round(
+            &json!({"campaignKey": "act-20261012-999"}),
+            now
+        ));
+        // 无窗口字段也无 key → 不命中（从严，不猜）
+        assert!(!campaign_in_current_round(&json!({}), now));
+    }
+
+    /// 「每日 100 Credits」在**无窗口字段**时仍能被识别为当日已领（回归钉）：
+    /// 旧实现在此形态下判「未领」→ 走盲发 → 409 误报失败
+    #[test]
+    fn daily_credits_claimed_without_window_fields_uses_key_date() {
+        let now = 1_791_858_600i64; // 2026-10-13 10:30 (UTC+8)
+        let today = json!({
+            "campaignKey": "act-20261013-250",
+            "claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT",
+            "benefit": {"kind": "CREDITS", "amount": 100},
+        });
+        assert!(daily_credits_claimed_in_list(&[today], now));
+        let yesterday = json!({
+            "campaignKey": "act-20261012-999",
+            "claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT",
+            "benefit": {"kind": "CREDITS", "amount": 100},
+        });
+        assert!(
+            !daily_credits_claimed_in_list(&[yesterday], now),
+            "昨日已领不得误判为今日已领"
+        );
+    }
+
+    /// 重学习在**无窗口字段**时同样回退 key 日期段（回归钉）——否则零 CLAIMABLE
+    /// 视野下学不到当日 id，只能退化到（已清空的）硬编码兜底
+    #[test]
+    fn learn_daily_ids_without_window_fields_uses_key_date() {
+        let now = 1_791_858_600i64;
+        let c = json!({
+            "campaignId": "01a130e9-f234-7511-8499-d79b4ef26ec4",
+            "campaignKey": "act-20261013-250",
+            "actionType": "CLAIM_BENEFIT", "benefit": {"kind": "CREDITS"},
+        });
+        let out = learn_daily_campaign_ids(&[c], now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "01a130e9-f234-7511-8499-d79b4ef26ec4");
     }
 
     /// 「每日 100 Credits」已领判定（从严口径）：CLAIMED+CLAIM_BENEFIT+CREDITS+
@@ -1241,7 +1438,7 @@ mod tests {
                                "benefit": {"kind": "CREDITS"},
                                "startAt": 1_791_338_400, "endAt": 1_791_424_740});
         assert!(!daily_credits_claimed_in_list(&[claimable], now));
-        // 字段缺失从严（无 benefit.kind / 无窗口）→ 不命中
+        // 无 benefit.kind / 无窗口字段 / 无 campaignKey → 不命中（无任何当日判据时不猜）
         let bare = json!({"claimStatus": "CLAIMED", "actionType": "CLAIM_BENEFIT"});
         assert!(!daily_credits_claimed_in_list(&[bare], now));
         // 大小写宽容 + snake_case 候选键（claimStatus 口径与 filter_claimable 同构）
@@ -1478,13 +1675,16 @@ mod tests {
                     Some(arr) if !arr.is_empty() => {
                         for c in arr {
                             println!(
-                                "  campaign {} key={} action={} status={} amount={:?}",
+                                "  campaign {} key={} action={} status={} amount={:?} startAt={:?} endAt={:?}",
                                 c.get("campaignId").and_then(Value::as_str).unwrap_or("?"),
                                 c.get("campaignKey").and_then(Value::as_str).unwrap_or("?"),
                                 c.get("actionType").and_then(Value::as_str).unwrap_or("?"),
                                 c.get("claimStatus").and_then(Value::as_str).unwrap_or("?"),
                                 c.get("benefit").and_then(|x| x.get("amount")),
+                                c.get("startAt"),
+                                c.get("endAt"),
                             );
+                            println!("    raw={}", c);
                         }
                     }
                     Some(_) => println!("  <campaigns 空数组>"),
@@ -1527,28 +1727,54 @@ mod tests {
             let (st, body, raw) =
                 qoder_common::get_json(&agent, &urls.campaigns, &qoder_common::build_auth_headers(&creds));
             print_campaigns_view("A 工具现状头", st, body.as_ref(), &raw);
+            if let Some(arr) = body
+                .as_ref()
+                .and_then(|b| b.get("campaigns"))
+                .and_then(Value::as_array)
+            {
+                let now = chrono::Utc::now().timestamp();
+                println!("  [now_secs] {now}");
+                println!("  [filter_claimable] len={}", filter_claimable(arr).len());
+                println!("  [learned] {:?}", learn_daily_campaign_ids(arr, now));
+                println!("  [today_claimed] {}", daily_credits_claimed_in_list(arr, now));
+            }
             // B 组：补齐客户端形态头
             let full = probe_full_client_headers(&qoder_common::build_auth_headers(&creds));
             let (st2, body2, raw2) = qoder_common::get_json(&agent, &urls.campaigns, &full);
             print_campaigns_view("B 补齐客户端头", st2, body2.as_ref(), &raw2);
-            // C 组：盲发幂等 claim 实测（campaignId 取 KNOWN_DAILY_CAMPAIGNS 表首条
-            // ——每日活动 ID 每日轮换，硬编码会过期，表随当日活动更新）——
+            // C 组：盲发幂等 claim 实测——campaignId 取**当日从列表实时学习**到的 id
+            // （硬编码表已刻意清空：每日活动 id 每日轮换，硬编码必然过期）。
             // 已领账号应回放 replayed:true；列表不可见账号若 200+CLAIMED 证明 claim
-            // 不受列表过滤约束（兜底直领可行），4xx 则锁定错误体形态
-            let (cid, _cname) = KNOWN_DAILY_CAMPAIGNS[0];
-            let c_url = format!(
-                "{}/sash/api/v1/me/campaigns/{cid}/claim",
-                qoder_common::OPEN_API_BASE
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1500));
-            let (st3, body3, raw3) =
-                post_empty(&agent, &c_url, &qoder_common::build_auth_headers(&creds));
-            println!(
-                "[C 盲发claim {cid}] HTTP {st3} body={}",
-                body3.as_ref().map(|b| b.to_string()).unwrap_or_else(|| {
-                    raw3.chars().take(300).collect()
-                })
-            );
+            // 不受列表过滤约束（兜底直领可行），4xx 则锁定错误体形态。
+            let learned_today = body
+                .as_ref()
+                .and_then(|b| b.get("campaigns"))
+                .and_then(Value::as_array)
+                .map(|arr| learn_daily_campaign_ids(arr, chrono::Utc::now().timestamp()))
+                .unwrap_or_default();
+            match learned_today.first() {
+                Some((cid, _cname)) => {
+                    let c_url = format!(
+                        "{}/sash/api/v1/me/campaigns/{cid}/claim",
+                        qoder_common::OPEN_API_BASE
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let (st3, body3, raw3) =
+                        post_empty(&agent, &c_url, &qoder_common::build_auth_headers(&creds));
+                    println!(
+                        "[C 盲发claim {cid}] HTTP {st3} body={}",
+                        body3
+                            .as_ref()
+                            .map(|b| b.to_string())
+                            .unwrap_or_else(|| raw3.chars().take(300).collect())
+                    );
+                }
+                None => println!("[C 盲发claim] 跳过：当日活动未从列表学到 id"),
+            }
+            // D 组：完整签到流程（process_account）——在当前时刻复算工具判定
+            let mut learned2: Vec<(String, String)> = Vec::new();
+            let ev = process_account(&state, &agent, a, &QoderCheckinOpts::daily(), &mut learned2);
+            println!("[D process_account] {ev}");
         }
     }
 }
