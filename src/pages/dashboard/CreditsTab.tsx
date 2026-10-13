@@ -175,6 +175,18 @@ export default function CreditsTab({
     if (effectiveRegion === 'all') return wbOfficial?.request_count_total ?? 0;
     return wbOfficial?.summary_by_region?.[effectiveRegion]?.request_count_total ?? 0;
   }, [wbOfficial, effectiveRegion]);
+  /**
+   * 所选版本的账号 uid 集（Switch AI）：官方用量的账号清单带 region，且与后端分桶
+   * 同源（resolve_region）。用于把「获得积分」侧（快照 / 签到日志，无区域字段）
+   * 按版本收敛——否则切版本时获得积分恒定不变（消耗按版本、获得全版本的口径错误）。
+   * null = 无法建立映射（账号清单缺失 / 合并视图），调用方退回全版本口径。
+   */
+  const regionUids = useMemo<Set<string> | null>(() => {
+    if (!regionAvailable || effectiveRegion === 'all') return null;
+    const accs = wbOfficial?.accounts;
+    if (!accs || accs.length === 0) return null;
+    return new Set(accs.filter((a) => a.region === effectiveRegion).map((a) => a.account_id));
+  }, [regionAvailable, effectiveRegion, wbOfficial]);
   // Qoder 本地快照差分（官网无按日明细，本地为唯一消耗来源；快照无模型粒度）
   const qoderPoints = useMemo(
     () => (qoderActive && source === 'local' ? qoderSnapshotsToPoints(qoderSnapshots) : []),
@@ -215,6 +227,8 @@ export default function CreditsTab({
     let errRequests = 0;
     // Trae 账号筛选时，老快照行无 accounts 明细被跳过的天数（KPI hint 如实标注）
     let earnedSkippedDates = 0;
+    // 获得积分是否真的按版本收敛成功（供 KPI 口径标注：失败时如实说明仍为全版本）
+    let earnedRegionApplied = false;
     const addConsume = (date: string, v: number) => {
       consumeByDate.set(date, (consumeByDate.get(date) ?? 0) + v);
     };
@@ -292,12 +306,27 @@ export default function CreditsTab({
       }
       // Buddy 获得（方案 B 快照 earned 优先，缺失日回退方案 A 签到）
       if (buddyActive) {
-        const earned = uidSet
-          ? wbEarnedByDateFiltered(wbSnapshots, wbCheckin, uidSet)
+        // 版本维度（Switch AI）：快照 / 签到日志本身不带区域字段，但其 `user_id` 可经
+        // 官方用量的账号清单（accounts[].region，与后端分桶同源）反查所属版本。
+        // 此前「获得积分」完全无视版本选择 → 切国内版/国际版该数字**一模一样**
+        // （截图即为此问题），是口径错误：消耗按版本、获得却全版本。
+        // 现按与消耗**同一版本口径**收敛：该版本账号集 ∩ 账号筛选集。
+        const earnedUids =
+          regionAvailable && effectiveRegion !== 'all' && regionUids
+            ? uidSet
+              ? new Set([...uidSet].filter((u) => regionUids.has(u)))
+              : regionUids
+            : uidSet;
+        // 该版本下无可用账号映射（如账号清单缺失）→ 无法安全分版本，退回全版本并标注口径，
+        // 不静默按空集处理（否则会显示为 0，同样失真）
+        const earnedRegionScoped = earnedUids !== null && earnedUids !== uidSet;
+        const earned = earnedUids
+          ? wbEarnedByDateFiltered(wbSnapshots, wbCheckin, earnedUids)
           : mergeEarned(wbCheckinEarnedByDate(wbCheckin), wbSnapshotEarnedByDate(wbSnapshots));
         for (const [d, v] of earned) {
           if (inRange(d)) consumeEarned(d, v);
         }
+        earnedRegionApplied = earnedRegionScoped;
       }
       // Qoder 消耗：本地快照差分日合计（官网无按日明细；模型筛选时不计入，保持口径诚实）
       if (qoderActive && source === 'local' && !modelFilter) {
@@ -318,7 +347,7 @@ export default function CreditsTab({
     for (const v of consumeByDate.values()) consumed += v;
     let earned = 0;
     for (const v of earnedByDate.values()) earned += v;
-    return { consumeByDate, earnedByDate, modelTotals, consumed, earned, sessions, requests, okRequests, errRequests, earnedSkippedDates };
+    return { consumeByDate, earnedByDate, modelTotals, consumed, earned, sessions, requests, okRequests, errRequests, earnedSkippedDates, earnedRegionApplied };
 
     function consumeEarned(date: string, v: number) {
       earnedByDate.set(date, (earnedByDate.get(date) ?? 0) + v);
@@ -327,6 +356,7 @@ export default function CreditsTab({
   }, [
     isGateway, isGatewayCredits, scope, gateway, traeActive, buddyActive, qoderActive, source, traePoints, buddyPoints, qoderPoints,
     modelFilter, creditsDaily, wbCheckin, wbSnapshots, wbOfficial, qoderSnapshots, qoderCheckin, uidSet, startStr, todayStr,
+    regionAvailable, effectiveRegion, regionUids,
   ]);
 
   // ---- 趋势数据（消耗柱 + 获得线；网关源为请求数柱）----
@@ -471,7 +501,14 @@ export default function CreditsTab({
           <>
             <Badge tone="slate">{SOURCE_LABELS[source]}源</Badge>
             {regionAvailable && effectiveRegion !== 'all' && (
-              <Badge tone="violet" title="消耗侧按所选版本统计；获得侧（签到/快照）无版本维度，仍为全版本合计。">
+              <Badge
+                tone="violet"
+                title={
+                  agg.earnedRegionApplied
+                    ? '消耗与获得两侧均按所选版本统计（获得侧经账号清单反查所属版本）。'
+                    : '消耗侧按所选版本统计；获得侧因账号版本映射不可得，仍为全版本合计。'
+                }
+              >
                 {REGION_LABELS[effectiveRegion]}口径
               </Badge>
             )}
@@ -571,11 +608,12 @@ export default function CreditsTab({
                   value={fmtCredits(agg.earned)}
                   hint={[
                     traeActive && source === 'official' ? 'Trae 积分包归日' : null,
-                    // 获得侧（签到/快照）无版本维度：切版本时明确标注仍为全版本合计，
-                    // 避免「净获得」被误读成该版本口径（口径诚实 §8）
+                    // 获得侧已按版本收敛（经账号清单反查所属版本）；映射不可得时如实退回全版本
                     buddyActive
                       ? regionAvailable && effectiveRegion !== 'all'
-                        ? 'Buddy 快照 earned（全版本合计 · 签到无版本维度）'
+                        ? agg.earnedRegionApplied
+                          ? `Buddy 快照 earned（${REGION_LABELS[effectiveRegion]}口径）`
+                          : 'Buddy 快照 earned（全版本合计 · 账号版本映射不可得）'
                         : 'Buddy 快照 earned（缺失日回退签到口径）'
                       : null,
                     qoderActive ? 'Qoder 快照 earned（签到合计）' : null,
