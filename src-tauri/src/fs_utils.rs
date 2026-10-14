@@ -29,7 +29,7 @@ pub fn read_json<T: serde::de::DeserializeOwned + Default>(path: &Path) -> T {
 /// 无 data_dir 入参场景的兜底 app_log：fs_utils 多数调用方只持文件路径，按
 /// state.rs 同源规则（%APPDATA%\AIWorkAssistant）定位数据目录；解析失败静默
 /// 放弃（日志失败不影响读取主流程）。
-fn app_log_default(msg: &str) {
+pub(crate) fn app_log_default(msg: &str) {
     if let Ok(appdata) = std::env::var("APPDATA") {
         app_log(&PathBuf::from(appdata).join(crate::state::DATA_DIR_NAME), msg);
     }

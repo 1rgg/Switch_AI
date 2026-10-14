@@ -6,6 +6,32 @@
 
 ---
 
+## [Switch AI 3.9.4] · 修复 Qoder 自动签到失败（客户端装在非默认目录时零可领活动）
+
+> 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。
+
+### 修复
+
+- **Qoder 每日签到恒失败、提示零 CLAIMABLE**：当 Qoder CN 客户端安装在**自定义盘或机器级
+  目录**（例如 `D:\Program Files\Qoder CN`）时，程序此前只在
+  `%LOCALAPPDATA%\Programs\Qoder CN` 一处查找设备身份工具 `runtime-info.exe`；找不到便
+  静默改用伪造的设备指纹，而服务端按设备指纹分桶，伪造值会被归入独立分组，导致活动接口
+  **不再下发设备定向活动**（每日 100 Credits）——表现为列表里一条可领项都没有、重新学习
+  当日活动 id 也是 0，最终全部账号签到失败并在调度器里反复重试。
+  现安装根候选扩为三类：默认 per-user 目录 → 各级 `Program Files`
+  （`ProgramFiles` / `ProgramFiles(x86)` / `ProgramW6432`）→ C~G 盘符下的
+  `Program Files\Qoder CN` 等常见布局，逐个探测 `resources\umid\runtime-info.exe` 取首个命中。
+- **设备身份解析失败不再静默**：工具未找到 / 执行失败 / 非零退出 / 输出无法解析四种情况，
+  现均写入 `logs/app.log`，一眼可辨是「工具没找到」还是「服务端确实无活动」。
+
+### 说明
+
+- 若本机**未安装** Qoder CN 客户端，或客户端安装目录不在上述候选范围内，签到仍会退回
+  伪造指纹而失败（日志会给出明确提示）。可在
+  [Issues](https://github.com/1rgg/Switch_AI/issues) 反馈你的自定义安装路径。
+
+---
+
 ## [Switch AI 3.9.3] · WorkBuddy 每日活跃上报（限时活动，仅国际版）+ 回填上游 3.7.10/3.7.11 修复批
 
 > 本条目属于 [Switch AI](https://github.com/1rgg/Switch_AI) 二次开发分支。

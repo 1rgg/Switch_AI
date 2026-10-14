@@ -664,23 +664,67 @@ pub struct NativeRiskIdentity {
     pub machine_code: String,
 }
 
-/// Qoder 主客户端（"Qoder CN" 0.4.3，Electron，userData=com.qodercn.app.stable）
-/// 随包分发的原生身份工具：`resources\umid\runtime-info.exe`（配 sgsdk.dll）。
-/// 客户端桥以 `spawn(exe, [env, "--account-stdin"])` + stdin `{account}.` 调用；
-/// 实测无参直跑同样输出真值且与账号参数无关（机器恒定，exit 0 瞬时返回）。
-fn runtime_info_exe_path() -> Option<std::path::PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")?;
-    let p = std::path::Path::new(&local)
-        .join("Programs")
-        .join("Qoder CN")
-        .join("resources")
-        .join("umid")
-        .join("runtime-info.exe");
-    if p.is_file() {
-        Some(p)
-    } else {
-        None
+/// Qoder CN 安装根候选（原生身份工具 `resources\umid` 的父目录）。
+///
+/// 工具本体：Qoder 主客户端（"Qoder CN" 0.4.3，Electron，
+/// userData=com.qodercn.app.stable）随包分发 `resources\umid\runtime-info.exe`
+/// （配 sgsdk.dll）；客户端桥以 `spawn(exe, [env, "--account-stdin"])` +
+/// stdin `{account}.` 调用，实测无参直跑同样输出真值且与账号参数无关
+/// （机器恒定，exit 0 瞬时返回）。
+///
+/// **2026-10-14 修（本机实测根因）**：原实现只认 `%LOCALAPPDATA%\Programs\Qoder CN`
+/// 这一处 Electron 默认 per-user 布局。Qoder CN 装到自定义盘/机器级目录时该路径
+/// 不存在（本机实测 `D:\Program Files\Qoder CN`）→ [`resolve_native_risk_identity`]
+/// 恒返回 None → 全部请求退化为 machine_id 派生指纹 → 服务端按设备指纹分桶，
+/// 派生值被分入独立桶 → campaigns 列表**静默丢掉设备定向活动**（「每日 100
+/// Credits」），实机日志表现即「列表 N 条 / 零 CLAIMABLE；当日 CREDITS 活动 0 条、
+/// 本轮重学 id 0 个」→ 盲发兜底无候选（硬编码表已刻意清空）→ 全轮失败。
+/// 故候选扩为：LOCALAPPDATA 默认布局（保留优先）+ 各级 Program Files + 常见
+/// 自定义盘根（与 `switcher::profile` 的 `D:\Programs\...` 候选惯例一致）。
+fn runtime_info_base_candidates() -> Vec<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    fn push_unique(out: &mut Vec<PathBuf>, p: PathBuf) {
+        if !out.iter().any(|e| e == &p) {
+            out.push(p);
+        }
     }
+    let mut out: Vec<PathBuf> = Vec::new();
+    // ① Electron 默认 per-user 安装（原唯一路径，保持最高优先）
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        push_unique(&mut out, Path::new(&local).join("Programs").join("Qoder CN"));
+    }
+    // ② 机器级 Program Files（含 32 位与 WOW64 环境变量形态）
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+        if let Some(pf) = std::env::var_os(var) {
+            push_unique(&mut out, Path::new(&pf).join("Qoder CN"));
+        }
+    }
+    // ③ 自定义盘根（本机命中 D:\Program Files\Qoder CN）：Program Files / 裸目录双形态。
+    //    仅探测 C~G 固定盘符，OnceLock 缓存使本枚举每进程至多一次
+    for drive in ["C", "D", "E", "F", "G"] {
+        let root = PathBuf::from(format!("{drive}:\\"));
+        if !root.exists() {
+            continue;
+        }
+        push_unique(&mut out, root.join("Program Files").join("Qoder CN"));
+        push_unique(&mut out, root.join("Program Files (x86)").join("Qoder CN"));
+        push_unique(&mut out, root.join("Programs").join("Qoder CN"));
+        push_unique(&mut out, root.join("Qoder CN"));
+    }
+    out
+}
+
+/// 定位原生身份工具 `runtime-info.exe`（候选根见
+/// [`runtime_info_base_candidates`]），返回首个真实存在的可执行文件。
+fn runtime_info_exe_path() -> Option<std::path::PathBuf> {
+    runtime_info_base_candidates()
+        .into_iter()
+        .map(|base| {
+            base.join("resources")
+                .join("umid")
+                .join("runtime-info.exe")
+        })
+        .find(|p| p.is_file())
 }
 
 /// 解析 runtime-info.exe stdout：优先整段 JSON，失败再按客户端桥的 '.' 分隔符
@@ -711,6 +755,13 @@ pub fn resolve_native_risk_identity() -> Option<&'static NativeRiskIdentity> {
     CACHE
         .get_or_init(|| {
             let Some(exe) = runtime_info_exe_path() else {
+                // 可见化（2026-10-14）：原实现静默回退派生指纹，是「全轮签到失败」
+                // 排障绕远路的直接原因——一条日志即可定位「工具没找到」而非「服务端无活动」
+                crate::fs_utils::app_log_default(
+                    "Qoder 原生身份工具未找到（已退回派生指纹）：候选安装根下均无 \
+                     resources\\umid\\runtime-info.exe。派生设备指纹会被服务端分入独立桶，\
+                     导致 campaigns 列表无 CLAIMABLE、签到恒失败；请确认已安装 Qoder CN 客户端",
+                );
                 return None;
             };
             let mut cmd = std::process::Command::new(&exe);
@@ -721,12 +772,28 @@ pub fn resolve_native_risk_identity() -> Option<&'static NativeRiskIdentity> {
                 cmd.creation_flags(0x0800_0000);
             }
             let Ok(out) = cmd.output() else {
+                crate::fs_utils::app_log_default(&format!(
+                    "Qoder 原生身份工具执行失败（已退回派生指纹）: {}",
+                    exe.display()
+                ));
                 return None;
             };
             if !out.status.success() {
+                crate::fs_utils::app_log_default(&format!(
+                    "Qoder 原生身份工具非零退出（已退回派生指纹）: {} status={}",
+                    exe.display(),
+                    out.status
+                ));
                 return None;
             }
-            parse_runtime_info_stdout(&String::from_utf8_lossy(&out.stdout))
+            let parsed = parse_runtime_info_stdout(&String::from_utf8_lossy(&out.stdout));
+            if parsed.is_none() {
+                crate::fs_utils::app_log_default(&format!(
+                    "Qoder 原生身份工具输出解析失败（已退回派生指纹）: {}",
+                    exe.display()
+                ));
+            }
+            parsed
         })
         .as_ref()
 }
