@@ -182,6 +182,125 @@ fn parse_data(data: &str) -> Option<WbEvent> {
 
 type Sender = tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>;
 
+// ==================== 上游 usage 缓存 tokens 宽口径提取（回填上游 3.7.10）====================
+//
+// 背景：上游 usage 里缓存读/写 tokens 的键名形态多样（OpenAI 标准、Anthropic 口径、
+// 上游私有别名、嵌套容器），此前各出口只认窄口径甚至硬编码 0，导致**下游缓存读恒为 0**
+// （CPA 等下游据此判断缓存失效，多轮工具循环无法正确累计）。
+//
+// 修法：提取收敛为本模块的**单一宽口径实现**，其余出口一律复用（不再各写一份窄口径）。
+// 键集对齐用量统计既有口径；**仅认正值**——0 值陈旧别名不得遮蔽同结构中有效的其他别名
+// （上游同一响应常同时携带 `cached_tokens: 0` 与 `prompt_cache_hit_tokens: N`）。
+
+/// 从对象中按候选键取**首个正值**（0/负数/非数字一律跳过，让后续别名有机会命中）。
+fn positive_of(u: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| {
+        let n = u.get(*k).and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        })?;
+        (n > 0).then_some(n)
+    })
+}
+
+/// 缓存读 tokens（cache read / cache hit）：顶层别名 + 嵌套
+/// `prompt_tokens_details.cached_tokens` + `inputTokensDetails[].cached_tokens`。
+pub(crate) fn cached_tokens_of(u: &Value) -> u64 {
+    positive_of(
+        u,
+        &[
+            "cache_read_input_tokens",
+            "cache_read_token",
+            "cacheReadInputTokens",
+            "prompt_cache_hit_tokens",
+            "cached_tokens",
+            "cache_read_tokens",
+        ],
+    )
+    .or_else(|| {
+        u.get("prompt_tokens_details")
+            .and_then(|d| positive_of(d, &["cached_tokens"]))
+    })
+    .or_else(|| {
+        u.get("inputTokensDetails")
+            .and_then(|d| d.as_array())
+            .and_then(|ds| ds.iter().find_map(|d| positive_of(d, &["cached_tokens"])))
+    })
+    .unwrap_or(0)
+}
+
+/// 上游缓存写 tokens（cache_creation 口径）：宽口径提取，仅认正值。
+pub(crate) fn cache_write_tokens_of(u: &Value) -> u64 {
+    positive_of(
+        u,
+        &[
+            "cache_creation_input_tokens",
+            "cache_write_tokens",
+            "cacheWriteTokens",
+            "cache_creation_tokens",
+        ],
+    )
+    .or_else(|| {
+        u.get("prompt_tokens_details")
+            .and_then(|d| positive_of(d, &["cache_write_tokens"]))
+    })
+    .unwrap_or(0)
+}
+
+/// 遮蔽键清除清单：宽口径提取器认的所有别名 + 2 个嵌套容器。
+///
+/// 多轮累计写回前须清除这些键——否则上一轮的 `cached_tokens` 会与本次
+/// 宽口径提取值并存，下游按优先级取到陈旧值（提取器键集变化时本清单须同步）。
+pub(crate) const CACHE_SHADOW_KEYS: [&str; 8] = [
+    "cache_read_input_tokens",
+    "cache_read_token",
+    "cacheReadInputTokens",
+    "prompt_cache_hit_tokens",
+    "cached_tokens",
+    "cache_read_tokens",
+    "prompt_tokens_details",
+    "inputTokensDetails",
+];
+
+/// 从 usage 对象中清除全部缓存读/写遮蔽键（就地修改）。
+pub(crate) fn clear_cache_shadow_keys(u: &mut Value) {
+    let Some(m) = u.as_object_mut() else { return };
+    for k in CACHE_SHADOW_KEYS {
+        m.remove(k);
+    }
+    for k in [
+        "cache_creation_input_tokens",
+        "cache_write_tokens",
+        "cacheWriteTokens",
+        "cache_creation_tokens",
+    ] {
+        m.remove(k);
+    }
+}
+
+/// 上游 usage → **OpenAI 标准形态**归一化投影（回填上游 3.7.10）。
+///
+/// 为什么必须投影而非原样透传：上游 usage 用的是自有键（Anthropic 口径的
+/// `cache_read_input_tokens`、私有别名等），严格 OpenAI 客户端只认
+/// `prompt_tokens_details.cached_tokens`——原样转发等于下游看不到缓存命中
+/// （实测下游缓存读恒为 0）。投影保留提示/补全总数，缓存读统一落到标准嵌套位。
+pub(crate) fn normalize_openai_usage(u: &Value) -> Value {
+    let (it, ot) = u64_pair(u);
+    let mut out = json!({
+        "prompt_tokens": it,
+        "completion_tokens": ot,
+        "total_tokens": it + ot,
+        "prompt_tokens_details": { "cached_tokens": cached_tokens_of(u) },
+    });
+    let cw = cache_write_tokens_of(u);
+    if cw > 0 {
+        out["cache_creation_input_tokens"] = json!(cw);
+    }
+    out
+}
+
+
 // ==================== Responses SSE 投影（T4.1/F-40） ====================
 
 /// Responses SSE 事件帧：event + data（type 与 event 同名，Codex 按 data.type 解析）
@@ -209,13 +328,19 @@ fn responses_object(id: &str, model: &str, status: &str, output: Vec<Value>, usa
     });
     if let Some(u) = usage {
         let (it, ot) = u64_pair(u);
+        // 缓存读/写 tokens 透传（回填上游 3.7.10）：此前硬编码 0，下游缓存读恒为 0。
+        // reasoning_tokens 上游若无对应字段仍为 0（该字段本模块暂不提取）
         obj["usage"] = json!({
             "input_tokens": it,
-            "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens_details": {"cached_tokens": cached_tokens_of(u)},
             "output_tokens": ot,
             "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": it + ot,
         });
+        let cw = cache_write_tokens_of(u);
+        if cw > 0 {
+            obj["usage"]["cache_creation_input_tokens"] = json!(cw);
+        }
     }
     obj
 }
@@ -282,6 +407,10 @@ pub fn stream_forward_ex(
     let mut tool_buf: BTreeMap<i64, (String, String, String)> = BTreeMap::new();
     // 上游最后携带的 finish_reason（P1 修复：Anthropic message_delta 按此映射 stop_reason）
     let mut last_finish = String::new();
+    // OpenAI 流式出口：role 只允许出现在首个下发帧（issue #96 噪声帧治理）
+    let mut openai_role_sent = false;
+    // 正常收尾标记（issue #96 同提交）：Done 分支置位，EOF 兜底据此避免重复收尾
+    let mut finished = false;
 
     // Responses 输出状态（T4.1/F-40）
     let mut resp_created = false;
@@ -349,6 +478,18 @@ pub fn stream_forward_ex(
                         ))));
                     }
                     let (it, ot) = usage.as_ref().map(u64_pair).unwrap_or((0, 0));
+                    // 缓存读/写 tokens 透传（回填上游 3.7.10）：Anthropic 出口此前缺失
+                    let mut a_usage = json!({"input_tokens": it, "output_tokens": ot});
+                    if let Some(u) = usage.as_ref() {
+                        let cr = cached_tokens_of(u);
+                        let cw = cache_write_tokens_of(u);
+                        if cr > 0 {
+                            a_usage["cache_read_input_tokens"] = json!(cr);
+                        }
+                        if cw > 0 {
+                            a_usage["cache_creation_input_tokens"] = json!(cw);
+                        }
+                    }
                     // P1 修复：stop_reason 按上游 finish_reason 映射，工具块存在时
                     // 必为 tool_use（原硬编码 end_turn 与已输出的 tool_use 块矛盾）
                     let stop_reason = if !tool_buf.is_empty() {
@@ -361,7 +502,7 @@ pub fn stream_forward_ex(
                         json!({
                             "type":"message_delta",
                             "delta":{"stop_reason":stop_reason,"stop_sequence":null},
-                            "usage":{"input_tokens":it,"output_tokens":ot},
+                            "usage":a_usage,
                         })
                     ))));
                     let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
@@ -395,14 +536,21 @@ pub fn stream_forward_ex(
                         } else {
                             tid.clone()
                         };
-                        let item = json!({
+                        let mut item = json!({
                             "id": item_id,
                             "type": "function_call",
                             "status": "completed",
                             "call_id": if tid.is_empty() { format!("call_{}_{}", chat_id, i) } else { tid.clone() },
-                            "name": name,
                             "arguments": args,
                         });
+                        // 编码名还原为 {name, namespace} 双字段（issue #93）：流式与非流式同口径
+                        match super::wb_responses::split_namespaced(&name) {
+                            Some((ns, inner)) => {
+                                item["name"] = json!(inner);
+                                item["namespace"] = json!(ns);
+                            }
+                            None => item["name"] = json!(name),
+                        }
                         let mut added = item.clone();
                         added["status"] = json!("in_progress");
                         added["arguments"] = json!("");
@@ -460,6 +608,7 @@ pub fn stream_forward_ex(
                     break;
                 }
                 // Done 与 EOF 断流共用收尾序列（P1-5 提取为 finish_stream!）
+                finished = true;
                 finish_stream!();
                 sent_any = true;
                 break;
@@ -501,6 +650,9 @@ pub fn stream_forward_ex(
                 if !finish.is_empty() {
                     last_finish = finish.clone();
                 }
+                // 本帧是否携带 usage（issue #96：纯噪声帧跳过判定依据，
+                // 须在 u 合并进函数级 usage 前捕获）
+                let frame_has_usage = u.is_some();
                 if let Some(x) = u {
                     usage = Some(x);
                 }
@@ -603,23 +755,68 @@ pub fn stream_forward_ex(
                 } else {
                     match proto {
                         crate::api_server::routes::Protocol::OpenAi => {
-                            // OpenAI chunk 归一化透传（rewrite id/model）
-                            let mut choice = json!({"index":0,"delta":delta});
-                            if !finish.is_empty() {
-                                choice["finish_reason"] = json!(finish);
+                            // OpenAI chunk 归一化透传（rewrite id/model）。
+                            // issue #96：Buddy 上游每个 delta 携带与内容无关的噪声
+                            // 字段——空 tool_calls 数组、逐帧重复 role、空串
+                            // content/reasoning_content/refusal、恒 null 的
+                            // extra_fields/function_call。AI SDK v5 系客户端把
+                            // "delta 存在 tool_calls 字段（哪怕空数组）"当作本轮
+                            // reasoning 结束信号，空数组被放大为"每个思考碎片单独
+                            // 成段"（深度思考模型一次响应被撕成上百张思考卡）。
+                            // 透传前按 OpenAI 流式惯例做 delta 归一化。
+                            let mut delta = delta;
+                            if let Some(obj) = delta.as_object_mut() {
+                                // 关键修复：空 tool_calls 数组整体移除
+                                if obj
+                                    .get("tool_calls")
+                                    .and_then(|v| v.as_array())
+                                    .is_some_and(|a| a.is_empty())
+                                {
+                                    obj.remove("tool_calls");
+                                }
+                                // role 只保留在首个下发帧，其余帧移除
+                                if openai_role_sent {
+                                    obj.remove("role");
+                                } else if obj.contains_key("role") {
+                                    openai_role_sent = true;
+                                }
+                                // 空字符串字段剥离
+                                for key in ["content", "reasoning_content", "refusal"] {
+                                    if obj.get(key).and_then(|v| v.as_str()) == Some("") {
+                                        obj.remove(key);
+                                    }
+                                }
+                                // 恒空噪声字段剥离
+                                for key in ["extra_fields", "function_call"] {
+                                    if obj.get(key).is_some_and(|v| v.is_null()) {
+                                        obj.remove(key);
+                                    }
+                                }
                             }
-                            let mut chunk = json!({
-                                "id": if id.is_empty() { chat_id.to_string() } else { id },
-                                "object": "chat.completion.chunk",
-                                "created": now_ts(),
-                                "model": model,
-                                "choices": [choice],
-                            });
-                            if let Some(x) = &usage {
-                                chunk["usage"] = x.clone();
+                            // 剥离后为空、且本帧无 finish_reason 与 usage 的纯噪声帧
+                            // 整帧跳过：has_content 基于非空语义判定不受影响，
+                            // 空完成哨兵检测（issue #57）语义不变
+                            let frame_empty = delta.as_object().is_none_or(|o| o.is_empty());
+                            if !(frame_empty && finish.is_empty() && !frame_has_usage) {
+                                let mut choice = json!({"index":0,"delta":delta});
+                                if !finish.is_empty() {
+                                    choice["finish_reason"] = json!(finish);
+                                }
+                                let mut chunk = json!({
+                                    "id": if id.is_empty() { chat_id.to_string() } else { id },
+                                    "object": "chat.completion.chunk",
+                                    "created": now_ts(),
+                                    "model": model,
+                                    "choices": [choice],
+                                });
+                                if let Some(x) = &usage {
+                                    // 归一化投影（回填上游 3.7.10）：上游自有键（Anthropic 口径等）
+                                    // 原样下发会让下游认不到缓存命中
+                                    chunk["usage"] = normalize_openai_usage(x);
+                                }
+                                send!(format!("data: {}\n\n", chunk));
+                                sent_any = true;
                             }
-                            send!(format!("data: {}\n\n", chunk));
-                            sent_any = true;
                         }
                         crate::api_server::routes::Protocol::OpenAiText => {
                             // delta.content → text 块；tool_calls 无对应字段跳过
@@ -636,7 +833,8 @@ pub fn stream_forward_ex(
                                     "choices": [choice],
                                 });
                                 if let Some(x) = &usage {
-                                    chunk["usage"] = x.clone();
+                                    // 同上：归一化投影（text_completion 出口同口径）
+                                    chunk["usage"] = normalize_openai_usage(x);
                                 }
                                 send!(format!("data: {}\n\n", chunk));
                                 sent_any = true;
@@ -712,15 +910,19 @@ pub fn stream_forward_ex(
     // 上游断流（EOF 未收到 Done/Error 事件）优雅收尾（审查 P1-5，对齐
     // sse.rs SOLO finish_stream 语义）：已有内容 → 按协议补齐终止帧，避免
     // 严格客户端因未闭合的 content_block / message 项挂起；零内容不伪装
-    // 成功，走下方空完成哨兵换号重试
-    if error_info.is_none() && !failed_inline && has_content && !tx.is_closed() {
+    // 成功，走下方空完成哨兵换号重试。
+    // `!finished` 门控（回填上游 3.7.11）：Done 分支已收尾过，此处再补一次会
+    // 让正常结束的成功流**重复下发** [DONE] / message_stop
+    if !finished && error_info.is_none() && !failed_inline && has_content && !tx.is_closed() {
         finish_stream!();
         sent_any = true;
     }
 
-    // 空完成兜底（issue #57）：EOF 且零内容零错误、客户端仍在线 → 哨兵上抛
-    // （原样收尾会让客户端收到 "empty provider response"）
-    if error_info.is_none() && !has_content && !failed_inline && !tx.is_closed() {
+    // 空完成兜底（issue #57）：EOF 且零内容零错误 → 哨兵上抛
+    // （原样收尾会让客户端收到 "empty provider response"）。
+    // 客户端在线门控已移除（回填上游 3.7.11）：断连时同样须上抛哨兵——否则
+    // 调用方按"成功"处理并绑定粘性会话，把一个什么都没产出的账号钉在会话上
+    if error_info.is_none() && !has_content && !failed_inline {
         error_info = Some((
             super::EMPTY_COMPLETION_CODE,
             super::EMPTY_COMPLETION_MSG.to_string(),
@@ -893,6 +1095,18 @@ pub fn completion_to_anthropic(v: &Value, msg_id: &str, model: &str) -> Value {
         content.push(json!({"type":"text","text":""}));
     }
     let (it, ot) = v.get("usage").map(u64_pair).unwrap_or((0, 0));
+    // 缓存读/写 tokens 透传（回填上游 3.7.10）：非流式 Anthropic 出口此前缺失
+    let mut a_usage = json!({"input_tokens": it, "output_tokens": ot});
+    if let Some(u) = v.get("usage") {
+        let cr = cached_tokens_of(u);
+        let cw = cache_write_tokens_of(u);
+        if cr > 0 {
+            a_usage["cache_read_input_tokens"] = json!(cr);
+        }
+        if cw > 0 {
+            a_usage["cache_creation_input_tokens"] = json!(cw);
+        }
+    }
     // P1 修复：stop_reason 读上游 finish_reason 映射（原硬编码 end_turn 丢失
     // tool_use/max_tokens 语义）；有 tool_calls 时强制 tool_use 兜底
     let has_tool_calls = message
@@ -912,7 +1126,7 @@ pub fn completion_to_anthropic(v: &Value, msg_id: &str, model: &str) -> Value {
         "content": content,
         "stop_reason": stop_reason,
         "stop_sequence": null,
-        "usage": {"input_tokens": it, "output_tokens": ot},
+        "usage": a_usage,
     })
 }
 
@@ -942,9 +1156,17 @@ pub fn completion_to_text(v: &Value, model: &str) -> Value {
 }
 
 fn u64_pair(u: &Value) -> (u64, u64) {
+    // 宽口径解析（回填上游 e932c19）：浮点/字符串形态上游同样会下发，
+    // 旧实现只认 as_u64，后两者静默归零
     let get = |keys: &[&str]| -> u64 {
         keys.iter()
-            .find_map(|k| u.get(*k).and_then(|v| v.as_u64()))
+            .find_map(|k| {
+                let v = u.get(*k)?;
+                v.as_u64()
+                    .or_else(|| v.as_i64().and_then(|i| u64::try_from(i).ok()))
+                    .or_else(|| v.as_f64().map(|f| f.max(0.0).round() as u64))
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()).map(|f| f.max(0.0).round() as u64))
+            })
             .unwrap_or(0)
     };
     (
@@ -1261,5 +1483,84 @@ mod tests {
         }
         let md = body.split("event: message_delta").nth(1).unwrap_or("");
         assert!(md.contains("\"input_tokens\":0"));
+    }
+
+    // ============ 缓存 tokens 宽口径提取（回填上游 3.7.10）============
+
+    /// 宽口径提取：顶层别名 + 嵌套形态都要认。
+    #[test]
+    fn cached_tokens_of_accepts_wide_key_forms() {
+        assert_eq!(cached_tokens_of(&json!({"cache_read_input_tokens": 64})), 64);
+        assert_eq!(cached_tokens_of(&json!({"prompt_cache_hit_tokens": 32})), 32);
+        assert_eq!(cached_tokens_of(&json!({"cached_tokens": 8})), 8);
+        // OpenAI 标准嵌套
+        assert_eq!(
+            cached_tokens_of(&json!({"prompt_tokens_details": {"cached_tokens": 16}})),
+            16
+        );
+        // 上游私有嵌套数组
+        assert_eq!(
+            cached_tokens_of(&json!({"inputTokensDetails": [{"cached_tokens": 4}]})),
+            4
+        );
+        // 无缓存字段
+        assert_eq!(cached_tokens_of(&json!({"prompt_tokens": 100})), 0);
+    }
+
+    /// 关键回归：0 值陈旧别名**不得遮蔽**同结构中有效的其他别名。
+    /// 上游同一响应常同时携带 `cached_tokens: 0` 与 `prompt_cache_hit_tokens: N`，
+    /// 旧窄口径会先命中 0 并据此判定「无缓存命中」。
+    #[test]
+    fn cached_tokens_of_skips_zero_aliases() {
+        let u = json!({"cached_tokens": 0, "prompt_cache_hit_tokens": 128});
+        assert_eq!(cached_tokens_of(&u), 128, "0 值别名不得遮蔽有效别名");
+    }
+
+    /// 宽口径写侧提取。
+    #[test]
+    fn cache_write_tokens_of_accepts_wide_key_forms() {
+        assert_eq!(cache_write_tokens_of(&json!({"cache_creation_input_tokens": 12})), 12);
+        assert_eq!(cache_write_tokens_of(&json!({"cache_write_tokens": 5})), 5);
+        assert_eq!(cache_write_tokens_of(&json!({"prompt_tokens": 1})), 0);
+    }
+
+    /// OpenAI 归一化投影：上游自有键 → 下游只认的标准嵌套位。
+    #[test]
+    fn normalize_openai_usage_projects_to_standard_shape() {
+        let u = json!({
+            "prompt_tokens": 100, "completion_tokens": 20,
+            "cache_read_input_tokens": 64, "cache_creation_input_tokens": 8,
+        });
+        let out = normalize_openai_usage(&u);
+        assert_eq!(out["prompt_tokens"], json!(100));
+        assert_eq!(out["completion_tokens"], json!(20));
+        assert_eq!(out["total_tokens"], json!(120));
+        assert_eq!(out["prompt_tokens_details"]["cached_tokens"], json!(64));
+        assert_eq!(out["cache_creation_input_tokens"], json!(8));
+    }
+
+    /// 遮蔽键清除：清单必须覆盖提取器认的全部别名，否则多轮累计会残留陈旧值。
+    #[test]
+    fn clear_cache_shadow_keys_removes_all_extractor_aliases() {
+        let mut u = json!({
+            "prompt_tokens": 1,
+            "cached_tokens": 9,
+            "prompt_cache_hit_tokens": 9,
+            "cache_read_input_tokens": 9,
+            "prompt_tokens_details": {"cached_tokens": 9},
+            "cache_creation_input_tokens": 9,
+        });
+        clear_cache_shadow_keys(&mut u);
+        assert_eq!(cached_tokens_of(&u), 0, "清除后不应再命中任何缓存别名");
+        assert_eq!(cache_write_tokens_of(&u), 0);
+        assert_eq!(u["prompt_tokens"], json!(1), "非缓存字段须保留");
+    }
+
+    /// 宽口径数值解析：浮点/字符串形态上游同样下发，旧 as_u64 会静默归零。
+    #[test]
+    fn u64_pair_accepts_float_and_string_forms() {
+        assert_eq!(u64_pair(&json!({"prompt_tokens": 10, "completion_tokens": 2})), (10, 2));
+        assert_eq!(u64_pair(&json!({"prompt_tokens": 10.0})), (10, 0));
+        assert_eq!(u64_pair(&json!({"prompt_tokens": "20"})), (20, 0));
     }
 }

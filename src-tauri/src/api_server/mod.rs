@@ -90,6 +90,11 @@ pub struct ApiSharedState {
     pub default_model: String,
     /// 数据目录（读取/持久化 api_models.json 的 function 自学习覆盖）
     pub data_dir: std::path::PathBuf,
+    /// 实际绑定 host（回填上游 3.7.9）：`/health` 是否免鉴权据此**运行时判定**。
+    ///
+    /// 为什么不重读配置：改配置未必重启（配置热改后 host 与实际绑定不一致），
+    /// 按运行时真值判定才不会「改配置未重启 → 误放行」。
+    pub listen_host: String,
     pub total_requests: AtomicU64,
     /// 当前并发数（统一网关 §4.5）：由 InflightGuard RAII 维护，覆盖全部业务端点。
     /// Arc 包装使 guard 可跨 spawn_blocking/流任务持有（'static + Send）
@@ -721,6 +726,7 @@ mod inflight_tests {
             model_cooldowns: Mutex::new(std::collections::HashMap::new()),
             default_model: String::new(),
             data_dir: dir.clone(),
+            listen_host: "127.0.0.1".to_string(),
             total_requests: AtomicU64::new(0),
             inflight: Arc::new(AtomicU64::new(0)),
             active_uid: Mutex::new(None),

@@ -3,9 +3,19 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use chrono::{Datelike, Local};
+use chrono::{Datelike, Local, Timelike};
+
+/// 本地时区 HH:MM:SS（回填上游 `e932c19`）。
+///
+/// 旧实现硬编码 `now + 8 * 3600` 假定 UTC+8——在非东八区机器（或容器未挂 TZ）
+/// 上日志时刻会整体偏移，与同目录其他按本地时间落盘的日志对不上，签到时点偏差
+/// 也无法从日志排查。改为读真实本地时区。
+fn local_hms() -> (u32, u32, u32) {
+    let n = Local::now();
+    (n.hour(), n.minute(), n.second())
+}
 
 /// API 请求日志记录器：按日期分文件，直接存储在 logs/ 目录下（文件名 api_YYYY-MM-DD.log）
 ///
@@ -153,14 +163,8 @@ impl ApiLogger {
         acct_name: &str,
         error: Option<&str>,
     ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let local_ts = now + 8 * 3600;
-        let h = (local_ts % 86400) / 3600;
-        let m = (local_ts % 3600) / 60;
-        let s = local_ts % 60;
+        // 本地时区取时刻（回填上游 e932c19：原硬编码 UTC+8）
+        let (h, m, s) = local_hms();
 
         let uid_short = &uid[..uid.len().min(12)];
         let ttfb_part = match ttfb_ms {
@@ -187,14 +191,8 @@ impl ApiLogger {
     /// 记录调度事件日志（F-77）：sticky_yield 让位 / busy 降级取号 / 对冲接管等，
     /// 单行 `[SCHED]` 前缀写入当日日志，供用量页日志检索与调度行为观测
     pub fn log_sched_event(&self, event: &str) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let local_ts = now + 8 * 3600;
-        let h = (local_ts % 86400) / 3600;
-        let m = (local_ts % 3600) / 60;
-        let s = local_ts % 60;
+        // 本地时区取时刻（回填上游 e932c19：原硬编码 UTC+8）
+        let (h, m, s) = local_hms();
         let line = format!("[{:02}:{:02}:{:02}] [SCHED] {}\n", h, m, s, event);
         self.enqueue(line);
     }
@@ -208,14 +206,8 @@ impl ApiLogger {
         status: u16,
         error: Option<&str>,
     ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let local_ts = now + 8 * 3600;
-        let h = (local_ts % 86400) / 3600;
-        let m = (local_ts % 3600) / 60;
-        let s = local_ts % 60;
+        // 本地时区取时刻（回填上游 e932c19）
+        let (h, m, s) = local_hms();
 
         let uid_short = &uid[..uid.len().min(12)];
         let mut lines = Vec::new();

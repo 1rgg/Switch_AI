@@ -48,6 +48,9 @@ pub async fn do_start(
     // load 已将空 default_model 兜底为内置默认，无需再 trim 判空
     let gw = crate::api_server::gateway_settings::load(&state.data_dir);
     let port = gw.port;
+    // 实际绑定 host 快照（回填上游 3.7.9）：`/health` 是否免鉴权据此运行时判定。
+    // 必须在 gw 字段被逐个移出前取出。
+    let listen_host = gw.host.clone();
 
     // 代理循环说明：ureq 2.12 未启用 proxy-from-env feature，构建 Agent 时
     // 既不读 HTTP(S)_PROXY/NO_PROXY 环境变量、也不读系统代理，Agent 未显式
@@ -291,6 +294,7 @@ pub async fn do_start(
         model_cooldowns: Mutex::new(std::collections::HashMap::new()),
         default_model,
         data_dir: state.data_dir.clone(),
+        listen_host,
         total_requests: std::sync::atomic::AtomicU64::new(0),
         inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         active_uid: Mutex::new(None),

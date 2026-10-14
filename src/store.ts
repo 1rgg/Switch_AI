@@ -229,6 +229,10 @@ function defaultSettings(): Settings {
     wb_growth_hhmm: '09:00',
     // WorkBuddy 每日签到调度时刻（任务配置页可改，默认 09:10）
     wb_checkin_hhmm: '09:10',
+    // WorkBuddy 每日活跃上报（限时活动，仅国际版）：**默认关闭**——官方把「接口调用
+    // 刷取活跃或奖励」列为可追回奖励的行为，须用户在任务配置页显式开启
+    wb_activity_enabled: false,
+    wb_activity_hhmm: '10:20',
     // 积分/Token 同步：Buddy 与 Trae 默认每 2 小时（issue #82 会话明细定时落盘），
     // 间隔可在环境配置页手工设置；daily 模式时刻 23:30 / 23:40；模型同步默认开（05:45 / 05:40）
     wb_credits_sync_mode: 'every_hours',

@@ -63,6 +63,10 @@ const TASKS: &[SchedTask] = &[
     // WorkBuddy 每日成长（任务配置页）：默认 09:00 可改（settings.wb_growth_hhmm）；
     // 成长三开关驱动（旅行/盲盒/任务），全关时空轮无副作用
     SchedTask { key: "wb-growth", name: "WorkBuddy 每日成长", hhmm: "09:00", kind: "fix" },
+    // WorkBuddy 每日活跃上报（限时活动，仅国际版）：**默认关闭**（settings.wb_activity_enabled），
+    // 须用户显式开启——官方把「接口调用刷活跃」列为可追回奖励的行为。
+    // 默认 10:20 排在签到/成长之后错峰；每号每天只发 1 次（日活跃按天去重）
+    SchedTask { key: "wb-activity", name: "WorkBuddy 每日活跃上报", hhmm: "10:20", kind: "fix" },
     // F-09 兜底续期：lazy 24h（到期前 24h 内才真正刷新），每天跑一次是安全超集
     SchedTask { key: "wb-renew", name: "WorkBuddy token 兜底续期", hhmm: "10:30", kind: "fix" },
     SchedTask { key: "doubao-keepalive", name: "豆包会话每日续期", hhmm: "09:20", kind: "fix" },
@@ -313,6 +317,7 @@ fn effective_hhmm(st: &AppState, t: &SchedTask) -> String {
         "trae-renew" => Some(st.settings().jwt_renew_hhmm),
         "wb-growth" => Some(st.settings().wb_growth_hhmm),
         "wb-checkin" => Some(st.settings().wb_checkin_hhmm),
+        "wb-activity" => Some(st.settings().wb_activity_hhmm),
         "wb-credits-snapshot" => Some(st.settings().wb_credits_sync_hhmm),
         "trae-credits-snapshot" => Some(st.settings().trae_credits_sync_hhmm),
         "qoder-checkin" => Some(st.settings().qoder_checkin_hhmm),
@@ -354,6 +359,9 @@ fn enabled(st: &AppState, key: &str) -> bool {
         "trae-renew" => st.settings().jwt_renew_enabled,
         // WorkBuddy 每日成长（任务配置页）：跟随成长调度开关（默认开）
         "wb-growth" => st.settings().wb_growth_enabled,
+        // WorkBuddy 每日活跃上报（限时活动，仅国际版）：**默认关闭**，须用户显式开启
+        //（官方把「接口调用刷活跃」列为可取消资格/追回奖励的行为，故不做默认开）
+        "wb-activity" => st.settings().wb_activity_enabled,
         // F-80 Qoder：签到跟随环境配置开关（qoder_settings.auto_checkin 默认开）；
         // 积分快照独立开关（默认开；无账号时任务内部静默跳过不计失败）
         "qoder-checkin" => crate::commands::qoder::load_settings(st).auto_checkin,
@@ -414,7 +422,14 @@ fn run_task(
         // 永久性凭证失败（需重新登录 / 无可用凭证，30 分钟内不会自愈）剔除出重试判定
         "wb-checkin" => {
             let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
-                return Err("跳过：已有签到/成长任务在执行中".into());
+                // 抢不到轮次锁（UI 路径正在签到/成长）= 幂等跳过而非失败（回填上游 e932c19）：
+                // 返 Err 会被调度器记当日首败并推送「签到失败」误报通知
+                //（签到本身未失败，UI 路径会照常完成）
+                return Ok(json!({
+                    "ok": true,
+                    "skipped": "已有签到/成长/活跃任务在执行中，本轮跳过",
+                    "skipped_busy": true,
+                }));
             };
             let mut events: Vec<Value> = Vec::new();
             let done = super::wb_checkin::run_checkin_round(
@@ -444,7 +459,12 @@ fn run_task(
         // WorkBuddy 每日成长（任务配置页）：成长三开关驱动，抢轮次锁与 UI 路径互斥
         "wb-growth" => {
             let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
-                return Err("跳过：已有签到/成长任务在执行中".into());
+                // 幂等跳过而非失败（回填上游 e932c19）：返 Err 会推「失败」误报通知
+                return Ok(json!({
+                    "ok": true,
+                    "skipped": "已有签到/成长/活跃任务在执行中，本轮跳过",
+                    "skipped_busy": true,
+                }));
             };
             let s = crate::commands::workbuddy::load_settings(st);
             let flags = super::wb_checkin::GrowthOpts {
@@ -452,9 +472,61 @@ fn run_task(
                 lottery: s.growth_lottery,
                 tasks: s.growth_tasks,
             };
-            // run_growth_round 为 NDJSON 推进式输出（无汇总返回值），调度日志记 ok 概要即可
-            super::wb_checkin::run_growth_round(st, &flags, &[], &mut |_| {});
+            // 累计事件（回填上游 e932c19）：原实现传空回调把失败**整体丢弃**，
+            // 调度日志恒记 ok 概要、失败不再进 30 分钟重试链——成长失败被静默吞掉
+            let mut events: Vec<Value> = Vec::new();
+            super::wb_checkin::run_growth_round(st, &flags, &[], &mut |ev| events.push(ev.clone()));
+            // 重试口径：可重试失败返 Err 交 30 分钟冷却重试；永久性凭证失败
+            // （需重新登录 / 无可用凭证）剔除，避免全天无效重试
+            let failed = events
+                .iter()
+                .filter(|e| e.get("status").and_then(Value::as_str) == Some("fail"))
+                .count() as i64;
+            let failed_permanent = events
+                .iter()
+                .filter(|e| {
+                    let m = e.get("message").and_then(Value::as_str).unwrap_or("");
+                    e.get("status").and_then(Value::as_str) == Some("fail")
+                        && (m.contains("需重新登录") || m.contains("无可用凭证"))
+                })
+                .count() as i64;
+            let retryable = (failed - failed_permanent).max(0);
+            if retryable > 0 {
+                return Err(format!("WB 成长：{retryable} 个账号失败（稍后自动重试）"));
+            }
             Ok(json!({ "ok": true }))
+        }
+        // WorkBuddy 每日活跃上报（限时活动，仅国际版；与 `--task-run wb-activity` 同款）。
+        // 抢轮次锁与 UI 路径互斥（与签到/成长共享结果落盘）。
+        // 重试口径对齐 wb-checkin：可重试失败返 Err 交 30 分钟冷却重试；
+        // 永久性凭证失败（需重新登录 / 无可用凭证）剔除出重试判定，避免全天无效重试
+        "wb-activity" => {
+            let Ok(_round) = crate::commands::workbuddy::try_acquire_wb_round() else {
+                // 抢不到锁 = 幂等跳过而非失败（UI 路径正在跑签到/成长）：
+                // 返 Err 会被记当日首败并推「失败」误报通知
+                return Ok(json!({
+                    "ok": true,
+                    "skipped": "已有签到/成长/活跃任务在执行中，本轮跳过",
+                    "skipped_busy": true,
+                }));
+            };
+            let mut events: Vec<Value> = Vec::new();
+            let done = super::wb_activity::run_activity_round(st, &[], &mut |ev| events.push(ev.clone()));
+            let failed = done.get("failed").and_then(Value::as_i64).unwrap_or(0);
+            let failed_permanent = events
+                .iter()
+                .filter(|e| {
+                    let m = e.get("message").and_then(Value::as_str).unwrap_or("");
+                    e.get("status").and_then(Value::as_str) == Some("fail")
+                        && (m.contains("需重新登录") || m.contains("无可用凭证"))
+                })
+                .count() as i64;
+            let retryable = (failed - failed_permanent).max(0);
+            if retryable > 0 {
+                let ok = done.get("ok").and_then(Value::as_i64).unwrap_or(0);
+                return Err(format!("WB 活跃上报：{ok} 成功 / {retryable} 失败（稍后自动重试）"));
+            }
+            Ok(done)
         }
         // Trae JWT 定时续期（issue #27）：与 `--task-run trae-renew` 同款（lazy 48h 惰性门）
         "trae-renew" => crate::commands::accounts::renew_due_accounts_impl(st),

@@ -757,7 +757,11 @@ pub fn update_run_installer(
     // 结果型事件：emit 失败落 stderr（issue #44 遗留项；即将 exit，无 data_dir 需求）
     crate::events::emit_logged(&app, "update-installing", serde_json::Value::String(asset_name.clone()), None);
     std::thread::sleep(Duration::from_millis(800));
-    std::process::exit(0);
+    // 走 Tauri 退出链（回填上游 e932c19）：原 std::process::exit(0) 绕过退出流程，
+    // 不触发 run_event 的 ExitRequested/Exit 清理（日志队列不排空、托盘与单实例
+    // 资源不释放），且调用方拿不到返回值。app.exit 由 Tauri 统一收尾。
+    app.exit(0);
+    Ok(())
 }
 
 #[cfg(test)]

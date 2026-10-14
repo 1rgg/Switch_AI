@@ -25,8 +25,14 @@ pub async fn bearer_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // `/health` 免鉴权（回填上游 3.7.9）：**仅环回监听时**豁免。
+    // 此前无条件放行，非环回（0.0.0.0 / 局域网）部署下同网段任何主机都能免鉴权
+    // 探测本服务；且判定按**实际绑定 host**（state.listen_host）而非重读配置——
+    // 改配置未重启时两者不一致，重读会把「实际仍在暴露」的实例误判为环回。
     if request.uri().path() == "/health" {
-        return next.run(request).await;
+        if super::server::is_loopback_host(&state.listen_host) {
+            return next.run(request).await;
+        }
     }
 
     // 请求体预检（issue #21）：Content-Length 超过网关上限时在 body 提取器之前

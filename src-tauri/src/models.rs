@@ -219,6 +219,17 @@ pub struct Settings {
     /// WorkBuddy 每日签到调度触发时刻 HH:MM（默认 09:10，任务配置页可改）
     #[serde(default = "default_wb_checkin_hhmm")]
     pub wb_checkin_hhmm: String,
+    /// WorkBuddy 每日活跃上报（限时活动，**仅国际版**）：调度器 wb-activity 开关。
+    ///
+    /// **默认关闭**——官方「活动限制」把「利用脚本/插件/**接口调用**等方式刷取活跃
+    /// 或奖励」列为可取消资格、追回奖励的行为，须由用户显式开启并自担风险。
+    /// 关闭时该链路完全不参与调度（不注册、不发任何请求）。
+    #[serde(default)]
+    pub wb_activity_enabled: bool,
+    /// WorkBuddy 每日活跃上报触发时刻 HH:MM（默认 10:20，任务配置页可改）。
+    /// 排在签到（09:10）与成长（09:00）之后，避免与二者抢上游频控配额。
+    #[serde(default = "default_wb_activity_hhmm")]
+    pub wb_activity_hhmm: String,
     // ── 看板数据定时同步（积分/Token/模型；调度器 credits/models 两类任务） ──
     /// Buddy 积分与 Token 看板同步模式：off（关闭）| hourly（每小时）| daily（每日 HH:MM）| every_hours（每N小时，默认）
     #[serde(default = "default_credits_sync_mode")]
@@ -385,6 +396,10 @@ fn default_wb_growth_hhmm() -> String {
 }
 fn default_wb_checkin_hhmm() -> String {
     "09:10".into()
+}
+/// WorkBuddy 每日活跃上报默认 10:20（排在签到 09:10 / 成长 09:00 之后错峰）
+fn default_wb_activity_hhmm() -> String {
+    "10:20".into()
 }
 /// Qoder 每日签到调度默认 10:15（F-80 §2.2：10:15 时 0 点签到与 10:00 登录奖励均可领）
 fn default_qoder_checkin_hhmm() -> String {

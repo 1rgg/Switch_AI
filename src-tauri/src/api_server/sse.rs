@@ -323,8 +323,10 @@ fn stream_convert_src(
     }
 
     if !saw_done && error_info.is_none() {
-        if !has_content && !sender.is_closed() {
-            // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）
+        // 客户端在线门控已移除（回填上游 3.7.11）：断连时同样须上抛哨兵，
+        // 否则调用方按「成功」处理并绑定粘性会话，把零产出的账号钉在会话上
+        if !has_content {
+            // EOF 且零内容：视为空完成（换号重试，不发 [DONE]）
             error_info = Some((
                 crate::api_server::EMPTY_COMPLETION_CODE,
                 super::EMPTY_COMPLETION_MSG.to_string(),
@@ -378,7 +380,8 @@ fn stream_convert_text_src(
             "choices": [choice],
         });
         if let Some(u) = usage {
-            chunk["usage"] = u.clone();
+            // 归一化投影：流式出口同样不得原样透传上游自有键（回填上游 3.7.10）
+            chunk["usage"] = super::wb_sse::normalize_openai_usage(u);
         }
         format!("data: {}\n\n", chunk)
     };
@@ -457,8 +460,10 @@ fn stream_convert_text_src(
     }
 
     if !saw_done && error_info.is_none() {
-        if !has_content && !sender.is_closed() {
-            // EOF 且零内容：同样视为空完成（换号重试，不发 [DONE]）
+        // 客户端在线门控已移除（回填上游 3.7.11）：断连时同样须上抛哨兵，
+        // 否则调用方按「成功」处理并绑定粘性会话，把零产出的账号钉在会话上
+        if !has_content {
+            // EOF 且零内容：视为空完成（换号重试，不发 [DONE]）
             error_info = Some((
                 crate::api_server::EMPTY_COMPLETION_CODE,
                 super::EMPTY_COMPLETION_MSG.to_string(),
@@ -550,7 +555,9 @@ pub fn aggregate<R: Read + Send>(
         }],
     });
     if let Some(u) = c.usage {
-        resp["usage"] = u;
+        // OpenAI 标准形态归一化投影（回填上游 3.7.10）：上游用自有键
+        // （cache_read_input_tokens 等），原样透传下游认不到缓存命中
+        resp["usage"] = super::wb_sse::normalize_openai_usage(&u);
     }
 
     (Some(resp), None)
@@ -580,7 +587,9 @@ pub fn aggregate_text<R: Read + Send>(
         }],
     });
     if let Some(u) = c.usage {
-        resp["usage"] = u;
+        // OpenAI 标准形态归一化投影（回填上游 3.7.10）：上游用自有键
+        // （cache_read_input_tokens 等），原样透传下游认不到缓存命中
+        resp["usage"] = super::wb_sse::normalize_openai_usage(&u);
     }
 
     (Some(resp), None)
@@ -613,8 +622,21 @@ fn anthropic_stop_reason(finish: &str) -> &'static str {
     }
 }
 
+/// 宽口径数值解析（回填上游 `e932c19`）：上游 usage 数值可能是整数、浮点
+/// （`123.0`）或字符串（`"20"`）形态——旧实现只认 `as_i64`，后两者静默归零，
+/// 与宽口径缓存提取配合时会产生「缓存读 > 总输入」的矛盾账。
+fn token_number(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f.round() as i64)),
+        Value::String(s) => s.trim().parse::<f64>().ok().map(|f| f.round() as i64),
+        _ => None,
+    }
+}
+
 fn usage_i64(u: &Value, keys: &[&str]) -> Option<i64> {
-    keys.iter().find_map(|k| u.get(*k).and_then(|v| v.as_i64()))
+    keys.iter().find_map(|k| u.get(*k).and_then(token_number))
 }
 
 fn anthropic_event(name: &str, data: &Value) -> String {
@@ -757,8 +779,14 @@ fn stream_convert_anthropic_src(
                 );
             }
             let mut out_tokens = None;
+            let mut cache_read = 0u64;
+            let mut cache_write = 0u64;
             if let Some(u) = &usage {
                 out_tokens = usage_i64(u, &["output_tokens", "completion_tokens"]);
+                // 缓存读/写 tokens 透传（回填上游 3.7.10）：Anthropic 出口此前完全缺失，
+                // 下游无法判断前缀缓存是否命中
+                cache_read = super::wb_sse::cached_tokens_of(u);
+                cache_write = super::wb_sse::cache_write_tokens_of(u);
             }
             let mut message_delta = json!({
                 "type": "message_delta",
@@ -770,6 +798,14 @@ fn stream_convert_anthropic_src(
             });
             if let Some(o) = out_tokens {
                 message_delta["usage"]["output_tokens"] = json!(o);
+            }
+            // Anthropic 口径：「读」用 cache_read_input_tokens、
+            // 「写」用 cache_creation_input_tokens；仅 >0 下发
+            if cache_read > 0 {
+                message_delta["usage"]["cache_read_input_tokens"] = json!(cache_read);
+            }
+            if cache_write > 0 {
+                message_delta["usage"]["cache_creation_input_tokens"] = json!(cache_write);
             }
             send_event!("message_delta", message_delta);
             send_event!("message_stop", json!({ "type": "message_stop" }));
@@ -920,7 +956,9 @@ fn stream_convert_anthropic_src(
         }
     }
 
-    if !saw_done && !disconnected {
+    if !saw_done {
+        // 断连门控已移除（回填上游 3.7.11）：断连时同样须走哨兵/收尾路径，
+        // 否则调用方误判成功并绑定粘性会话
         if message_started || !tools.is_empty() {
             // 上游未发 done 即断流：把已收到的内容按正常收尾发出，避免客户端挂起
             finish_stream!();
@@ -1069,6 +1107,15 @@ pub fn aggregate_anthropic<R: Read + Send>(
         }
         if let Some(v) = usage_i64(u, &["output_tokens", "completion_tokens"]) {
             usage_obj["output_tokens"] = json!(v);
+        }
+        // 缓存读/写 tokens 透传（回填上游 3.7.10）：非流式出口此前同样缺失
+        let cache_read = super::wb_sse::cached_tokens_of(u);
+        let cache_write = super::wb_sse::cache_write_tokens_of(u);
+        if cache_read > 0 {
+            usage_obj["cache_read_input_tokens"] = json!(cache_read);
+        }
+        if cache_write > 0 {
+            usage_obj["cache_creation_input_tokens"] = json!(cache_write);
         }
     }
 

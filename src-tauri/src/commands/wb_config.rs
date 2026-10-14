@@ -96,8 +96,12 @@ fn template_map_set_at(data_dir: &std::path::Path, map: &Value) -> Result<(), St
     if !map.is_object() {
         return Err("审核模板映射必须是 JSON 对象（含 templates 数组）".into());
     }
+    // from 必填字符串；to 可为字符串或 null（回填上游 3.7.11 issue #99 合并语义）：
+    //   to = 字符串 → 改写为该文本（"" 表示剥离为空串）
+    //   to = null / 缺省 → **停用**该 from 规则（从生效表移除，原句透传）
+    // 合并语义下「省略某条默认规则」不再表示删除——默认表始终生效，停用须显式 null
     serde_json::from_value::<TemplateMapFile>(map.clone())
-        .map_err(|e| format!("审核模板映射格式不正确（templates[].from/to 均为必填字符串）: {e}"))?;
+        .map_err(|e| format!("审核模板映射格式不正确（templates[].from 必填字符串，to 为字符串或 null）: {e}"))?;
     crate::store::db(data_dir).kv_set("wb_template_map", map)
 }
 
@@ -127,14 +131,31 @@ mod tests {
         assert!(validate_route_config(&json!({"aliases": {"claude-x": "glm-5.3"}})).is_ok());
     }
 
-    /// 校验拒绝畸形模板映射（templates 元素缺 to / 非对象根）
+    /// 校验拒绝畸形模板映射（from 非字符串 / 非对象根）。
+    /// 注意（回填上游 3.7.11）：缺 `to` **不再**是畸形——`to = null` = 停用该规则，
+    /// 是合并语义下的合法形态（默认表仍生效，仅本次 from 被移除）。
     #[test]
     fn template_map_validation_rejects_malformed() {
         let dir = tmp_dir("tpl_invalid");
-        assert!(template_map_set_at(&dir, &json!({"templates": [{"from": "a"}]})).is_err());
+        // 缺 from 才是畸形（无法定位要覆盖哪条规则）
+        assert!(template_map_set_at(&dir, &json!({"templates": [{"to": "b"}]})).is_err());
+        // from 非字符串
+        assert!(template_map_set_at(&dir, &json!({"templates": [{"from": 1}]})).is_err());
         assert!(template_map_set_at(&dir, &json!([1, 2])).is_err());
         // 拒绝后不得落库
         assert!(crate::store::db(&dir).kv_get_raw("wb_template_map").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// issue #99 停用语义：to = null 合法，表示从生效表移除该 from 规则。
+    #[test]
+    fn template_map_allows_null_to_as_disable() {
+        let dir = tmp_dir("tpl_disable");
+        let map = json!({"templates": [{"from": "x"}]});
+        assert!(template_map_set_at(&dir, &map).is_ok(), "缺 to 应视为停用而非畸形");
+        let f: crate::api_server::wb_payload::TemplateMapFile =
+            serde_json::from_value(map).unwrap();
+        assert!(f.templates[0].to.is_none(), "缺 to 解析为 None（停用）");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

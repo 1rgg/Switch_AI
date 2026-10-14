@@ -182,6 +182,8 @@ function TaskConfigCard({
   patch,
   growthForm,
   setGrowthForm,
+  activityForm,
+  setActivityForm,
   creditsForm,
   setCreditsForm,
   checkinHhmm,
@@ -193,6 +195,8 @@ function TaskConfigCard({
   patch: (p: Partial<WorkBuddySettings>) => void;
   growthForm: { enabled: boolean; hhmm: string };
   setGrowthForm: (f: { enabled: boolean; hhmm: string }) => void;
+  activityForm: { enabled: boolean; hhmm: string };
+  setActivityForm: (f: { enabled: boolean; hhmm: string }) => void;
   creditsForm: { mode: string; hhmm: string; hours: string };
   setCreditsForm: (f: { mode: string; hhmm: string; hours: string }) => void;
   checkinHhmm: string;
@@ -623,6 +627,49 @@ function TaskConfigCard({
           </label>
         </div>
       </div>
+
+      <div className="my-4 border-t border-slate-100 dark:border-zinc-800" />
+
+      {/* 每日活跃上报（限时活动，仅国际版）：默认关闭，须显式开启 */}
+      <h3 className="mb-1 font-medium">每日活跃上报（限时活动）</h3>
+      <p className="mb-3 text-xs text-slate-400">
+        面向 <b>WorkBuddy 国际版</b>（workbuddy.ai）个人版：当日有一次有效活跃即赠积分，
+        Free 30 积分/天、Pro 50 积分/天，<b>次日自动发放、无需领取</b>，每个活动日最多 1 次。
+        国内版账号不参与（自动跳过）。
+      </p>
+      <div className="mb-3 space-y-2">
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={activityForm.enabled}
+            onChange={(e) => setActivityForm({ ...activityForm, enabled: e.target.checked })}
+          />
+          启用每日活跃上报
+          <span className="rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">
+            默认关闭
+          </span>
+        </label>
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-slate-500">每日执行时刻</span>
+          <input
+            type="time"
+            value={activityForm.hhmm}
+            onChange={(e) => setActivityForm({ ...activityForm, hhmm: e.target.value || '10:20' })}
+            disabled={!activityForm.enabled}
+            className="input h-9 !w-28 text-sm"
+          />
+          {activityForm.enabled && (
+            <span className="text-xs text-slate-400">
+              每天 {activityForm.hhmm || '10:20'} 执行（应用关闭期间不执行）
+            </span>
+          )}
+        </div>
+        <p className="rounded border border-amber-200 bg-amber-50 p-2 text-xs leading-relaxed text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-300">
+          ⚠️ 官方「活动限制」明确将「利用脚本、外挂、插件、模拟器、<b>接口调用</b>、批量注册等方式
+          刷取活跃或奖励」列为可<b>取消参与资格、暂停或追回已发奖励</b>的行为。本功能以接口调用模拟
+          客户端活跃，属于该条款指向的行为，请自行评估风险后再开启。
+        </p>
+      </div>
     </div>
   );
 }
@@ -643,6 +690,8 @@ export default function BuddySettings() {
   const [locCbDone, setLocCbDone] = useState(false);
   // 成长调度表单（wb_growth_enabled/hhmm 存 app Settings，随「保存配置」统一提交）
   const [growthForm, setGrowthForm] = useState({ enabled: true, hhmm: '09:00' });
+  // 每日活跃上报表单（wb_activity_enabled/hhmm 存 app Settings；默认关闭）
+  const [activityForm, setActivityForm] = useState({ enabled: false, hhmm: '10:20' });
   // 积分与 Token 同步表单（wb_credits_sync_mode/hhmm 存 app Settings，随「保存配置」统一提交）
   const [creditsForm, setCreditsForm] = useState({ mode: 'every_hours', hhmm: '23:30', hours: '2' });
   // 每日签到调度时刻与多账号间隔（wb_checkin_hhmm/gap_secs 存 app Settings，随「保存配置」统一提交）
@@ -700,6 +749,11 @@ export default function BuddySettings() {
       enabled: appSettings.wb_growth_enabled ?? true,
       hhmm: appSettings.wb_growth_hhmm || '09:00',
     });
+    // 活跃上报默认关闭：`?? false` 保证后端未返回该字段时表单也是关闭态
+    setActivityForm({
+      enabled: appSettings.wb_activity_enabled ?? false,
+      hhmm: appSettings.wb_activity_hhmm || '10:20',
+    });
     setCreditsForm({
       mode: appSettings.wb_credits_sync_mode || 'every_hours',
       hhmm: appSettings.wb_credits_sync_hhmm || '23:30',
@@ -723,6 +777,8 @@ export default function BuddySettings() {
         wb_auth_file_path: pathForm.wb_auth_file_path.trim() || null,
         wb_growth_enabled: growthForm.enabled,
         wb_growth_hhmm: growthForm.hhmm.trim() || '09:00',
+        wb_activity_enabled: activityForm.enabled,
+        wb_activity_hhmm: activityForm.hhmm.trim() || '10:20',
         wb_credits_sync_mode: creditsForm.mode,
         wb_credits_sync_hhmm: creditsForm.hhmm.trim() || '23:30',
         wb_credits_sync_hours: creditsForm.hours.trim() || '2',
@@ -916,6 +972,8 @@ export default function BuddySettings() {
           patch={patch}
           growthForm={growthForm}
           setGrowthForm={setGrowthForm}
+          activityForm={activityForm}
+          setActivityForm={setActivityForm}
           creditsForm={creditsForm}
           setCreditsForm={setCreditsForm}
           checkinHhmm={checkinHhmm}

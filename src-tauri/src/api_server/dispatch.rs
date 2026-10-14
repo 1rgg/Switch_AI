@@ -943,6 +943,7 @@ mod tests {
             model_cooldowns: std::sync::Mutex::new(HashMap::new()),
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
+            listen_host: "127.0.0.1".to_string(),
             total_requests: std::sync::atomic::AtomicU64::new(0),
             inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active_uid: std::sync::Mutex::new(None),

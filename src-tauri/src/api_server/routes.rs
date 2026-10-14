@@ -455,37 +455,15 @@ fn whitelist_error_response(model: &str, proto: Protocol) -> Response {
     }
 }
 
-pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
-    let pool = state.pool.status_list();
-    let wb_pool = state.wb_pool.status_list();
-    let available = pool.iter().filter(|p| !p.disabled && !p.cooling).count();
-    let cooling = pool.iter().filter(|p| p.cooling).count();
-    let disabled = pool.iter().filter(|p| p.disabled).count();
-    let total_credits: f64 = pool.iter().filter_map(|p| p.credits).sum();
-    let total = state.total_requests.load(std::sync::atomic::Ordering::Relaxed);
-    let active = safe_lock(&state.active_uid).clone();
-    let last_err = safe_lock(&state.last_error).clone();
-    let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
-    let wb_available = wb_pool.iter().filter(|p| !p.disabled && !p.cooling).count();
-
+/// `/health`（回填上游 3.7.9 收敏）：仅返回**存活布尔**，不含任何账号/积分/用量诊断。
+///
+/// 为什么收敏：本端点默认免鉴权（环回监听时），此前返回账号总数、可用数、冷却数、
+/// 总积分、当前账号 uid、最近错误——同网段任何主机无凭据即可枚举账号规模与积分水位。
+/// 完整诊断已由需鉴权的 [`status`] 提供，此处不再重复暴露。
+pub async fn health(State(_state): State<Arc<ApiSharedState>>) -> impl IntoResponse {
     Json(json!({
         "status": "ok",
         "running": true,
-        "total_requests": total,
-        "active_uid": active,
-        "last_error": last_err,
-        "pool": {
-            "total_accounts": pool.len(),
-            "available": available,
-            "cooling": cooling,
-            "disabled": disabled,
-            "total_credits": (total_credits * 100.0).round() / 100.0,
-        },
-        "wb": {
-            "enabled": wb_enabled,
-            "total_accounts": wb_pool.len(),
-            "available": wb_available,
-        }
     }))
 }
 
@@ -1602,11 +1580,9 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 state.pool.note_error(&picked.uid, ErrKind::Server);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} first-byte timeout(10s)", picked.uid));
-                                // P2 修复：失败尝试记账（与非流式/WB 口径一致）
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, false, stream,
-                                    start_ts.elapsed().as_millis() as u64, 0, 0,
-                                );
+                                // 每请求终态单行（回填上游 3.7.11）：首字超时 → 换号是中间态，
+                                // 不落账（对齐 wb 流式路径），由终局分支统一落行。
+                                // 原实现在此处记账，一次请求换 N 个号就记 N 条，requests 虚高
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     504, &picked.uid, start_ts.elapsed().as_millis() as u64,
@@ -1670,8 +1646,18 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             let us = ttfb_us.load(std::sync::atomic::Ordering::Relaxed);
                             if us == 0 { None } else { Some(us / 1000) }
                         };
-                        // 用量记账（流式结束即落盘；F-76① TTFT 入账；对冲接管记生效账号）
-                        {
+                        // 用量记账（流式结束即落盘；F-76① TTFT 入账；对冲接管记生效账号）。
+                        // 每请求终态单行（回填上游 3.7.11）：换号重试为中间态不落账，避免
+                        // requests 虚高——判定与下方换号分支同口径（空完成未流出 /
+                        // 账号级错误未流出）；终态（成功 / 就地收尾 / 错误透传）恰落一行
+                        let rotating = match &error_info {
+                            None => false,
+                            Some((code, msg)) => {
+                                !sent_any
+                                    && super::classify_solo_error(*code, msg) != ErrKind::None
+                            }
+                        };
+                        if !rotating {
                             let (pt, ct) = up_usage.as_ref().map(extract_tokens).unwrap_or((0, 0));
                             state.record_usage_ttfb(
                                 false, &model, &win_uid, &key_id, error_info.is_none(), true,
@@ -1833,11 +1819,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 let preview = safe_slice(&resp_body, 200);
                                 *safe_lock(&state.last_error) =
                                     Some(format!("uid={} status={} body={}", picked.uid, status, preview));
-                                // P2 修复：失败尝试记账（与非流式/WB 口径一致）
-                                state.record_usage(
-                                    false, &model, &picked.uid, &key_id, false, stream,
-                                    start_ts.elapsed().as_millis() as u64, 0, 0,
-                                );
+                                // 每请求终态单行（回填上游 3.7.11）：SwitchKey → 换号是中间态，
+                                // 不落账（对齐 wb 流式路径），由终局分支统一落行
                                 state.logger.log_request(
                                     "trae", "POST", proto.log_path(), &model, stream,
                                     status, &picked.uid, start_ts.elapsed().as_millis() as u64,
@@ -2900,6 +2883,7 @@ mod tests {
             model_cooldowns: std::sync::Mutex::new(std::collections::HashMap::new()),
             default_model: "deepseek-v4-flash".into(),
             data_dir: dir.clone(),
+            listen_host: "127.0.0.1".to_string(),
             total_requests: std::sync::atomic::AtomicU64::new(0),
             inflight: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active_uid: std::sync::Mutex::new(None),

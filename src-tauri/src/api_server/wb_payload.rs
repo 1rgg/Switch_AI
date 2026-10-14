@@ -118,6 +118,15 @@ pub fn default_template_map() -> Vec<(String, String)> {
             "You are a coding agent powered by the glm-".to_string(),
             "You are a coding agent built on the glm-".to_string(),
         ),
+        // issue #99 布防（回填上游 3.7.11）：VS Code 扩展（IDE 形态）身份句**逗号续接
+        // 变体**——上方规则句号结尾，逗号变体（"...for Claude, running inside the
+        // VS Code extension."）必然漏匹配；前缀匹配覆盖任意续接。精确触发句以
+        // 「11128 指纹样本」诊断日志核实后经 UI 热更新迭代，无须发版。
+        // 本规则在合并语义下始终生效，存量自定义表自动获得（无须手工同步）
+        (
+            "You are Claude Code, Anthropic's official CLI for Claude,".to_string(),
+            "You are Claude Code, Anthropic's official CLI tool for Claude,".to_string(),
+        ),
     ]
 }
 
@@ -133,23 +142,67 @@ pub struct TemplateMapFile {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct TemplateRule {
     pub from: String,
-    pub to: String,
+    /// 改写目标（回填上游 3.7.11 合并语义）：`Some("")` = 剥离为**空串**
+    /// （删除指纹原文）；`Some(文本)` = 改写为该文本；`None` = **停用**
+    /// （从生效表移除该条，原句透传）。两种「空」语义此前混为一谈。
+    #[serde(default)]
+    pub to: Option<String>,
 }
 
 impl TemplateMapFile {
-    /// 转换为 (from, to) 规则表：剔除空 from；全空 → None（调用方走内置兜底）
+    /// 转换为 (from, to) 规则表（兼容旧语义）：剔除空 from。
+    ///
+    /// 旧口径：全空 → None → 调用方走内置兜底（「整体替换」语义）。
+    /// **新口径**（回填上游 3.7.11）：内置默认表**始终生效**，自定义表按原文
+    /// 指纹逐字覆盖/追加——故本方法保留供旧调用点兼容，新代码请用
+    /// [`merged_template_rules`]。
     pub fn into_rules(self) -> Option<Vec<(String, String)>> {
         let rules: Vec<(String, String)> = self
             .templates
             .into_iter()
             .filter(|r| !r.from.is_empty())
-            .map(|r| (r.from, r.to))
+            .filter_map(|r| r.to.map(|t| (r.from, t)))
             .collect();
         if rules.is_empty() {
             None
         } else {
             Some(rules)
         }
+    }
+
+    /// 合并语义（issue #99）：内置默认表**始终生效**，自定义表按「原文指纹」
+    /// 逐字覆盖/追加，`to = None` 表示停用该条（从生效表移除）。
+    ///
+    /// 为什么必须合并而非整体替换：默认表会随版本新增布防规则（如 VS Code 扩展
+    /// 身份句逗号变体），整体替换语义下**存量自定义表永远拿不到新规则**，每次
+    /// 发版都要用户手工同步——漏一条就多一类请求被上游 11128 拦截。
+    pub fn merged_template_rules(self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut custom: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for r in self.templates {
+            if r.from.is_empty() {
+                continue;
+            }
+            custom.insert(r.from, r.to);
+        }
+        for (from, to) in default_template_map() {
+            // 自定义表按原文指纹覆盖同条默认规则；显式停用（None）则整条移除
+            match custom.get(&from) {
+                Some(None) => continue,
+                Some(Some(t)) => out.push((from, t.clone())),
+                None => out.push((from, to)),
+            }
+        }
+        // 默认表没有的自定义规则按追加处理（保留用户自有布防）
+        for (from, to) in custom {
+            if default_template_map().iter().any(|(f, _)| f == &from) {
+                continue;
+            }
+            if let Some(t) = to {
+                out.push((from, t));
+            }
+        }
+        out
     }
 }
 
@@ -188,6 +241,68 @@ pub fn template_hit_note() -> String {
         Some(s) => format!("；模板命中: {s}"),
         None => String::new(),
     }
+}
+
+/// 11128 / 影子风控命中的**指纹样本**提取（回填上游 3.7.11 issue #99）。
+///
+/// 首条 system 消息文本前 300 字符（压缩空白为单空格、内嵌双引号转单引号）+
+/// 工具名列表（前 10 个；缺 `function.name` 回退顶层 `name`——Responses 原生工具形态）。
+///
+/// 用途：此前风控命中只知道「模板改写了什么」，不知道「漏了什么」——样本落 app.log
+/// 后可直接反查精确触发句，经 UI「指纹清洗」tab 热更新规则表，**无须发版**。
+/// 工具名清单还能识别客户端 harness 形态（如 `mcp__ide__*` = VS Code 扩展）。
+///
+/// 应取**清洗前**的原始请求体（保留原始句式便于逐字配规则）；已改写部分由
+/// [`template_hit_note`] 的命中注记区分。
+pub fn fingerprint_sample(body: &[u8]) -> String {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return "body 解析失败".to_string();
+    };
+    let raw = v
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .and_then(|a| {
+            a.iter()
+                .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+        })
+        .and_then(|m| m.get("content"))
+        .map(|c| match c {
+            Value::String(s) => s.clone(),
+            // 数组形态（多段 content）：拼接各段 text
+            Value::Array(a) => a
+                .iter()
+                .filter_map(|seg| seg.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+    // 空白压缩为单空格；双引号转单引号（避免破坏日志行的引号配对）
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = compact.replace('"', "'");
+    let head: String = compact.chars().take(300).collect();
+
+    let tools: Vec<String> = v
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|t| {
+                    t.pointer("/function/name")
+                        .and_then(|n| n.as_str())
+                        .or_else(|| t.get("name").and_then(|n| n.as_str()))
+                })
+                .take(10)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut out = format!("system=\"{head}\"");
+    if !tools.is_empty() {
+        out.push_str(&format!(" tools=[{}]", tools.join(",")));
+    }
+    out
 }
 
 /// 审核模板黑名单最小改写：映射表为空才跳过（不做硬编码关键词预检——
@@ -973,5 +1088,135 @@ mod tests {
         let v: Value = serde_json::from_slice(&out).unwrap();
         let d0 = v["tools"][0]["function"]["description"].as_str().unwrap();
         assert!(d0.contains("based on GPT-5"));
+    }
+
+    // ============ 模板规则合并语义（回填上游 3.7.11 issue #99）============
+
+    /// 核心回归：默认表**始终生效**——自定义表只写一条自有规则时，默认布防
+    /// （含新增的 VS Code 逗号变体）必须仍然命中，否则发版新增规则对存量用户无效。
+    #[test]
+    fn merged_rules_keep_defaults_alongside_custom() {
+        let f = TemplateMapFile {
+            templates: vec![TemplateRule {
+                from: "MY CUSTOM FINGERPRINT".to_string(),
+                to: Some("MY CUSTOM FINGERPRINT".to_string()),
+            }],
+            updated_at: None,
+        };
+        let rules = f.merged_template_rules();
+        // 自带规则在
+        assert!(rules.iter().any(|(k, _)| k == "MY CUSTOM FINGERPRINT"));
+        // 语义保证（issue #99 核心）：**每一条**默认规则都必须在合并结果里，
+        // 除非被显式停用。这比抽查某条文本更严谨——默认表任一条丢失都是缺陷。
+        let mut missing: Vec<String> = Vec::new();
+        for (from, _) in default_template_map() {
+            if !rules.iter().any(|(k, _)| *k == from) {
+                missing.push(from);
+            }
+        }
+        assert!(missing.is_empty(), "默认规则在合并结果中丢失: {missing:?}");
+        // 自定义规则为追加（默认表没有该 from）
+        assert_eq!(rules.len(), default_template_map().len() + 1);
+    }
+
+    /// 自定义表按 from 逐字覆盖同条默认规则。
+    #[test]
+    fn merged_rules_custom_overrides_same_from() {
+        let from = "You are Codex, built on GPT-5";
+        let f = TemplateMapFile {
+            templates: vec![TemplateRule {
+                from: from.to_string(),
+                to: Some("OVERRIDDEN".to_string()),
+            }],
+            updated_at: None,
+        };
+        let rules = f.merged_template_rules();
+        let hit = rules.iter().find(|(k, _)| k == from).unwrap();
+        assert_eq!(hit.1, "OVERRIDDEN", "同名 from 应被自定义值覆盖");
+    }
+
+    /// to = None 表示**停用**：该 from 从生效表移除，原句透传。
+    #[test]
+    fn merged_rules_null_to_disables_rule() {
+        let from = "You are Codex, built on GPT-5";
+        let f = TemplateMapFile {
+            templates: vec![TemplateRule { from: from.to_string(), to: None }],
+            updated_at: None,
+        };
+        let rules = f.merged_template_rules();
+        assert!(
+            !rules.iter().any(|(k, _)| k == from),
+            "to=null 的规则须从生效表移除"
+        );
+        // 其他默认规则不受影响
+        assert!(rules.len() > 1);
+    }
+
+    /// to = Some("") 仍表示**剥离**（改写为空串）——与停用是两种语义，不可混淆。
+    #[test]
+    fn merged_rules_empty_string_to_strips() {
+        let from = "You are Codex, built on GPT-5";
+        let f = TemplateMapFile {
+            templates: vec![TemplateRule { from: from.to_string(), to: Some(String::new()) }],
+            updated_at: None,
+        };
+        let rules = f.merged_template_rules();
+        let hit = rules.iter().find(|(k, _)| k == from).expect("剥离规则应保留在生效表");
+        assert_eq!(hit.1, "", "空串 to = 剥离（改写为空）");
+    }
+
+    /// issue #99 布防：VS Code 扩展身份句**逗号续接变体**（句号规则必然漏匹配）。
+    #[test]
+    fn vscode_identity_comma_variant_rewrite() {
+        let tpl = default_template_map();
+        let v = "You are Claude Code, Anthropic's official CLI for Claude, running inside the VS Code extension.";
+        let out = apply_template_map(v, &tpl);
+        assert!(out.contains("official CLI tool for Claude, running inside"), "{out}");
+        assert!(!out.contains("CLI for Claude,"), "{out}");
+        // 句号形态仍由原规则覆盖，互不干扰
+        let plain = "You are Claude Code, Anthropic's official CLI for Claude.";
+        let out2 = apply_template_map(plain, &tpl);
+        assert!(!out2.contains("CLI for Claude."), "{out2}");
+    }
+
+    // ============ 指纹样本提取（回填上游 3.7.11 issue #99）============
+
+    #[test]
+    fn fingerprint_sample_extracts_system_and_tools() {
+        let body = json!({
+            "messages": [
+                {"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude,  running\ninside the VS Code extension."},
+                {"role":"user","content":"hi"}
+            ],
+            "tools": [
+                {"type":"function","function":{"name":"mcp__ide__getDiagnostics","parameters":{}}},
+                {"type":"function","function":{"name":"read_file","parameters":{}}}
+            ]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let s = fingerprint_sample(&bytes);
+        assert!(s.starts_with("system=\""), "{s}");
+        // 空白压缩为单空格
+        assert!(s.contains("Claude, running inside the VS Code extension."), "{s}");
+        // 工具名列表（可识别 IDE harness 形态）
+        assert!(s.contains("tools=[mcp__ide__getDiagnostics,read_file]"), "{s}");
+        // 非 JSON body 不 panic
+        assert_eq!(fingerprint_sample(b"not json"), "body 解析失败");
+        // 无 tools → 不输出 tools 段
+        let s2 = fingerprint_sample(&serde_json::to_vec(&json!({
+            "messages": [{"role":"system","content":"x"}]
+        })).unwrap());
+        assert!(!s2.contains("tools="), "{s2}");
+    }
+
+    /// Responses 原生工具形态（顶层 name，无 function 包裹）同样要提取到。
+    #[test]
+    fn fingerprint_sample_reads_flat_tool_names() {
+        let body = json!({
+            "messages": [{"role":"system","content":"s"}],
+            "tools": [{"type":"web_search","name":"web_search"}]
+        });
+        let s = fingerprint_sample(&serde_json::to_vec(&body).unwrap());
+        assert!(s.contains("tools=[web_search]"), "{s}");
     }
 }

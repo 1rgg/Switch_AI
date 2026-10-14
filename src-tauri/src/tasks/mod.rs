@@ -29,6 +29,7 @@ pub mod qoder_upstream;
 pub mod scheduler;
 pub mod trae_checkin;
 pub mod ui_click;
+pub mod wb_activity;
 pub mod wb_checkin;
 pub mod wb_common;
 pub mod wb_credits;
@@ -92,6 +93,33 @@ pub fn run_cli_task(name: &str, state: &AppState) -> i32 {
             wb_checkin::run_growth_round(state, &flags, &[], &mut print_progress);
             Ok(serde_json::json!({ "ok": true }))
         }
+        // WorkBuddy 每日活跃上报（限时活动，仅国际版；schtasks 直调 + 应用内调度器共用）。
+        // 每号每天只发 1 次（当日去重落 KV）；可重试失败返 Err 让退出码可见
+        "wb-activity" => {
+            let mut events: Vec<serde_json::Value> = Vec::new();
+            let done = wb_activity::run_activity_round(state, &[], &mut |ev| events.push(ev.clone()));
+            // 永久性凭证失败与调度器口径对齐（重试注定失败，不计入 Err——
+            // 否则失效账号让 schtasks 每日执行结果恒为失败）
+            let failed = done.get("failed").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            let failed_permanent = events
+                .iter()
+                .filter(|e| {
+                    let m = e.get("message").and_then(serde_json::Value::as_str).unwrap_or("");
+                    e.get("status").and_then(serde_json::Value::as_str) == Some("fail")
+                        && (m.contains("需重新登录") || m.contains("无可用凭证"))
+                })
+                .count() as i64;
+            let retryable = (failed - failed_permanent).max(0);
+            if retryable > 0 {
+                let ok = done.get("ok").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                Err(format!("WB 活跃上报：{ok} 成功 / {retryable} 失败"))
+            } else {
+                Ok(done)
+            }
+        }
+        // WorkBuddy 每日活跃（限时活动）**只读诊断**：不产生活跃、不领奖。
+        // 用于上线写操作前核实国际版端点真实行为（见 wb_activity 模块注释）
+        "wb-activity-probe" => Ok(wb_activity::run_activity_probe(state)),
         // Qoder 每日签到（F-80；schtasks 直调 + 应用内调度器共用；10:15 单次覆盖双活动）
         "qoder-checkin" => {
             let opts = qoder_checkin::QoderCheckinOpts::daily();

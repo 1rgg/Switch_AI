@@ -199,17 +199,35 @@ pub fn clear_model_failure(state: &ApiSharedState, model: &str) {
     safe_lock(&state.model_cooldowns).remove(model);
 }
 
+/// 多轮累计写回：把跨轮累计的缓存读/写 tokens 写入最终 usage（回填上游 3.7.10）。
+///
+/// 调用前须先 `clear_cache_shadow_keys` 清除上一轮残留别名，否则下游按优先级
+/// 可能取到陈旧值。写侧仅在 >0 时下发——与上游「0 不视为命中」口径一致，
+/// 避免给下游塞入无意义的 `cached_tokens: 0` 而被误判为「缓存全部失效」。
+fn write_back_acc_cache(u: &mut Value, acc: (u64, u64)) {
+    let (read, write) = acc;
+    if read > 0 {
+        u["prompt_cache_hit_tokens"] = json!(read);
+        // OpenAI 标准嵌套形态：严格客户端（CPA 等）只认这里
+        u["prompt_tokens_details"] = json!({ "cached_tokens": read });
+    }
+    if write > 0 {
+        u["cache_creation_input_tokens"] = json!(write);
+    }
+}
+
 // ==================== 审核模板映射热更新（T2.1） ====================
 
-/// 每请求读取外置映射表（fs_utils::read_json_cached：mtime+size 线程安全缓存，
-/// 免自建缓存结构与 Mutex 内磁盘 IO）；data/ 新路径缺失回退旧根路径（存量数据
-/// 兼容）；文件缺失/损坏/空表用内置兜底
+/// 每请求读取外置映射表（SQLite KV 热路径单行读取）；文件缺失/损坏/空表时
+/// 内置默认表仍生效。
+///
+/// 合并语义（回填上游 3.7.11 issue #99）：**内置默认表始终生效**，自定义表按
+/// 原文指纹逐字覆盖/追加——默认表新增布防规则自动对存量自定义表生效，无须
+/// 用户每次发版手工同步。`to = None` 表示停用该条（原句透传）。
 pub fn load_templates(state: &ApiSharedState) -> Vec<(String, String)> {
-    // SQLite 化（P2）：data/wb_template_map.json → kv `wb_template_map`（热路径单行读取）
     crate::store::db(&state.data_dir)
         .kv_get::<wb_payload::TemplateMapFile>("wb_template_map")
-        .into_rules()
-        .unwrap_or_else(wb_payload::default_template_map)
+        .merged_template_rules()
 }
 
 // ==================== 错误分类（WB 上游） ====================
@@ -733,7 +751,14 @@ fn run_wb_stream(
                                 state.logger.log_request_ttfb(
                                     "buddy", "POST", "/v2/chat/completions", model, true, 200, win_uid,
                                     duration_ms, Some(ttfb_ms), &key_name,
-                                    &state.wb_pool.name_of(win_uid), Some(&format!("空完成 → 换号重试{}", wb_payload::template_hit_note())),
+                                    &state.wb_pool.name_of(win_uid),
+                                    // 指纹样本（回填上游 3.7.11 issue #99）：影子风控同样落样本，
+                                    // 否则「漏了哪条触发句」仍然无从反查
+                                    Some(&format!(
+                                        "空完成 → 换号重试{}；指纹样本: {}",
+                                        wb_payload::template_hit_note(),
+                                        wb_payload::fingerprint_sample(&converted)
+                                    )),
                                 );
                                 break;
                             }
@@ -796,7 +821,9 @@ fn run_wb_stream(
                     {
                         sanitize = true;
                         state.logger.log_sched_event(&format!(
-                            "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                            "11128 强制清洗重试{}；指纹样本: {}",
+                            wb_payload::template_hit_note(),
+                            wb_payload::fingerprint_sample(body_vec)
                         ));
                         converted = wb_payload::prepare_wb_chat_body(
                             body_vec, model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
@@ -1127,7 +1154,9 @@ pub async fn wb_aggregate_chat(
                         {
                             sanitize = true;
                             state.logger.log_sched_event(&format!(
-                                "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                                "11128 强制清洗重试{}；指纹样本: {}",
+                                wb_payload::template_hit_note(),
+                                wb_payload::fingerprint_sample(&body_vec)
                             ));
                             converted = wb_payload::prepare_wb_chat_body(
                                 &body_vec, &model, &picked.uid, &conv_id, effort.as_deref(), true, &templates,
@@ -1365,6 +1394,8 @@ pub async fn wb_tool_exec_chat(
             // 各轮上游 usage 累加（含最终轮），成功时写回最终 completion——
             // 多轮回喂的真实消耗 = 各轮之和，只记最终轮会少计中间轮
             let mut acc_usage = (0u64, 0u64);
+            // 缓存读/写 tokens 跨轮累计（回填上游 3.7.10）：(cache_read, cache_write)
+            let mut acc_cache = (0u64, 0u64);
             let outcome = loop {
                 if round >= super::wb_toolexec::MAX_ROUNDS {
                     break Err(format!(
@@ -1431,6 +1462,12 @@ pub async fn wb_tool_exec_chat(
                                 acc_usage.0 + u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                                 acc_usage.1 + u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
                             );
+                            // 缓存读/写 tokens 跨轮累计（回填上游 3.7.10）：
+                            // 多轮工具循环里每轮各有命中，只报最后一轮会严重低估
+                            acc_cache = (
+                                acc_cache.0 + super::wb_sse::cached_tokens_of(u),
+                                acc_cache.1 + super::wb_sse::cache_write_tokens_of(u),
+                            );
                         }
                         // P1-6：仅代理成功注入工具时才按名提取代执行调用；
                         // 客户端同名工具的调用一律视为普通透传（不提取不执行）
@@ -1444,17 +1481,23 @@ pub async fn wb_tool_exec_chat(
                             let mut completion = completion;
                             match completion.get_mut("usage") {
                                 Some(u) => {
+                                    // 先清遮蔽键再写累加值（回填上游 3.7.10）：上一轮的
+                                    // cached_tokens 等别名若残留，下游按优先级会取到陈旧值
+                                    super::wb_sse::clear_cache_shadow_keys(u);
                                     u["prompt_tokens"] = json!(acc_usage.0);
                                     u["completion_tokens"] = json!(acc_usage.1);
                                     if u.get("total_tokens").is_some() {
                                         u["total_tokens"] = json!(acc_usage.0 + acc_usage.1);
                                     }
+                                    write_back_acc_cache(u, acc_cache);
                                 }
                                 None => {
-                                    completion["usage"] = json!({
+                                    let mut u = json!({
                                         "prompt_tokens": acc_usage.0,
                                         "completion_tokens": acc_usage.1,
                                     });
+                                    write_back_acc_cache(&mut u, acc_cache);
+                                    completion["usage"] = u;
                                 }
                             }
                             break Ok(completion); // 最终回复
@@ -1505,7 +1548,9 @@ pub async fn wb_tool_exec_chat(
                         {
                             sanitize = true;
                             state.logger.log_sched_event(&format!(
-                                "11128 强制清洗重试{}", wb_payload::template_hit_note()
+                                "11128 强制清洗重试{}；指纹样本: {}",
+                                wb_payload::template_hit_note(),
+                                wb_payload::fingerprint_sample(&body_bytes)
                             ));
                             round = round.saturating_sub(1);
                             std::thread::sleep(std::time::Duration::from_millis(200));
