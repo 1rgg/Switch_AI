@@ -196,9 +196,14 @@ fn stream_convert_src(
             "model": "",
             "choices": choices,
         });
-        if pending_usage.is_some() {
+        if let Some(u) = pending_usage {
             if let Some(c) = chunk.as_object_mut() {
-                c.insert("usage".into(), pending_usage.clone().unwrap());
+                // 归一化投影（回填上游 3.7.10）：上游 usage 用自有键
+                // （cache_read_input_tokens 等），原样透传下游认不到缓存命中——
+                // 严格 OpenAI 客户端只认 prompt_tokens_details.cached_tokens，
+                // 缓存读恒为 0。本出口此前是本文件唯一漏做投影的路径
+                // （text/非流式/Anthropic 三条出口均经 normalize_openai_usage）
+                c.insert("usage".into(), super::wb_sse::normalize_openai_usage(u));
             }
         }
         format!("data: {}\n\n", chunk)
@@ -1239,6 +1244,49 @@ mod tests {
         assert_eq!(without_created(&a), without_created(&b));
         assert!(a.contains("\"finish_reason\":\"stop\""));
         assert!(a.ends_with("data: [DONE]"));
+    }
+
+    // ==================== OpenAI 流式 usage 归一化（缓存读不得丢失）====================
+
+    /// 回归：上游 usage 用自有键（cache_read_input_tokens），OpenAI 流式出口
+    /// 必须投影为 prompt_tokens_details.cached_tokens。
+    ///
+    /// 缺陷现场：本出口曾原样透传上游 usage，严格 OpenAI 客户端只认标准嵌套位
+    /// → 下游「缓存命中 0% / 缓存读取 0 tok」（Trae 池流量 100% 走本出口，
+    /// 症状全局可见）；text/非流式/Anthropic 三条出口均已归一化，仅本路径漏做。
+    #[test]
+    fn openai_stream_usage_projects_cached_tokens() {
+        let input = "event: output\ndata: {\"response\":\"hi\"}\n\n\
+                     event: token_usage\ndata: {\"prompt_tokens\":34790,\"completion_tokens\":299,\
+                     \"cache_read_input_tokens\":20660,\"cache_creation_input_tokens\":0}\n\n\
+                     event: done\ndata: {\"finish_reason\":\"stop\"}\n\n";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        let (error_info, sent_any, usage) = stream_convert_lines(
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
+            tx,
+            "c1",
+        );
+        assert!(error_info.is_none());
+        assert!(sent_any);
+
+        let joined = collect_events(rx).join("\n");
+        let usage_line = joined
+            .lines()
+            .filter(|l| l.starts_with("data: {"))
+            .map(|l| l.trim_start_matches("data: "))
+            .filter_map(|j| serde_json::from_str::<Value>(j).ok())
+            .find_map(|v| v.get("usage").cloned())
+            .expect("收尾 chunk 必须携带 usage");
+        // 标准嵌套位：严格 OpenAI 客户端据此判定缓存命中
+        assert_eq!(
+            usage_line["prompt_tokens_details"]["cached_tokens"],
+            json!(20660),
+            "缓存读必须投影到 prompt_tokens_details.cached_tokens，否则下游命中恒为 0"
+        );
+        assert_eq!(usage_line["prompt_tokens"], json!(34790));
+        assert_eq!(usage_line["completion_tokens"], json!(299));
+        // 上游自有键不再作为唯一载体（下游读不到）；返回的 usage 仍是上游原值
+        assert_eq!(usage.as_ref().unwrap()["cache_read_input_tokens"], json!(20660));
     }
 
     // ==================== 空完成哨兵（issue #57 影子风控）====================
